@@ -1,0 +1,23 @@
+node_modules
+dist
+.vite
+*.pdf
+*.zip
+*.log
+*.tmp
+*.temp
+*.idb
+*.indexeddb
+*.sqlite
+*.sqlite3
+*.db
+.env
+.env.*
+*.local
+backups/
+exports/
+screenshots/
+temp/
+tmp/
+screenshot*.png
+Screen Shot*.png
