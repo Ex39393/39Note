@@ -7,6 +7,7 @@ import {
   type UnderlineColor,
 } from '../types/highlight';
 import type { Note } from '../types/note';
+import type { GlossaryEntry } from '../types/glossary';
 import type { DocumentIdentity } from '../types/persistence';
 import type {
   CollectionRecord,
@@ -15,6 +16,7 @@ import type {
   TagRecord,
 } from '../types/library';
 import { isValidDocumentId } from '../utils/documentId';
+import { sanitizePersistedGlossaryEntries } from '../utils/glossaryPersistence';
 
 const DATABASE_NAME = '39note-db';
 const DATABASE_VERSION = 3;
@@ -22,11 +24,12 @@ const DOCUMENT_STATE_STORE = 'document-states';
 const PDF_FILE_STORE = 'pdf-files';
 const COLLECTION_STORE = 'collections';
 const TAG_STORE = 'tags';
-export const PERSISTENCE_SCHEMA_VERSION = 5;
+export const PERSISTENCE_SCHEMA_VERSION = 6;
 const LEGACY_SCHEMA_VERSION = 1;
 const PREVIOUS_SCHEMA_VERSION = 2;
 const HIGHLIGHT_NOTE_SCHEMA_VERSION = 3;
 const DOCUMENT_METADATA_SCHEMA_VERSION = 4;
+const PREVIOUS_PERSISTENCE_SCHEMA_VERSION = 5;
 
 export interface PersistedDocumentState extends DocumentIdentity, DocumentLibraryMetadata {
   schemaVersion: typeof PERSISTENCE_SCHEMA_VERSION;
@@ -34,6 +37,7 @@ export interface PersistedDocumentState extends DocumentIdentity, DocumentLibrar
   displayTitle: string;
   annotations: PdfAnnotation[];
   notes: Note[];
+  glossaryEntries: GlossaryEntry[];
   nextNoteNumber: number;
   updatedAt: number;
 }
@@ -323,6 +327,7 @@ export function validateBackupDocumentState(value: unknown): PersistedDocumentSt
   if (
     !Array.isArray(value.annotations) ||
     !Array.isArray(value.notes) ||
+    (value.glossaryEntries !== undefined && !Array.isArray(value.glossaryEntries)) ||
     value.annotations.some((annotation) => (
       !isRecord(annotation) ||
       (annotation.type !== 'highlight' && annotation.type !== 'underline')
@@ -336,6 +341,7 @@ export function validateBackupDocumentState(value: unknown): PersistedDocumentSt
     !state ||
     state.annotations.length !== value.annotations.length ||
     state.notes.length !== value.notes.length ||
+    state.glossaryEntries.length !== (Array.isArray(value.glossaryEntries) ? value.glossaryEntries.length : 0) ||
     !isSafeBackupFilename(state.originalFileName)
   ) {
     return null;
@@ -605,6 +611,7 @@ export async function saveDocumentState(
   identity: DocumentIdentity,
   annotations: PdfAnnotation[],
   notes: Note[],
+  glossaryEntries: GlossaryEntry[],
   nextNoteNumber: number,
   displayTitle: string,
 ): Promise<boolean> {
@@ -620,6 +627,10 @@ export async function saveDocumentState(
 
     const sanitizedAnnotations = sanitizeAnnotations(annotations);
     const sanitizedNotes = sanitizeNotes(notes, sanitizedAnnotations);
+    const sanitizedGlossaryEntries = sanitizePersistedGlossaryEntries(
+      glossaryEntries,
+      identity.documentId,
+    );
     const existingState = sanitizeDocumentState(
       await database.get(DOCUMENT_STATE_STORE, identity.documentId),
       identity.documentId,
@@ -633,6 +644,7 @@ export async function saveDocumentState(
       displayTitle: normalizeDisplayTitle(displayTitle, identity.documentName),
       annotations: sanitizedAnnotations,
       notes: sanitizedNotes,
+      glossaryEntries: sanitizedGlossaryEntries,
       nextNoteNumber: normalizeNextNoteNumber(nextNoteNumber, sanitizedNotes),
       updatedAt: Date.now(),
       ...(existingState ? getDocumentLibraryMetadata(existingState) : createEmptyLibraryMetadata()),
@@ -681,6 +693,7 @@ function createEmptyDocumentState(identity: DocumentIdentity): PersistedDocument
     displayTitle: identity.documentName,
     annotations: [],
     notes: [],
+    glossaryEntries: [],
     nextNoteNumber: 1,
     updatedAt: Date.now(),
     collectionIds: [],
@@ -724,6 +737,7 @@ function sanitizeDocumentState(
     (value.schemaVersion !== PERSISTENCE_SCHEMA_VERSION &&
       value.schemaVersion !== HIGHLIGHT_NOTE_SCHEMA_VERSION &&
       value.schemaVersion !== DOCUMENT_METADATA_SCHEMA_VERSION &&
+      value.schemaVersion !== PREVIOUS_PERSISTENCE_SCHEMA_VERSION &&
       value.schemaVersion !== PREVIOUS_SCHEMA_VERSION &&
       value.schemaVersion !== LEGACY_SCHEMA_VERSION)
   ) {
@@ -740,6 +754,7 @@ function sanitizeDocumentState(
 
   const annotations = sanitizeAnnotations(value.annotations ?? value.highlights);
   const notes = sanitizeNotes(value.notes, annotations);
+  const glossaryEntries = sanitizePersistedGlossaryEntries(value.glossaryEntries, expectedDocumentId);
   const originalFileName = isNonEmptyString(value.originalFileName)
     ? value.originalFileName
     : value.documentName;
@@ -752,6 +767,7 @@ function sanitizeDocumentState(
     displayTitle: normalizeDisplayTitle(value.displayTitle, originalFileName),
     annotations,
     notes,
+    glossaryEntries,
     nextNoteNumber: normalizeNextNoteNumber(value.nextNoteNumber, notes),
     updatedAt: isTimestamp(value.updatedAt) ? value.updatedAt : 0,
     ...sanitizeDocumentLibraryMetadata(value),

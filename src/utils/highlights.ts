@@ -43,8 +43,8 @@ function createAnnotationsFromSelections<TType extends PdfAnnotation['type']>(
       return [];
     }
 
-    const rects = normalizeRectangles(
-      simplifySelectionRectangles(selection.boundingRectangles),
+    const rects = normalizeSelectionRectangles(
+      selection.boundingRectangles,
       selection.pageWidth,
       selection.pageHeight,
     );
@@ -204,12 +204,12 @@ function belongsToSameVisualLine(
   );
 }
 
-function normalizeRectangles(
+export function normalizeSelectionRectangles(
   rectangles: PdfTextSelectionRectangle[],
   pageWidth: number,
   pageHeight: number,
 ): NormalizedHighlightRectangle[] {
-  return rectangles.map((rectangle) => ({
+  return simplifySelectionRectangles(rectangles).map((rectangle) => ({
     x: rectangle.left / pageWidth,
     y: rectangle.top / pageHeight,
     width: rectangle.width / pageWidth,

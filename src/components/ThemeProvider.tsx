@@ -19,6 +19,7 @@ function createThemeVariables(theme: ThemeDefinition): CSSProperties {
     '--theme-selection': theme.mutedTextColor,
     '--theme-highlight': theme.highlightColor,
     '--theme-underline': theme.underlineColor,
+    '--glossary-underline-color': theme.glossaryUnderlineColor,
     '--theme-note': theme.noteColor,
     '--theme-bold': theme.textColor,
     '--theme-page-background': theme.pageBackground,

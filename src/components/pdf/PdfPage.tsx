@@ -14,6 +14,8 @@ import {
 } from 'pdfjs-dist';
 import type { ElementSize } from '../../hooks/useElementSize';
 import type { PdfSearchResult } from '../../types/pdfSearch';
+import type { DefinitionBubble as DefinitionBubbleModel, GlossaryEntry } from '../../types/glossary';
+import type { PdfTextSelection } from '../../types/textSelection';
 import {
   highlightColors,
   underlineColors,
@@ -21,6 +23,9 @@ import {
 } from '../../types/highlight';
 import { correctTextLayerReadingOrder } from '../../utils/textLayerReadingOrder';
 import { getHighlightRenderGroups, normalizeAnnotationVisualGeometry } from '../../utils/highlights';
+import { extractEnglishLookupWord } from '../../utils/dictionary';
+import { getPdfTextSelections } from '../../utils/textSelection';
+import { DefinitionBubble } from './DefinitionBubble';
 
 type FitMode = 'width' | 'page' | null;
 
@@ -48,11 +53,19 @@ interface PdfPageProps {
   fitMode: FitMode;
   zoom: number;
   annotations: PdfAnnotation[];
+  glossaryEntries: GlossaryEntry[];
+  definitionBubbles: DefinitionBubbleModel[];
   activeAnnotationId: string | null;
+  activeGlossaryEntryId: string | null;
   onCurrentPageChange: (pageNumber: number) => void;
   onScaleChange: (pageNumber: number, scale: number) => void;
   onGoToPage: (pageNumber: number) => void;
   onAnnotationSelect: (annotationId: string, left: number, top: number) => void;
+  onWordLookup: (selection: PdfTextSelection) => void;
+  onAddBubbleToGlossary: (bubbleId: string) => void;
+  onCloseDefinitionBubble: (bubbleId: string) => void;
+  onMoveDefinitionUp: (bubbleId: string, definitionId: string) => void;
+  onToggleDefinitionsExpanded: (bubbleId: string) => void;
   onPageLayoutChange: (pageNumber: number) => void;
   onTextLayerReady: (pageNumber: number) => void;
   searchResults: PdfSearchResult[];
@@ -67,11 +80,19 @@ export function PdfPage({
   fitMode,
   zoom,
   annotations,
+  glossaryEntries,
+  definitionBubbles,
   activeAnnotationId,
+  activeGlossaryEntryId,
   onCurrentPageChange,
   onScaleChange,
   onGoToPage,
   onAnnotationSelect,
+  onWordLookup,
+  onAddBubbleToGlossary,
+  onCloseDefinitionBubble,
+  onMoveDefinitionUp,
+  onToggleDefinitionsExpanded,
   onPageLayoutChange,
   onTextLayerReady,
   searchResults,
@@ -378,6 +399,24 @@ export function PdfPage({
     }
   };
 
+  const handleTextLayerDoubleClick = () => {
+    const selection = window.getSelection();
+    const shell = shellRef.current;
+    if (!selection || !shell || selection.isCollapsed || selection.rangeCount !== 1) {
+      return;
+    }
+
+    const pageSelection = getPdfTextSelections(selection, shell).find(
+      (candidate) => candidate.pageNumber === pageNumber,
+    );
+    const lookupWord = pageSelection ? extractEnglishLookupWord(pageSelection.text) : null;
+    if (!pageSelection || !lookupWord) {
+      return;
+    }
+
+    onWordLookup({ ...pageSelection, text: lookupWord });
+  };
+
   const shellStyle = dimensions
     ? ({
         width: dimensions.width,
@@ -431,6 +470,31 @@ export function PdfPage({
                 />
               );
             }))}
+            {glossaryEntries.flatMap((entry) => entry.sourceRects.map((rectangle, index) => {
+              const metrics = getUnderlineMetrics(rectangle, dimensions.height);
+              const overlapsOrdinaryUnderline = underlines.some((underline) =>
+                underline.rects.some((candidate) => rectanglesOverlap(candidate, rectangle)),
+              );
+              const y = clamp(
+                metrics.y - (overlapsOrdinaryUnderline ? 3 : 0),
+                0,
+                dimensions.height - GLOSSARY_UNDERLINE_STROKE_WIDTH,
+              );
+              return (
+                <line
+                  className={`glossary-underline ${entry.glossaryEntryId === activeGlossaryEntryId ? 'is-active' : ''}`}
+                  data-glossary-entry-id={entry.glossaryEntryId}
+                  key={`${entry.markerAnnotationId}-${index}`}
+                  strokeLinecap="round"
+                  strokeWidth={GLOSSARY_UNDERLINE_STROKE_WIDTH}
+                  vectorEffect="non-scaling-stroke"
+                  x1={snapToDevicePixel(rectangle.x * dimensions.width)}
+                  x2={snapToDevicePixel((rectangle.x + rectangle.width) * dimensions.width)}
+                  y1={y}
+                  y2={y}
+                />
+              );
+            }))}
             {activeAnnotation?.rects.map((rectangle, index) => (
               <rect
                 className="active-highlight-indicator"
@@ -466,6 +530,7 @@ export function PdfPage({
           data-pdf-text-layer
           data-page-number={pageNumber}
           onClick={handleTextLayerClick}
+          onDoubleClick={handleTextLayerDoubleClick}
         />
         {links.map((link) => (
           <a
@@ -484,12 +549,39 @@ export function PdfPage({
             }}
           />
         ))}
+        {dimensions
+          ? definitionBubbles.map((bubble) => (
+              <DefinitionBubble
+                bubble={bubble}
+                key={bubble.id}
+                pageHeight={dimensions.height}
+                pageWidth={dimensions.width}
+                onAddToGlossary={onAddBubbleToGlossary}
+                onClose={onCloseDefinitionBubble}
+                onMoveDefinitionUp={onMoveDefinitionUp}
+                onToggleExpanded={onToggleDefinitionsExpanded}
+              />
+            ))
+          : null}
       </div>
     </article>
   );
 }
 
 const UNDERLINE_STROKE_WIDTH = 1.85;
+const GLOSSARY_UNDERLINE_STROKE_WIDTH = 1.85;
+
+function rectanglesOverlap(
+  first: { x: number; y: number; width: number; height: number },
+  second: { x: number; y: number; width: number; height: number },
+): boolean {
+  return (
+    first.x < second.x + second.width &&
+    first.x + first.width > second.x &&
+    first.y < second.y + second.height &&
+    first.y + first.height > second.y
+  );
+}
 
 function getUnderlineMetrics(
   rectangle: { y: number; height: number },

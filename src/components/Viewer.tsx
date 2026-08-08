@@ -20,6 +20,11 @@ import type {
 import type { DocumentIdentity } from '../types/persistence';
 import type { ReadingPosition } from '../types/library';
 import type { PdfTextSelection } from '../types/textSelection';
+import type {
+  DefinitionBubble,
+  DictionaryDefinition,
+  GlossaryEntry,
+} from '../types/glossary';
 import { resolveDocumentIdentity } from '../utils/documentIdentity';
 import { createPdfDocumentInitParameters } from '../utils/pdfJsAssets';
 import { PdfPage } from './pdf/PdfPage';
@@ -28,6 +33,8 @@ import type { AnnotationFilterState } from './pdf/AnnotationFilterControl';
 import { matchesAnnotationFilter } from '../utils/annotationFilter';
 import { logNavigationDiagnostic } from '../utils/navigationDiagnostics';
 import { SelectionAction } from './pdf/SelectionAction';
+import { extractEnglishLookupWord, moveDefinitionUp } from '../utils/dictionary';
+import { normalizeSelectionRectangles } from '../utils/highlights';
 
 GlobalWorkerOptions.workerSrc = pdfWorker;
 
@@ -42,8 +49,14 @@ interface ViewerProps {
   onCurrentPageChange: (pageNumber: number) => void;
   onEffectiveZoomChange: (zoom: number) => void;
   onDocumentReady: (identity: DocumentIdentity, file: File) => void;
+  documentId: string | null;
   onTextSelectionChange?: (selection: PdfTextSelection[]) => void;
   annotations: PdfAnnotation[];
+  glossaryEntries: GlossaryEntry[];
+  onAddGlossaryEntry: (
+    bubble: DefinitionBubble,
+    preferredDefinition: DictionaryDefinition,
+  ) => GlossaryEntry | null;
   onCreateHighlights: (selections: PdfTextSelection[], color: HighlightColor) => void;
   onCreateUnderlines: (selections: PdfTextSelection[], color: UnderlineColor) => void;
   onRemoveAnnotation: (annotationId: string) => void;
@@ -70,6 +83,7 @@ export interface PdfSearchToolbarState {
 export interface ViewerHandle {
   captureZoomAnchor: (operationId: number) => void;
   navigateToAnnotation: (annotationId: string) => boolean;
+  navigateToGlossaryEntry: (glossaryEntryId: string) => boolean;
   goToPage: (pageNumber: number) => void;
   openSearch: () => void;
   closeSearch: () => void;
@@ -102,8 +116,11 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(function Viewer({
   onCurrentPageChange,
   onEffectiveZoomChange,
   onDocumentReady,
+  documentId,
   onTextSelectionChange,
   annotations,
+  glossaryEntries,
+  onAddGlossaryEntry,
   onCreateHighlights,
   onCreateUnderlines,
   onRemoveAnnotation,
@@ -153,6 +170,9 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(function Viewer({
   const [highlightColor, setHighlightColor] = useState<HighlightColor>('yellow');
   const [underlineColor, setUnderlineColor] = useState<UnderlineColor>('blue');
   const [activeAnnotationId, setActiveAnnotationId] = useState<string | null>(null);
+  const [activeGlossaryEntryId, setActiveGlossaryEntryId] = useState<string | null>(null);
+  const [definitionBubbles, setDefinitionBubbles] = useState<DefinitionBubble[]>([]);
+  const dictionaryGenerationRef = useRef(0);
   const [activePageNumber, setActivePageNumber] = useState(1);
   const search = usePdfSearch(document);
   const activeSearchResultId = search.activeResult?.id ?? null;
@@ -255,6 +275,39 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(function Viewer({
     pendingAnnotationNavigationRef.current = annotationId;
     return applyAnnotationNavigation(annotationId);
   }, [applyAnnotationNavigation]);
+
+  const navigateToGlossaryEntry = useCallback((glossaryEntryId: string) => {
+    const entry = glossaryEntries.find(
+      (candidate) => candidate.glossaryEntryId === glossaryEntryId,
+    );
+    if (!entry) return false;
+    const scroller = scrollRef.current;
+    const page = scroller?.querySelector<HTMLElement>(`#page-${entry.pageNumber}`);
+    const rectangle = entry.sourceRects[0];
+    if (!scroller || !page || !rectangle || page.clientHeight === 0) return false;
+
+    const scrollerRectangle = scroller.getBoundingClientRect();
+    const pageRectangle = page.getBoundingClientRect();
+    const anchorY =
+      pageRectangle.top + (rectangle.y + rectangle.height / 2) * pageRectangle.height;
+    const preferredY = scrollerRectangle.top + scroller.clientHeight * 0.4;
+    navigationEpochRef.current += 1;
+    scroller.scrollTop = clamp(
+      scroller.scrollTop + anchorY - preferredY,
+      0,
+      Math.max(0, scroller.scrollHeight - scroller.clientHeight),
+    );
+    onExplicitNavigation?.();
+    setActiveGlossaryEntryId(glossaryEntryId);
+    if (highlightIndicatorTimeoutRef.current !== null) {
+      clearTimeout(highlightIndicatorTimeoutRef.current);
+    }
+    highlightIndicatorTimeoutRef.current = setTimeout(() => {
+      setActiveGlossaryEntryId(null);
+      highlightIndicatorTimeoutRef.current = null;
+    }, 1200);
+    return true;
+  }, [glossaryEntries, onExplicitNavigation]);
 
   const goToPage = useCallback((pageNumber: number) => {
     navigationEpochRef.current += 1;
@@ -426,6 +479,7 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(function Viewer({
     () => ({
       captureZoomAnchor,
       navigateToAnnotation,
+      navigateToGlossaryEntry,
       goToPage,
       openSearch: search.open,
       closeSearch: search.close,
@@ -436,8 +490,119 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(function Viewer({
       restoreReadingPosition,
       getNavigationEpoch: () => navigationEpochRef.current,
     }),
-    [captureReadingPosition, captureZoomAnchor, goToPage, navigateToAnnotation, restoreReadingPosition, search.close, search.goToNextResult, search.goToPreviousResult, search.open, search.setQuery],
+    [captureReadingPosition, captureZoomAnchor, goToPage, navigateToAnnotation, navigateToGlossaryEntry, restoreReadingPosition, search.close, search.goToNextResult, search.goToPreviousResult, search.open, search.setQuery],
   );
+
+  const lookupWord = useCallback((selection: PdfTextSelection) => {
+    const displayedWord = extractEnglishLookupWord(selection.text);
+    if (!displayedWord || !documentId || selection.pageWidth <= 0 || selection.pageHeight <= 0) {
+      return;
+    }
+    const rects = normalizeSelectionRectangles(
+      selection.boundingRectangles,
+      selection.pageWidth,
+      selection.pageHeight,
+    );
+    if (rects.length === 0) return;
+    const bubbleId = createDefinitionBubbleId(selection.pageNumber, rects);
+    const generation = dictionaryGenerationRef.current;
+    const existingGlossaryEntry = glossaryEntries.find(
+      (entry) =>
+        entry.pageNumber === selection.pageNumber &&
+        entry.startOffset === selection.startOffset &&
+        entry.endOffset === selection.endOffset &&
+        rectanglesMatch(entry.sourceRects, rects),
+    );
+    const bubble: DefinitionBubble = {
+      id: bubbleId,
+      documentId,
+      pageNumber: selection.pageNumber,
+      displayedWord,
+      normalizedLookupWord: displayedWord.toLocaleLowerCase('en-US'),
+      rects,
+      startOffset: selection.startOffset,
+      endOffset: selection.endOffset,
+      definitions: [],
+      status: 'loading',
+      isExpanded: false,
+      ...(existingGlossaryEntry
+        ? { glossaryEntryId: existingGlossaryEntry.glossaryEntryId }
+        : {}),
+    };
+    setDefinitionBubbles((current) => {
+      const index = current.findIndex((candidate) => candidate.id === bubbleId);
+      return index === -1
+        ? [...current, bubble]
+        : current.map((candidate) =>
+            candidate.id === bubbleId
+              ? { ...candidate, status: 'loading', displayedWord }
+              : candidate,
+          );
+    });
+
+    void import('../services/dictionaryService')
+      .then(({ lookupLocalDictionary }) => lookupLocalDictionary(displayedWord))
+      .then((result) => {
+        if (dictionaryGenerationRef.current !== generation) return;
+        setDefinitionBubbles((current) =>
+          current.map((candidate) =>
+            candidate.id === bubbleId
+              ? {
+                  ...candidate,
+                  normalizedLookupWord: result.normalizedWord,
+                  definitions: result.definitions,
+                  status: result.definitions.length > 0 ? 'ready' : 'not-found',
+                }
+              : candidate,
+          ),
+        );
+      })
+      .catch(() => {
+        if (dictionaryGenerationRef.current !== generation) return;
+        setDefinitionBubbles((current) =>
+          current.map((candidate) =>
+            candidate.id === bubbleId ? { ...candidate, status: 'error' } : candidate,
+          ),
+        );
+      });
+  }, [documentId, glossaryEntries]);
+
+  const addBubbleToGlossary = useCallback((bubbleId: string) => {
+    const bubble = definitionBubbles.find((candidate) => candidate.id === bubbleId);
+    const preferredDefinition = bubble?.definitions[0];
+    if (!bubble || !preferredDefinition || bubble.glossaryEntryId) return;
+    const entry = onAddGlossaryEntry(bubble, preferredDefinition);
+    if (!entry) return;
+    setDefinitionBubbles((current) =>
+      current.map((candidate) =>
+        candidate.id === bubbleId
+          ? { ...candidate, glossaryEntryId: entry.glossaryEntryId }
+          : candidate,
+      ),
+    );
+  }, [definitionBubbles, onAddGlossaryEntry]);
+
+  const closeDefinitionBubble = useCallback((bubbleId: string) => {
+    setDefinitionBubbles((current) => current.filter((bubble) => bubble.id !== bubbleId));
+  }, []);
+
+  const moveBubbleDefinitionUp = useCallback((bubbleId: string, definitionId: string) => {
+    setDefinitionBubbles((current) =>
+      current.map((bubble) =>
+        bubble.id === bubbleId
+          ? { ...bubble, definitions: moveDefinitionUp(bubble.definitions, definitionId) }
+          : bubble,
+      ),
+    );
+  }, []);
+
+  const toggleDefinitionsExpanded = useCallback((bubbleId: string) => {
+    setDefinitionBubbles((current) =>
+      current.map((bubble) =>
+        bubble.id === bubbleId ? { ...bubble, isExpanded: !bubble.isExpanded } : bubble,
+      ),
+    );
+  }, []);
   const handleTextSelectionChange = useCallback(
     (selection: PdfTextSelection[]) => {
       textSelectionRef.current = selection;
@@ -569,8 +734,8 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(function Viewer({
         onCurrentPageChange(1);
       })
       .catch(() => {
-      if (!isDisposed) {
-        onPdfDocumentChange?.(null);
+        if (!isDisposed) {
+          onPdfDocumentChange?.(null);
           setError('This PDF could not be opened.');
           onPageCountChange(0);
           onCurrentPageChange(0);
@@ -585,7 +750,11 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(function Viewer({
     };
   }, [file, onCurrentPageChange, onPageCountChange, onDocumentReady, onPdfDocumentChange]);
 
-  useEffect(() => setSearchPanelPosition(null), [file]);
+  useEffect(() => {
+    setSearchPanelPosition(null);
+    dictionaryGenerationRef.current += 1;
+    setDefinitionBubbles([]);
+  }, [file]);
 
   const visibleAnnotations = annotations.filter((annotation) => matchesAnnotationFilter(annotation, notedAnnotationIds, annotationFilter));
   const annotationsForPage = (pageNumber: number) => {
@@ -734,7 +903,14 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(function Viewer({
                   document={document}
                   fitMode={fitMode}
                   annotations={annotationsForPage(index + 1)}
+                  glossaryEntries={glossaryEntries.filter(
+                    (entry) => entry.pageNumber === index + 1,
+                  )}
+                  definitionBubbles={definitionBubbles.filter(
+                    (bubble) => bubble.pageNumber === index + 1,
+                  )}
                   activeAnnotationId={activeAnnotationId}
+                  activeGlossaryEntryId={activeGlossaryEntryId}
                   key={index + 1}
                   onCurrentPageChange={() => undefined}
                   onScaleChange={(pageNumber, scale) => {
@@ -744,6 +920,11 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(function Viewer({
                   }}
                   onGoToPage={goToPage}
                   onAnnotationSelect={selectHighlight}
+                  onWordLookup={lookupWord}
+                  onAddBubbleToGlossary={addBubbleToGlossary}
+                  onCloseDefinitionBubble={closeDefinitionBubble}
+                  onMoveDefinitionUp={moveBubbleDefinitionUp}
+                  onToggleDefinitionsExpanded={toggleDefinitionsExpanded}
                   onPageLayoutChange={handlePageLayoutChange}
                   onTextLayerReady={handleTextLayerReady}
                   searchResults={search.results.filter((result) => result.pageNumber === index + 1)}
@@ -855,4 +1036,36 @@ function getSelectionActionPosition(
     left: Math.min(Math.max(anchor.left, 8), window.innerWidth - 110),
     top: Math.max(anchor.top - 42, 8),
   };
+}
+
+function createDefinitionBubbleId(
+  pageNumber: number,
+  rects: Array<{ x: number; y: number; width: number; height: number }>,
+): string {
+  return `definition:${pageNumber}:${rects
+    .map((rectangle) =>
+      [rectangle.x, rectangle.y, rectangle.width, rectangle.height]
+        .map((value) => value.toFixed(5))
+        .join(','),
+    )
+    .join(';')}`;
+}
+
+function rectanglesMatch(
+  first: Array<{ x: number; y: number; width: number; height: number }>,
+  second: Array<{ x: number; y: number; width: number; height: number }>,
+): boolean {
+  return (
+    first.length === second.length &&
+    first.every((rectangle, index) => {
+      const candidate = second[index];
+      return (
+        candidate !== undefined &&
+        Math.abs(rectangle.x - candidate.x) < 0.0001 &&
+        Math.abs(rectangle.y - candidate.y) < 0.0001 &&
+        Math.abs(rectangle.width - candidate.width) < 0.0001 &&
+        Math.abs(rectangle.height - candidate.height) < 0.0001
+      );
+    })
+  );
 }

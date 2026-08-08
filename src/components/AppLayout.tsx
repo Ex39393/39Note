@@ -1,4 +1,12 @@
-import { lazy, Suspense, useCallback, useEffect, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react';
+import {
+  lazy,
+  Suspense,
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  type PointerEvent as ReactPointerEvent,
+} from 'react';
 import type { PDFDocumentProxy } from 'pdfjs-dist';
 import { Sidebar } from './Sidebar';
 import { Toolbar } from './Toolbar';
@@ -6,12 +14,28 @@ import { Viewer, type ViewerHandle } from './Viewer';
 import { NotesPanel } from './NotesPanel';
 import { LargeNoteEditor } from './LargeNoteEditor';
 import { WebLocalDataNotice } from './WebLocalDataNotice';
+import { AnnotatedPdfExportDialog } from './AnnotatedPdfExportDialog';
 import type { AnnotationFilterState } from './pdf/AnnotationFilterControl';
 import type { HighlightColor, PdfAnnotation, UnderlineColor } from '../types/highlight';
 import type { Note } from '../types/note';
+import type {
+  DefinitionBubble,
+  DictionaryDefinition,
+  GlossaryEntry,
+  NotesPrintLayout,
+} from '../types/glossary';
+import type {
+  AnnotatedPdfExportOptions,
+  AnnotatedPdfExportProgress,
+  PdfPageGeometry,
+} from '../types/annotatedPdfExport';
 import type { DocumentIdentity } from '../types/persistence';
 import type { PdfTextSelection } from '../types/textSelection';
-import type { DocumentOpenRequest, DocumentOpenSource, DocumentOpenTarget } from '../types/documentOpen';
+import type {
+  DocumentOpenRequest,
+  DocumentOpenSource,
+  DocumentOpenTarget,
+} from '../types/documentOpen';
 import type { ReadingPosition } from '../types/library';
 import {
   deleteDocumentState,
@@ -37,8 +61,16 @@ import {
   type InitialNavigationDecision,
 } from '../utils/initialNavigation';
 import { logNavigationDiagnostic } from '../utils/navigationDiagnostics';
+import { normalizePdfRotation } from '../utils/annotatedPdfExportModel';
+import { selectAnnotationsForExport } from '../utils/annotatedPdfExportSelection';
+import {
+  createGlossaryEntryFromBubble,
+  removeGlossaryEntry as removeGlossaryEntryFromState,
+} from '../utils/glossary';
 
-const LibraryPanel = lazy(() => import('./LibraryPanel').then((module) => ({ default: module.LibraryPanel })));
+const LibraryPanel = lazy(() =>
+  import('./LibraryPanel').then((module) => ({ default: module.LibraryPanel })),
+);
 
 type FitMode = 'width' | 'page' | null;
 
@@ -61,10 +93,14 @@ interface NoteDragPreviewState {
 }
 
 export function AppLayout() {
-  const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(() => sessionStorage.getItem('39note.reader-tools-open') === 'false');
+  const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(
+    () => sessionStorage.getItem('39note.reader-tools-open') === 'false',
+  );
   const [sidebarWidth, setSidebarWidth] = useState(() => {
     const storedWidth = Number(sessionStorage.getItem('39note.sidebar-width'));
-    return Number.isFinite(storedWidth) && storedWidth >= 240 && storedWidth <= 520 ? storedWidth : 300;
+    return Number.isFinite(storedWidth) && storedWidth >= 240 && storedWidth <= 520
+      ? storedWidth
+      : 300;
   });
   const [file, setFile] = useState<File | null>(null);
   const [pdfDocument, setPdfDocument] = useState<PDFDocumentProxy | null>(null);
@@ -75,8 +111,11 @@ export function AppLayout() {
   const [currentPage, setCurrentPage] = useState(0);
   const [annotations, setAnnotations] = useState<PdfAnnotation[]>([]);
   const [notes, setNotes] = useState<Note[]>([]);
+  const [glossaryEntries, setGlossaryEntries] = useState<GlossaryEntry[]>([]);
   const [nextNoteNumber, setNextNoteNumber] = useState(1);
-  const [documentIdentity, setDocumentIdentity] = useState<DocumentIdentity | null>(null);
+  const [documentIdentity, setDocumentIdentity] = useState<DocumentIdentity | null>(
+    null,
+  );
   const [documentDisplayTitle, setDocumentDisplayTitle] = useState<string | null>(null);
   const [isDocumentHydrated, setIsDocumentHydrated] = useState(false);
   const [focusedNoteId, setFocusedNoteId] = useState<string | null>(null);
@@ -88,12 +127,20 @@ export function AppLayout() {
   const [storageWarning, setStorageWarning] = useState<string | null>(null);
   const [exportWarning, setExportWarning] = useState<string | null>(null);
   const [isPdfExporting, setIsPdfExporting] = useState(false);
+  const [isAnnotatedPdfDialogOpen, setIsAnnotatedPdfDialogOpen] = useState(false);
+  const [isAnnotatedPdfExporting, setIsAnnotatedPdfExporting] = useState(false);
+  const [annotatedPdfProgress, setAnnotatedPdfProgress] =
+    useState<AnnotatedPdfExportProgress | null>(null);
+  const [annotatedPdfError, setAnnotatedPdfError] = useState<string | null>(null);
+  const annotatedPdfExportInFlightRef = useRef(false);
   const [pendingLibraryNavigation, setPendingLibraryNavigation] =
     useState<PendingLibraryNavigation | null>(null);
   const [documentOpenRequest, setDocumentOpenRequestState] =
     useState<DocumentOpenRequest | null>(null);
   const [zoomOperationId, setZoomOperationId] = useState(0);
-  const [noteDragPreview, setNoteDragPreview] = useState<NoteDragPreviewState | null>(null);
+  const [noteDragPreview, setNoteDragPreview] = useState<NoteDragPreviewState | null>(
+    null,
+  );
   const [largeEditorNoteId, setLargeEditorNoteId] = useState<string | null>(null);
   const [readingRestoreToast, setReadingRestoreToast] = useState<string | null>(null);
   const [annotationFilter, setAnnotationFilter] = useState<AnnotationFilterState>({
@@ -101,7 +148,9 @@ export function AppLayout() {
     noteStatus: 'all',
     colors: [],
   });
-  const readingRestoreToastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const readingRestoreToastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(
+    null,
+  );
   const viewerRef = useRef<ViewerHandle>(null);
   const zoomOperationRef = useRef(0);
   const hydrationRequestRef = useRef(0);
@@ -128,6 +177,7 @@ export function AppLayout() {
     documentIdentity,
     annotations,
     notes,
+    glossaryEntries,
     nextNoteNumber,
     documentDisplayTitle,
     isDocumentHydrated,
@@ -137,15 +187,19 @@ export function AppLayout() {
     documentIdentity,
     annotations,
     notes,
+    glossaryEntries,
     nextNoteNumber,
     documentDisplayTitle,
     isDocumentHydrated,
   };
 
-  const commitDocumentOpenRequest = useCallback((request: DocumentOpenRequest | null) => {
-    documentOpenRequestRef.current = request;
-    setDocumentOpenRequestState(request);
-  }, []);
+  const commitDocumentOpenRequest = useCallback(
+    (request: DocumentOpenRequest | null) => {
+      documentOpenRequestRef.current = request;
+      setDocumentOpenRequestState(request);
+    },
+    [],
+  );
 
   const persistCurrentDocument = useCallback(async (): Promise<boolean> => {
     const currentState = documentStateRef.current;
@@ -157,6 +211,7 @@ export function AppLayout() {
       currentState.documentIdentity,
       currentState.annotations,
       currentState.notes,
+      currentState.glossaryEntries,
       currentState.nextNoteNumber,
       currentState.documentDisplayTitle ?? currentState.documentIdentity.documentName,
     );
@@ -195,7 +250,14 @@ export function AppLayout() {
         persistenceTimerRef.current = null;
       }
     };
-  }, [annotations, documentIdentity, isDocumentHydrated, notes, persistCurrentDocument]);
+  }, [
+    annotations,
+    documentIdentity,
+    isDocumentHydrated,
+    notes,
+    glossaryEntries,
+    persistCurrentDocument,
+  ]);
 
   useEffect(() => {
     const handlePageExit = () => {
@@ -224,220 +286,351 @@ export function AppLayout() {
     sessionStorage.setItem('39note.reader-tools-open', String(!isSidebarCollapsed));
   }, [isSidebarCollapsed]);
 
-  const createDocumentOpenRequest = useCallback((
-    documentId: string,
-    source: DocumentOpenSource,
-    target: DocumentOpenTarget,
-  ): DocumentOpenRequest => {
-    const request: DocumentOpenRequest = {
-      requestId: crypto.randomUUID(),
-      documentId,
-      source,
-      target,
-      createdAt: Date.now(),
-      generation: documentGenerationRef.current + 1,
-      navigationEpoch: viewerRef.current?.getNavigationEpoch() ?? 0,
-    };
-    logNavigationDiagnostic('open-request-created', {
-      requestId: request.requestId,
-      documentId: request.documentId,
-      source: request.source,
-      targetType: request.target?.type ?? 'none',
-      generation: request.generation,
-      navigationEpoch: request.navigationEpoch,
-    });
-    return request;
-  }, []);
+  const createDocumentOpenRequest = useCallback(
+    (
+      documentId: string,
+      source: DocumentOpenSource,
+      target: DocumentOpenTarget,
+    ): DocumentOpenRequest => {
+      const request: DocumentOpenRequest = {
+        requestId: crypto.randomUUID(),
+        documentId,
+        source,
+        target,
+        createdAt: Date.now(),
+        generation: documentGenerationRef.current + 1,
+        navigationEpoch: viewerRef.current?.getNavigationEpoch() ?? 0,
+      };
+      logNavigationDiagnostic('open-request-created', {
+        requestId: request.requestId,
+        documentId: request.documentId,
+        source: request.source,
+        targetType: request.target?.type ?? 'none',
+        generation: request.generation,
+        navigationEpoch: request.navigationEpoch,
+      });
+      return request;
+    },
+    [],
+  );
 
-  const openDocument = useCallback((nextFile: File, requestedOpen?: DocumentOpenRequest) => {
-    void flushPersistence();
-    hydrationRequestRef.current += 1;
-    documentGenerationRef.current += 1;
-    storedPdfLoadRequestRef.current += 1;
-    const openRequest = requestedOpen ?? createDocumentOpenRequest('', 'normal-library-open', null);
-    commitDocumentOpenRequest({ ...openRequest, generation: documentGenerationRef.current });
-    openingResolutionRef.current = 'pending';
-    hydratedReadingPositionRef.current = null;
-    initialNavigationApplicationRef.current = null;
-    if (!requestedOpen?.target) {
-      libraryNavigationRequestRef.current += 1;
-      pendingLibraryNavigationRef.current = null;
-      setPendingLibraryNavigation(null);
-    }
-    setFile(nextFile);
-    setPdfDocument(null);
-    setFitMode('width');
-    setZoom(1);
-    setEffectiveZoom(1);
-    setPageCount(0);
-    setCurrentPage(0);
-    setAnnotations([]);
-    setAnnotationFilter({ types: ['highlight', 'underline'], noteStatus: 'all', colors: [] });
-    setNotes([]);
-    setNextNoteNumber(1);
-    setDocumentIdentity(null);
-    setDocumentDisplayTitle(nextFile.name);
-    setIsDocumentHydrated(false);
-    setFocusedNoteId(null);
-    setNoteDragPreview(null);
-    setLargeEditorNoteId(null);
-    setExportWarning(null);
-    setIsLibraryOpen(false);
-  }, [commitDocumentOpenRequest, createDocumentOpenRequest, flushPersistence]);
-
-  const hydrateDocument = useCallback((identity: DocumentIdentity, sourceFile: File) => {
-    const requestId = hydrationRequestRef.current + 1;
-    hydrationRequestRef.current = requestId;
-    const generation = documentGenerationRef.current;
-    const currentOpenRequest = documentOpenRequestRef.current;
-    if (currentOpenRequest && currentOpenRequest.generation === generation) {
-      if (currentOpenRequest.documentId && currentOpenRequest.documentId !== identity.documentId) {
-        setStorageWarning('The selected PDF does not match the requested Library document.');
-        return;
+  const openDocument = useCallback(
+    (nextFile: File, requestedOpen?: DocumentOpenRequest) => {
+      void flushPersistence();
+      hydrationRequestRef.current += 1;
+      documentGenerationRef.current += 1;
+      storedPdfLoadRequestRef.current += 1;
+      const openRequest =
+        requestedOpen ?? createDocumentOpenRequest('', 'normal-library-open', null);
+      commitDocumentOpenRequest({
+        ...openRequest,
+        generation: documentGenerationRef.current,
+      });
+      openingResolutionRef.current = 'pending';
+      hydratedReadingPositionRef.current = null;
+      initialNavigationApplicationRef.current = null;
+      if (!requestedOpen?.target) {
+        libraryNavigationRequestRef.current += 1;
+        pendingLibraryNavigationRef.current = null;
+        setPendingLibraryNavigation(null);
       }
-      if (!currentOpenRequest.documentId) {
-        commitDocumentOpenRequest({ ...currentOpenRequest, documentId: identity.documentId });
+      setFile(nextFile);
+      setPdfDocument(null);
+      setFitMode('width');
+      setZoom(1);
+      setEffectiveZoom(1);
+      setPageCount(0);
+      setCurrentPage(0);
+      setAnnotations([]);
+      setAnnotationFilter({
+        types: ['highlight', 'underline'],
+        noteStatus: 'all',
+        colors: [],
+      });
+      setNotes([]);
+      setGlossaryEntries([]);
+      setNextNoteNumber(1);
+      setDocumentIdentity(null);
+      setDocumentDisplayTitle(nextFile.name);
+      setIsDocumentHydrated(false);
+      setFocusedNoteId(null);
+      setNoteDragPreview(null);
+      setLargeEditorNoteId(null);
+      setExportWarning(null);
+      setIsLibraryOpen(false);
+    },
+    [commitDocumentOpenRequest, createDocumentOpenRequest, flushPersistence],
+  );
+
+  const hydrateDocument = useCallback(
+    (identity: DocumentIdentity, sourceFile: File) => {
+      const requestId = hydrationRequestRef.current + 1;
+      hydrationRequestRef.current = requestId;
+      const generation = documentGenerationRef.current;
+      const currentOpenRequest = documentOpenRequestRef.current;
+      if (currentOpenRequest && currentOpenRequest.generation === generation) {
+        if (
+          currentOpenRequest.documentId &&
+          currentOpenRequest.documentId !== identity.documentId
+        ) {
+          setStorageWarning(
+            'The selected PDF does not match the requested Library document.',
+          );
+          return;
+        }
+        if (!currentOpenRequest.documentId) {
+          commitDocumentOpenRequest({
+            ...currentOpenRequest,
+            documentId: identity.documentId,
+          });
+        }
       }
-    }
 
-    setDocumentIdentity(identity);
-    setDocumentDisplayTitle(identity.documentName);
-    setIsDocumentHydrated(false);
-    setAnnotations([]);
-    setNotes([]);
-    setFocusedNoteId(null);
+      setDocumentIdentity(identity);
+      setDocumentDisplayTitle(identity.documentName);
+      setIsDocumentHydrated(false);
+      setAnnotations([]);
+      setNotes([]);
+      setGlossaryEntries([]);
+      setFocusedNoteId(null);
 
-    void storePdfFile(identity, sourceFile).then((wasStored) => {
-      if (wasStored) {
-        setStorageWarning(null);
-        setLibraryRefreshToken((currentToken) => currentToken + 1);
-      } else {
-        setStorageWarning('The PDF copy could not be saved locally. Reading and annotations remain available.');
-      }
-    });
+      void storePdfFile(identity, sourceFile).then((wasStored) => {
+        if (wasStored) {
+          setStorageWarning(null);
+          setLibraryRefreshToken((currentToken) => currentToken + 1);
+        } else {
+          setStorageWarning(
+            'The PDF copy could not be saved locally. Reading and annotations remain available.',
+          );
+        }
+      });
 
-    void loadDocumentState(identity.documentId).then((persistedState) => {
-      if (hydrationRequestRef.current !== requestId || documentGenerationRef.current !== generation) {
-        return;
-      }
+      void loadDocumentState(identity.documentId).then((persistedState) => {
+        if (
+          hydrationRequestRef.current !== requestId ||
+          documentGenerationRef.current !== generation
+        ) {
+          return;
+        }
 
-      setAnnotations(persistedState?.annotations ?? []);
-      setNotes(persistedState?.notes ?? []);
-      hydratedReadingPositionRef.current = persistedState?.readingPosition ?? null;
-      setNextNoteNumber(persistedState?.nextNoteNumber ?? 1);
-      setDocumentDisplayTitle(persistedState?.displayTitle ?? identity.documentName);
-      setIsDocumentHydrated(true);
-    });
-  }, [commitDocumentOpenRequest]);
+        setAnnotations(persistedState?.annotations ?? []);
+        setNotes(persistedState?.notes ?? []);
+        setGlossaryEntries(persistedState?.glossaryEntries ?? []);
+        hydratedReadingPositionRef.current = persistedState?.readingPosition ?? null;
+        setNextNoteNumber(persistedState?.nextNoteNumber ?? 1);
+        setDocumentDisplayTitle(persistedState?.displayTitle ?? identity.documentName);
+        setIsDocumentHydrated(true);
+      });
+    },
+    [commitDocumentOpenRequest],
+  );
 
   useEffect(() => {
-    if (!documentIdentity || !isDocumentHydrated || currentPage < 1 || openingResolutionRef.current === 'pending') return;
-    if (readingPositionTimerRef.current !== null) clearTimeout(readingPositionTimerRef.current);
+    if (
+      !documentIdentity ||
+      !isDocumentHydrated ||
+      currentPage < 1 ||
+      openingResolutionRef.current === 'pending'
+    )
+      return;
+    if (readingPositionTimerRef.current !== null)
+      clearTimeout(readingPositionTimerRef.current);
     readingPositionTimerRef.current = setTimeout(() => {
       const position = viewerRef.current?.captureReadingPosition();
       if (position) void saveReadingPosition(documentIdentity.documentId, position);
       readingPositionTimerRef.current = null;
     }, 1200);
     return () => {
-      if (readingPositionTimerRef.current !== null) clearTimeout(readingPositionTimerRef.current);
+      if (readingPositionTimerRef.current !== null)
+        clearTimeout(readingPositionTimerRef.current);
     };
   }, [currentPage, documentIdentity, effectiveZoom, fitMode, isDocumentHydrated]);
 
-  const createHighlights = useCallback((selections: PdfTextSelection[], color: HighlightColor) => {
-    if (!isDocumentHydrated) {
-      return;
-    }
+  const createHighlights = useCallback(
+    (selections: PdfTextSelection[], color: HighlightColor) => {
+      if (!isDocumentHydrated) {
+        return;
+      }
 
-    const nextHighlights = createHighlightsFromSelections(selections, color);
-    setAnnotations((currentAnnotations) => upsertAnnotations(currentAnnotations, nextHighlights));
-  }, [isDocumentHydrated]);
+      const nextHighlights = createHighlightsFromSelections(selections, color);
+      setAnnotations((currentAnnotations) =>
+        upsertAnnotations(currentAnnotations, nextHighlights),
+      );
+    },
+    [isDocumentHydrated],
+  );
 
-  const createUnderlines = useCallback((selections: PdfTextSelection[], color: UnderlineColor) => {
-    if (!isDocumentHydrated) {
-      return;
-    }
+  const createUnderlines = useCallback(
+    (selections: PdfTextSelection[], color: UnderlineColor) => {
+      if (!isDocumentHydrated) {
+        return;
+      }
 
-    const nextUnderlines = createUnderlinesFromSelections(selections, color);
-    setAnnotations((currentAnnotations) => upsertAnnotations(currentAnnotations, nextUnderlines));
-  }, [isDocumentHydrated]);
+      const nextUnderlines = createUnderlinesFromSelections(selections, color);
+      setAnnotations((currentAnnotations) =>
+        upsertAnnotations(currentAnnotations, nextUnderlines),
+      );
+    },
+    [isDocumentHydrated],
+  );
 
   const removeAnnotation = useCallback((annotationId: string) => {
     setAnnotations((currentAnnotations) =>
       currentAnnotations.filter((annotation) => annotation.id !== annotationId),
     );
-    setNotes((currentNotes) => currentNotes.filter((note) => note.annotationId !== annotationId));
+    setNotes((currentNotes) =>
+      currentNotes.filter((note) => note.annotationId !== annotationId),
+    );
   }, []);
 
-  const updateAnnotationColor = useCallback((annotationId: string, color: HighlightColor | UnderlineColor) => {
-    setAnnotations((currentAnnotations) => currentAnnotations.map((annotation) => {
-      if (annotation.id !== annotationId || annotation.color === color) {
-        return annotation;
+  const updateAnnotationColor = useCallback(
+    (annotationId: string, color: HighlightColor | UnderlineColor) => {
+      setAnnotations((currentAnnotations) =>
+        currentAnnotations.map((annotation) => {
+          if (annotation.id !== annotationId || annotation.color === color) {
+            return annotation;
+          }
+
+          if (
+            annotation.type === 'highlight' &&
+            !['yellow', 'green', 'blue', 'pink'].includes(color)
+          ) {
+            return annotation;
+          }
+          if (
+            annotation.type === 'underline' &&
+            !['red', 'blue', 'green', 'black'].includes(color)
+          ) {
+            return annotation;
+          }
+
+          return { ...annotation, color, updatedAt: Date.now() } as PdfAnnotation;
+        }),
+      );
+    },
+    [],
+  );
+
+  const addNote = useCallback(
+    (annotationId: string) => {
+      if (!isDocumentHydrated) {
+        return;
       }
 
-      if (annotation.type === 'highlight' && !['yellow', 'green', 'blue', 'pink'].includes(color)) {
-        return annotation;
-      }
-      if (annotation.type === 'underline' && !['red', 'blue', 'green', 'black'].includes(color)) {
-        return annotation;
+      const annotation = annotations.find((candidate) => candidate.id === annotationId);
+      if (!annotation) {
+        return;
       }
 
-      return { ...annotation, color, updatedAt: Date.now() } as PdfAnnotation;
-    }));
-  }, []);
+      const existingNote = notes.find((note) => note.annotationId === annotationId);
+      if (existingNote) {
+        setFocusedNoteId(existingNote.id);
+        setIsNotesDrawerOpen(true);
+        viewerRef.current?.navigateToAnnotation(annotationId);
+        return;
+      }
 
-  const addNote = useCallback((annotationId: string) => {
-    if (!isDocumentHydrated) {
-      return;
-    }
+      const timestamp = Date.now();
+      const note: Note = {
+        id: crypto.randomUUID(),
+        annotationId,
+        pageNumber: annotation.pageNumber,
+        displayNumber: String(nextNoteNumber),
+        selectedText: annotation.text,
+        content: '',
+        createdAt: timestamp,
+        updatedAt: timestamp,
+      };
 
-    const annotation = annotations.find((candidate) => candidate.id === annotationId);
-    if (!annotation) {
-      return;
-    }
-
-    const existingNote = notes.find((note) => note.annotationId === annotationId);
-    if (existingNote) {
-      setFocusedNoteId(existingNote.id);
+      setNotes((currentNotes) => [note, ...currentNotes]);
+      setNextNoteNumber((currentNumber) => currentNumber + 1);
+      setFocusedNoteId(note.id);
       setIsNotesDrawerOpen(true);
-      viewerRef.current?.navigateToAnnotation(annotationId);
-      return;
-    }
-
-    const timestamp = Date.now();
-    const note: Note = {
-      id: crypto.randomUUID(),
-      annotationId,
-      pageNumber: annotation.pageNumber,
-      displayNumber: String(nextNoteNumber),
-      selectedText: annotation.text,
-      content: '',
-      createdAt: timestamp,
-      updatedAt: timestamp,
-    };
-
-    setNotes((currentNotes) => [note, ...currentNotes]);
-    setNextNoteNumber((currentNumber) => currentNumber + 1);
-    setFocusedNoteId(note.id);
-    setIsNotesDrawerOpen(true);
-  }, [annotations, isDocumentHydrated, nextNoteNumber, notes]);
+    },
+    [annotations, isDocumentHydrated, nextNoteNumber, notes],
+  );
 
   const updateNote = useCallback((noteId: string, content: string) => {
-    setNotes((currentNotes) => currentNotes.map((note) => (
-      note.id === noteId ? { ...note, content, updatedAt: Date.now() } : note
-    )));
+    setNotes((currentNotes) =>
+      currentNotes.map((note) =>
+        note.id === noteId ? { ...note, content, updatedAt: Date.now() } : note,
+      ),
+    );
   }, []);
 
   const deleteNote = useCallback((noteId: string) => {
     setNotes((currentNotes) => currentNotes.filter((note) => note.id !== noteId));
   }, []);
 
-  const updateNoteDisplayNumber = useCallback((noteId: string, displayNumber: string) => {
-    setNotes((currentNotes) => currentNotes.map((note) => (
-      note.id === noteId ? { ...note, displayNumber, updatedAt: Date.now() } : note
-    )));
-  }, []);
+  const addGlossaryEntry = useCallback(
+    (
+      bubble: DefinitionBubble,
+      preferredDefinition: DictionaryDefinition,
+    ): GlossaryEntry | null => {
+      if (
+        !documentIdentity ||
+        !isDocumentHydrated ||
+        bubble.documentId !== documentIdentity.documentId
+      ) {
+        return null;
+      }
 
-  const exportCurrentNotes = useCallback(() => {
+      const entry = createGlossaryEntryFromBubble(
+        documentIdentity.documentId,
+        bubble,
+        preferredDefinition,
+      );
+      setGlossaryEntries((currentEntries) => [...currentEntries, entry]);
+      setIsNotesDrawerOpen(true);
+      return entry;
+    },
+    [documentIdentity, isDocumentHydrated],
+  );
+
+  const removeGlossaryEntry = useCallback((glossaryEntryId: string) => {
+    setGlossaryEntries((currentEntries) => {
+      const result = removeGlossaryEntryFromState(
+        currentEntries,
+        documentStateRef.current.annotations,
+        glossaryEntryId,
+      );
+      return result.entries;
+    });
+    window.setTimeout(() => void flushPersistence(), 0);
+  }, [flushPersistence]);
+
+  const navigateToGlossaryEntry = useCallback((entry: GlossaryEntry) => {
+    if (
+      !documentIdentity ||
+      !isDocumentHydrated ||
+      entry.documentId !== documentIdentity.documentId
+    ) {
+      return;
+    }
+    openingResolutionRef.current = 'pending';
+    initialNavigationApplicationRef.current = null;
+    commitDocumentOpenRequest({
+      ...createDocumentOpenRequest(documentIdentity.documentId, 'document-glossary', {
+        type: 'glossary',
+        glossaryEntryId: entry.glossaryEntryId,
+        pageNumber: entry.pageNumber,
+      }),
+      generation: documentGenerationRef.current,
+    });
+  }, [commitDocumentOpenRequest, createDocumentOpenRequest, documentIdentity, isDocumentHydrated]);
+
+  const updateNoteDisplayNumber = useCallback(
+    (noteId: string, displayNumber: string) => {
+      setNotes((currentNotes) =>
+        currentNotes.map((note) =>
+          note.id === noteId ? { ...note, displayNumber, updatedAt: Date.now() } : note,
+        ),
+      );
+    },
+    [],
+  );
+
+  const exportCurrentNotes = useCallback((layout: NotesPrintLayout) => {
     if (isPdfExporting) {
       return;
     }
@@ -451,37 +644,117 @@ export function AppLayout() {
       notes,
       documentDisplayTitle ?? file?.name ?? '39Note',
       annotations,
+      glossaryEntries,
+      layout,
       completeExport,
     );
     if (!cleanup) {
       setIsPdfExporting(false);
-      setExportWarning('The browser blocked the print window. Allow popups and try again.');
+      setExportWarning(
+        'The browser blocked the print window. Allow popups and try again.',
+      );
       return;
     }
 
     pdfExportCleanupRef.current = cleanup;
     setExportWarning(null);
-  }, [annotations, documentDisplayTitle, file, isPdfExporting, notes]);
+  }, [annotations, documentDisplayTitle, file, glossaryEntries, isPdfExporting, notes]);
 
-  const beginNoteDrag = useCallback((note: Note, event: ReactPointerEvent<HTMLButtonElement>) => {
-    const noteCard = event.currentTarget.closest<HTMLElement>('.note-card');
-    if (!noteCard) {
-      return;
-    }
+  const exportAnnotatedPdf = useCallback(
+    async (options: AnnotatedPdfExportOptions) => {
+      if (
+        isAnnotatedPdfExporting ||
+        annotatedPdfExportInFlightRef.current ||
+        !file ||
+        !pdfDocument ||
+        !documentIdentity ||
+        !isDocumentHydrated
+      ) {
+        return;
+      }
 
-    const rectangle = noteCard.getBoundingClientRect();
-    noteDragPositionRef.current = { x: rectangle.left, y: rectangle.top };
-    setNoteDragPreview({
-      noteId: note.id,
-      pointerId: event.pointerId,
-      width: rectangle.width,
-      height: rectangle.height,
-      offsetX: event.clientX - rectangle.left,
-      offsetY: event.clientY - rectangle.top,
-      initialX: rectangle.left,
-      initialY: rectangle.top,
-    });
-  }, []);
+      annotatedPdfExportInFlightRef.current = true;
+      setIsAnnotatedPdfExporting(true);
+      setAnnotatedPdfError(null);
+      setAnnotatedPdfProgress({
+        stage: 'preparing',
+        message: 'Preparing original PDF...',
+      });
+
+      try {
+        await flushPersistence();
+        const storedPdf = await loadStoredPdfFile(documentIdentity.documentId);
+        const sourceBlob = storedPdf?.blob ?? file;
+        const pageGeometries = await collectPdfPageGeometries(pdfDocument);
+        const exportAnnotations = selectAnnotationsForExport(
+          annotations,
+          notes,
+          annotationFilter,
+          options.includeHiddenAnnotations,
+        );
+        const { createAnnotatedPdf } = await import('../services/annotatedPdfExport');
+        const result = await createAnnotatedPdf({
+          sourceBlob,
+          documentTitle: documentDisplayTitle ?? file.name ?? '39Note',
+          annotations: exportAnnotations,
+          notes,
+          pageGeometries,
+          options,
+          onProgress: setAnnotatedPdfProgress,
+        });
+        downloadAnnotatedPdf(result.bytes, result.filename);
+        setAnnotatedPdfProgress({
+          stage: 'download',
+          message: `Download ready: ${result.exportedAnnotationCount} annotations${result.appendixEntryCount > 0 ? `, ${result.appendixEntryCount} Notes` : ''}.`,
+        });
+      } catch (error) {
+        setAnnotatedPdfError(
+          error instanceof Error
+            ? error.message
+            : 'The annotated PDF could not be created. The original PDF was not changed.',
+        );
+        setAnnotatedPdfProgress(null);
+      } finally {
+        annotatedPdfExportInFlightRef.current = false;
+        setIsAnnotatedPdfExporting(false);
+      }
+    },
+    [
+      annotationFilter,
+      annotations,
+      documentDisplayTitle,
+      documentIdentity,
+      file,
+      flushPersistence,
+      isAnnotatedPdfExporting,
+      isDocumentHydrated,
+      notes,
+      pdfDocument,
+    ],
+  );
+
+  const beginNoteDrag = useCallback(
+    (note: Note, event: ReactPointerEvent<HTMLButtonElement>) => {
+      const noteCard = event.currentTarget.closest<HTMLElement>('.note-card');
+      if (!noteCard) {
+        return;
+      }
+
+      const rectangle = noteCard.getBoundingClientRect();
+      noteDragPositionRef.current = { x: rectangle.left, y: rectangle.top };
+      setNoteDragPreview({
+        noteId: note.id,
+        pointerId: event.pointerId,
+        width: rectangle.width,
+        height: rectangle.height,
+        offsetX: event.clientX - rectangle.left,
+        offsetY: event.clientY - rectangle.top,
+        initialX: rectangle.left,
+        initialY: rectangle.top,
+      });
+    },
+    [],
+  );
 
   const openLargeEditor = useCallback((note: Note) => {
     setNoteDragPreview(null);
@@ -577,21 +850,21 @@ export function AppLayout() {
     }
   }, [noteDragPreview, notes]);
 
-  const renameLibraryDocument = useCallback(async (
-    documentId: string,
-    displayTitle: string,
-  ): Promise<boolean> => {
-    const wasRenamed = await updateDocumentDisplayTitle(documentId, displayTitle);
-    if (!wasRenamed) {
-      return false;
-    }
+  const renameLibraryDocument = useCallback(
+    async (documentId: string, displayTitle: string): Promise<boolean> => {
+      const wasRenamed = await updateDocumentDisplayTitle(documentId, displayTitle);
+      if (!wasRenamed) {
+        return false;
+      }
 
-    if (documentIdentity?.documentId === documentId) {
-      setDocumentDisplayTitle(displayTitle.trim());
-    }
-    setLibraryRefreshToken((currentToken) => currentToken + 1);
-    return true;
-  }, [documentIdentity]);
+      if (documentIdentity?.documentId === documentId) {
+        setDocumentDisplayTitle(displayTitle.trim());
+      }
+      setLibraryRefreshToken((currentToken) => currentToken + 1);
+      return true;
+    },
+    [documentIdentity],
+  );
 
   const openLibrary = useCallback(() => {
     void flushPersistence().then(() => {
@@ -645,180 +918,217 @@ export function AppLayout() {
     return () => window.removeEventListener('keydown', handleShortcuts);
   }, [file, openLibrarySearch]);
 
-  const forgetDocument = useCallback(async (documentId: string): Promise<boolean> => {
-    await flushPersistence();
-    const wasForgotten = await deleteDocumentState(documentId);
-    if (!wasForgotten) {
-      return false;
-    }
-
-    if (documentIdentity?.documentId === documentId) {
-      hydrationRequestRef.current += 1;
-      storedPdfLoadRequestRef.current += 1;
-      setFile(null);
-      setPageCount(0);
-      setCurrentPage(0);
-      setAnnotations([]);
-      setNotes([]);
-      setNextNoteNumber(1);
-      setDocumentIdentity(null);
-      setDocumentDisplayTitle(null);
-      setIsDocumentHydrated(false);
-      setFocusedNoteId(null);
-      setNoteDragPreview(null);
-      setLargeEditorNoteId(null);
-      setExportWarning(null);
-      setIsLibraryOpen(true);
-    }
-
-    return true;
-  }, [documentIdentity, flushPersistence]);
-
-  const forgetLibraryDocuments = useCallback(async (ids: string[]): Promise<{ deleted: string[]; failed: string[] }> => {
-    await flushPersistence();
-    const result = await deleteDocumentStates(ids);
-    if (documentIdentity && result.deleted.includes(documentIdentity.documentId)) {
-      setFile(null); setDocumentIdentity(null); setAnnotations([]); setNotes([]); setPageCount(0); setCurrentPage(0); setIsDocumentHydrated(false); setIsLibraryOpen(true);
-    }
-    setLibraryRefreshToken((currentToken) => currentToken + 1);
-    return result;
-  }, [documentIdentity, flushPersistence]);
-
-  const removeLibraryPdfCopy = useCallback(async (documentId: string): Promise<boolean> => {
-    await flushPersistence();
-    const wasRemoved = await removeStoredPdfCopy(documentId);
-    if (wasRemoved) {
-      setLibraryRefreshToken((currentToken) => currentToken + 1);
-    }
-    return wasRemoved;
-  }, [flushPersistence]);
-
-  const updateLibraryOrganization = useCallback(async (documentId: string, isPinned: boolean): Promise<boolean> => {
-    const wasUpdated = await updateDocumentOrganization([documentId], {
-      isPinned,
-      ...(isPinned ? { pinnedAt: Date.now() } : { pinnedAt: undefined }),
-    });
-    if (wasUpdated) setLibraryRefreshToken((currentToken) => currentToken + 1);
-    return wasUpdated;
-  }, []);
-
-  const getStoredDocumentFile = useCallback(async (documentId: string): Promise<File | null> => {
-    const requestId = storedPdfLoadRequestRef.current + 1;
-    storedPdfLoadRequestRef.current = requestId;
-    const storedPdfFile = await loadStoredPdfFile(documentId);
-
-    if (!storedPdfFile || storedPdfLoadRequestRef.current !== requestId) {
-      return null;
-    }
-
-    return new File(
-      [storedPdfFile.blob],
-      storedPdfFile.fileName,
-      { type: storedPdfFile.mimeType, lastModified: storedPdfFile.lastModified },
-    );
-  }, []);
-
-  const openStoredDocument = useCallback(async (documentId: string): Promise<boolean> => {
-    const storedDocumentFile = await getStoredDocumentFile(documentId);
-    if (!storedDocumentFile) {
-      return false;
-    }
-
-    openDocument(storedDocumentFile, createDocumentOpenRequest(documentId, 'normal-library-open', null));
-    return true;
-  }, [createDocumentOpenRequest, getStoredDocumentFile, openDocument]);
-
-  const openLibraryNote = useCallback(async (
-    documentId: string,
-    noteId: string,
-    annotationId: string,
-    pageNumber: number,
-  ): Promise<boolean> => {
-    const navigationRequestId = libraryNavigationRequestRef.current + 1;
-    libraryNavigationRequestRef.current = navigationRequestId;
-    const pendingNavigation: PendingLibraryNavigation = {
-      documentId,
-      noteId,
-      annotationId,
-      isReadyToFocus: false,
-    };
-    pendingLibraryNavigationRef.current = pendingNavigation;
-    setPendingLibraryNavigation(pendingNavigation);
-    const openRequest = createDocumentOpenRequest(documentId, 'library-note-result', {
-      type: 'annotation',
-      annotationId,
-      pageNumber,
-      noteId,
-    });
-    if (documentIdentity?.documentId === documentId && isDocumentHydrated) {
-      const currentDocumentRequest = {
-        ...openRequest,
-        generation: documentGenerationRef.current,
-      };
-      openingResolutionRef.current = 'pending';
-      initialNavigationApplicationRef.current = null;
-      commitDocumentOpenRequest(currentDocumentRequest);
-      return true;
-    }
-
-    commitDocumentOpenRequest(openRequest);
-
-    const storedDocumentFile = await getStoredDocumentFile(documentId);
-    const isStillActiveRequest =
-      documentOpenRequestRef.current?.requestId === openRequest.requestId;
-    if (
-      !storedDocumentFile
-      || libraryNavigationRequestRef.current !== navigationRequestId
-      || !isStillActiveRequest
-    ) {
-      if (documentOpenRequestRef.current?.requestId === openRequest.requestId) {
-        logNavigationDiagnostic('stale-request-ignored', {
-          requestId: openRequest.requestId,
-          documentId,
-          source: openRequest.source,
-          reason: storedDocumentFile ? 'superseded-library-navigation' : 'stored-pdf-unavailable',
-        });
-        commitDocumentOpenRequest(null);
+  const forgetDocument = useCallback(
+    async (documentId: string): Promise<boolean> => {
+      await flushPersistence();
+      const wasForgotten = await deleteDocumentState(documentId);
+      if (!wasForgotten) {
+        return false;
       }
-      return false;
-    }
 
-    openDocument(storedDocumentFile, openRequest);
-    return true;
-  }, [
-    commitDocumentOpenRequest,
-    createDocumentOpenRequest,
-    documentIdentity,
-    getStoredDocumentFile,
-    isDocumentHydrated,
-    openDocument,
-  ]);
+      if (documentIdentity?.documentId === documentId) {
+        hydrationRequestRef.current += 1;
+        storedPdfLoadRequestRef.current += 1;
+        setFile(null);
+        setPageCount(0);
+        setCurrentPage(0);
+        setAnnotations([]);
+        setNotes([]);
+        setGlossaryEntries([]);
+        setNextNoteNumber(1);
+        setDocumentIdentity(null);
+        setDocumentDisplayTitle(null);
+        setIsDocumentHydrated(false);
+        setFocusedNoteId(null);
+        setNoteDragPreview(null);
+        setLargeEditorNoteId(null);
+        setExportWarning(null);
+        setIsLibraryOpen(true);
+      }
 
-  const selectPdfForLibraryNote = useCallback((
-    fileToOpen: File,
-    documentId: string,
-    noteId: string,
-    annotationId: string,
-    pageNumber: number,
-  ) => {
-    libraryNavigationRequestRef.current += 1;
-    const pendingNavigation: PendingLibraryNavigation = {
-      documentId,
-      noteId,
-      annotationId,
-      isReadyToFocus: false,
-    };
-    pendingLibraryNavigationRef.current = pendingNavigation;
-    setPendingLibraryNavigation(pendingNavigation);
-    const openRequest = createDocumentOpenRequest(documentId, 'library-note-result', {
-      type: 'annotation',
-      annotationId,
-      pageNumber,
-      noteId,
-    });
-    commitDocumentOpenRequest(openRequest);
-    openDocument(fileToOpen, openRequest);
-  }, [commitDocumentOpenRequest, createDocumentOpenRequest, openDocument]);
+      return true;
+    },
+    [documentIdentity, flushPersistence],
+  );
+
+  const forgetLibraryDocuments = useCallback(
+    async (ids: string[]): Promise<{ deleted: string[]; failed: string[] }> => {
+      await flushPersistence();
+      const result = await deleteDocumentStates(ids);
+      if (documentIdentity && result.deleted.includes(documentIdentity.documentId)) {
+        setFile(null);
+        setDocumentIdentity(null);
+        setAnnotations([]);
+        setNotes([]);
+        setGlossaryEntries([]);
+        setPageCount(0);
+        setCurrentPage(0);
+        setIsDocumentHydrated(false);
+        setIsLibraryOpen(true);
+      }
+      setLibraryRefreshToken((currentToken) => currentToken + 1);
+      return result;
+    },
+    [documentIdentity, flushPersistence],
+  );
+
+  const removeLibraryPdfCopy = useCallback(
+    async (documentId: string): Promise<boolean> => {
+      await flushPersistence();
+      const wasRemoved = await removeStoredPdfCopy(documentId);
+      if (wasRemoved) {
+        setLibraryRefreshToken((currentToken) => currentToken + 1);
+      }
+      return wasRemoved;
+    },
+    [flushPersistence],
+  );
+
+  const updateLibraryOrganization = useCallback(
+    async (documentId: string, isPinned: boolean): Promise<boolean> => {
+      const wasUpdated = await updateDocumentOrganization([documentId], {
+        isPinned,
+        ...(isPinned ? { pinnedAt: Date.now() } : { pinnedAt: undefined }),
+      });
+      if (wasUpdated) setLibraryRefreshToken((currentToken) => currentToken + 1);
+      return wasUpdated;
+    },
+    [],
+  );
+
+  const getStoredDocumentFile = useCallback(
+    async (documentId: string): Promise<File | null> => {
+      const requestId = storedPdfLoadRequestRef.current + 1;
+      storedPdfLoadRequestRef.current = requestId;
+      const storedPdfFile = await loadStoredPdfFile(documentId);
+
+      if (!storedPdfFile || storedPdfLoadRequestRef.current !== requestId) {
+        return null;
+      }
+
+      return new File([storedPdfFile.blob], storedPdfFile.fileName, {
+        type: storedPdfFile.mimeType,
+        lastModified: storedPdfFile.lastModified,
+      });
+    },
+    [],
+  );
+
+  const openStoredDocument = useCallback(
+    async (documentId: string): Promise<boolean> => {
+      const storedDocumentFile = await getStoredDocumentFile(documentId);
+      if (!storedDocumentFile) {
+        return false;
+      }
+
+      openDocument(
+        storedDocumentFile,
+        createDocumentOpenRequest(documentId, 'normal-library-open', null),
+      );
+      return true;
+    },
+    [createDocumentOpenRequest, getStoredDocumentFile, openDocument],
+  );
+
+  const openLibraryNote = useCallback(
+    async (
+      documentId: string,
+      noteId: string,
+      annotationId: string,
+      pageNumber: number,
+    ): Promise<boolean> => {
+      const navigationRequestId = libraryNavigationRequestRef.current + 1;
+      libraryNavigationRequestRef.current = navigationRequestId;
+      const pendingNavigation: PendingLibraryNavigation = {
+        documentId,
+        noteId,
+        annotationId,
+        isReadyToFocus: false,
+      };
+      pendingLibraryNavigationRef.current = pendingNavigation;
+      setPendingLibraryNavigation(pendingNavigation);
+      const openRequest = createDocumentOpenRequest(documentId, 'library-note-result', {
+        type: 'annotation',
+        annotationId,
+        pageNumber,
+        noteId,
+      });
+      if (documentIdentity?.documentId === documentId && isDocumentHydrated) {
+        const currentDocumentRequest = {
+          ...openRequest,
+          generation: documentGenerationRef.current,
+        };
+        openingResolutionRef.current = 'pending';
+        initialNavigationApplicationRef.current = null;
+        commitDocumentOpenRequest(currentDocumentRequest);
+        return true;
+      }
+
+      commitDocumentOpenRequest(openRequest);
+
+      const storedDocumentFile = await getStoredDocumentFile(documentId);
+      const isStillActiveRequest =
+        documentOpenRequestRef.current?.requestId === openRequest.requestId;
+      if (
+        !storedDocumentFile ||
+        libraryNavigationRequestRef.current !== navigationRequestId ||
+        !isStillActiveRequest
+      ) {
+        if (documentOpenRequestRef.current?.requestId === openRequest.requestId) {
+          logNavigationDiagnostic('stale-request-ignored', {
+            requestId: openRequest.requestId,
+            documentId,
+            source: openRequest.source,
+            reason: storedDocumentFile
+              ? 'superseded-library-navigation'
+              : 'stored-pdf-unavailable',
+          });
+          commitDocumentOpenRequest(null);
+        }
+        return false;
+      }
+
+      openDocument(storedDocumentFile, openRequest);
+      return true;
+    },
+    [
+      commitDocumentOpenRequest,
+      createDocumentOpenRequest,
+      documentIdentity,
+      getStoredDocumentFile,
+      isDocumentHydrated,
+      openDocument,
+    ],
+  );
+
+  const selectPdfForLibraryNote = useCallback(
+    (
+      fileToOpen: File,
+      documentId: string,
+      noteId: string,
+      annotationId: string,
+      pageNumber: number,
+    ) => {
+      libraryNavigationRequestRef.current += 1;
+      const pendingNavigation: PendingLibraryNavigation = {
+        documentId,
+        noteId,
+        annotationId,
+        isReadyToFocus: false,
+      };
+      pendingLibraryNavigationRef.current = pendingNavigation;
+      setPendingLibraryNavigation(pendingNavigation);
+      const openRequest = createDocumentOpenRequest(documentId, 'library-note-result', {
+        type: 'annotation',
+        annotationId,
+        pageNumber,
+        noteId,
+      });
+      commitDocumentOpenRequest(openRequest);
+      openDocument(fileToOpen, openRequest);
+    },
+    [commitDocumentOpenRequest, createDocumentOpenRequest, openDocument],
+  );
 
   const showReadingPositionToast = useCallback((position: ReadingPosition) => {
     setReadingRestoreToast(
@@ -833,54 +1143,57 @@ export function AppLayout() {
     }, 5600);
   }, []);
 
-  const handleInitialAnnotationNavigationApplied = useCallback((annotationId: string) => {
-    const openRequest = documentOpenRequestRef.current;
-    const identity = documentStateRef.current.documentIdentity;
-    if (
-      !openRequest
-      || !['library-note-result', 'document-note'].includes(openRequest.source)
-      || openRequest.target?.type !== 'annotation'
-      || openRequest.target.annotationId !== annotationId
-      || !identity
-      || identity.documentId !== openRequest.documentId
-      || openRequest.generation !== documentGenerationRef.current
-      || viewerRef.current?.getNavigationEpoch() !== openRequest.navigationEpoch
-    ) {
-      logNavigationDiagnostic('stale-request-ignored', {
-        requestId: openRequest?.requestId,
-        documentId: openRequest?.documentId,
-        source: openRequest?.source,
-        targetType: openRequest?.target?.type ?? 'none',
-        annotationId,
-        reason: 'annotation-application-guard-failed',
-      });
-      return;
-    }
+  const handleInitialAnnotationNavigationApplied = useCallback(
+    (annotationId: string) => {
+      const openRequest = documentOpenRequestRef.current;
+      const identity = documentStateRef.current.documentIdentity;
+      if (
+        !openRequest ||
+        !['library-note-result', 'document-note'].includes(openRequest.source) ||
+        openRequest.target?.type !== 'annotation' ||
+        openRequest.target.annotationId !== annotationId ||
+        !identity ||
+        identity.documentId !== openRequest.documentId ||
+        openRequest.generation !== documentGenerationRef.current ||
+        viewerRef.current?.getNavigationEpoch() !== openRequest.navigationEpoch
+      ) {
+        logNavigationDiagnostic('stale-request-ignored', {
+          requestId: openRequest?.requestId,
+          documentId: openRequest?.documentId,
+          source: openRequest?.source,
+          targetType: openRequest?.target?.type ?? 'none',
+          annotationId,
+          reason: 'annotation-application-guard-failed',
+        });
+        return;
+      }
 
-    initialNavigationApplicationRef.current = {
-      requestId: openRequest.requestId,
-      decisionType: 'explicit-annotation-target',
-    };
-    logNavigationDiagnostic('navigation-applied', {
-      requestId: openRequest.requestId,
-      documentId: openRequest.documentId,
-      source: openRequest.source,
-      targetType: 'annotation',
-      annotationId,
-      generation: openRequest.generation,
-      navigationEpoch: openRequest.navigationEpoch,
-    });
-    commitDocumentOpenRequest(null);
-    logNavigationDiagnostic('request-consumed', {
-      requestId: openRequest.requestId,
-      documentId: openRequest.documentId,
-      source: openRequest.source,
-      targetType: 'annotation',
-    });
-    openingResolutionRef.current = 'resolved';
-    pendingLibraryNavigationRef.current = null;
-    setPendingLibraryNavigation(null);
-  }, [commitDocumentOpenRequest]);
+      initialNavigationApplicationRef.current = {
+        requestId: openRequest.requestId,
+        decisionType: 'explicit-annotation-target',
+      };
+      logNavigationDiagnostic('navigation-applied', {
+        requestId: openRequest.requestId,
+        documentId: openRequest.documentId,
+        source: openRequest.source,
+        targetType: 'annotation',
+        annotationId,
+        generation: openRequest.generation,
+        navigationEpoch: openRequest.navigationEpoch,
+      });
+      commitDocumentOpenRequest(null);
+      logNavigationDiagnostic('request-consumed', {
+        requestId: openRequest.requestId,
+        documentId: openRequest.documentId,
+        source: openRequest.source,
+        targetType: 'annotation',
+      });
+      openingResolutionRef.current = 'resolved';
+      pendingLibraryNavigationRef.current = null;
+      setPendingLibraryNavigation(null);
+    },
+    [commitDocumentOpenRequest],
+  );
 
   useEffect(() => {
     const openRequest = documentOpenRequest;
@@ -889,27 +1202,27 @@ export function AppLayout() {
     }
 
     const target = openRequest.target;
-    const targetAnnotation = target?.type === 'annotation'
-      ? annotations.find((candidate) => candidate.id === target.annotationId)
-      : undefined;
-    const targetNote = target?.type === 'annotation' && target.noteId
-      ? notes.find((candidate) => candidate.id === target.noteId)
-      : undefined;
+    const targetAnnotation =
+      target?.type === 'annotation'
+        ? annotations.find((candidate) => candidate.id === target.annotationId)
+        : undefined;
+    const targetNote =
+      target?.type === 'annotation' && target.noteId
+        ? notes.find((candidate) => candidate.id === target.noteId)
+        : undefined;
     const isRequestDocumentHydrated =
-      isDocumentHydrated
-      && openRequest.documentId === documentIdentity.documentId
-      && openRequest.generation === documentGenerationRef.current;
+      isDocumentHydrated &&
+      openRequest.documentId === documentIdentity.documentId &&
+      openRequest.generation === documentGenerationRef.current;
     let annotationLookupState: AnnotationLookupState = 'not-required';
     if (target?.type === 'annotation') {
       annotationLookupState = !isRequestDocumentHydrated
         ? 'pending'
-        : targetAnnotation
-        && (
-          openRequest.source !== 'library-note-result'
-          || (targetNote && targetNote.annotationId === targetAnnotation.id)
-        )
-        ? 'found'
-        : 'missing';
+        : targetAnnotation &&
+            (openRequest.source !== 'library-note-result' ||
+              (targetNote && targetNote.annotationId === targetAnnotation.id))
+          ? 'found'
+          : 'missing';
     }
 
     const decision = resolveInitialNavigation({
@@ -963,8 +1276,8 @@ export function AppLayout() {
 
     const existingApplication = initialNavigationApplicationRef.current;
     if (
-      existingApplication?.requestId === decision.requestId
-      && existingApplication.decisionType === decision.type
+      existingApplication?.requestId === decision.requestId &&
+      existingApplication.decisionType === decision.type
     ) {
       return;
     }
@@ -975,12 +1288,12 @@ export function AppLayout() {
     const isCurrentRequest = (expectedNavigationEpoch: number) => {
       const currentRequest = documentOpenRequestRef.current;
       return Boolean(
-        currentRequest
-        && currentRequest.requestId === requestId
-        && currentRequest.documentId === documentId
-        && currentRequest.generation === generation
-        && documentGenerationRef.current === generation
-        && viewerRef.current?.getNavigationEpoch() === expectedNavigationEpoch,
+        currentRequest &&
+        currentRequest.requestId === requestId &&
+        currentRequest.documentId === documentId &&
+        currentRequest.generation === generation &&
+        documentGenerationRef.current === generation &&
+        viewerRef.current?.getNavigationEpoch() === expectedNavigationEpoch,
       );
     };
     const applyReadingPosition = (position: ReadingPosition, showToast: boolean) => {
@@ -1103,7 +1416,11 @@ export function AppLayout() {
         requestId,
         decisionType: decision.type,
       };
-      viewerRef.current?.goToPage(decision.target.pageNumber);
+      if (decision.target.type === 'glossary') {
+        viewerRef.current?.navigateToGlossaryEntry(decision.target.glossaryEntryId);
+      } else {
+        viewerRef.current?.goToPage(decision.target.pageNumber);
+      }
       commitDocumentOpenRequest(null);
       openingResolutionRef.current = 'resolved';
       return;
@@ -1171,51 +1488,52 @@ export function AppLayout() {
     viewerRef.current?.navigateToAnnotation(pendingNavigation.annotationId);
   }, []);
 
-  const navigateToNote = useCallback((note: Note) => {
-    if (!documentIdentity || !isDocumentHydrated) {
-      return;
-    }
+  const navigateToNote = useCallback(
+    (note: Note) => {
+      if (!documentIdentity || !isDocumentHydrated) {
+        return;
+      }
 
-    const pendingNavigation: PendingLibraryNavigation = {
-      documentId: documentIdentity.documentId,
-      noteId: note.id,
-      annotationId: note.annotationId,
-      isReadyToFocus: false,
-    };
-    const request = {
-      ...createDocumentOpenRequest(
-        documentIdentity.documentId,
-        'document-note',
-        {
+      const pendingNavigation: PendingLibraryNavigation = {
+        documentId: documentIdentity.documentId,
+        noteId: note.id,
+        annotationId: note.annotationId,
+        isReadyToFocus: false,
+      };
+      const request = {
+        ...createDocumentOpenRequest(documentIdentity.documentId, 'document-note', {
           type: 'annotation',
           annotationId: note.annotationId,
           pageNumber: note.pageNumber,
           noteId: note.id,
-        },
-      ),
-      generation: documentGenerationRef.current,
-    };
+        }),
+        generation: documentGenerationRef.current,
+      };
 
-    pendingLibraryNavigationRef.current = pendingNavigation;
-    setPendingLibraryNavigation(pendingNavigation);
-    setIsNotesDrawerOpen(true);
-    setFocusedNoteId(note.id);
-    openingResolutionRef.current = 'pending';
-    initialNavigationApplicationRef.current = null;
-    commitDocumentOpenRequest(request);
-  }, [
-    commitDocumentOpenRequest,
-    createDocumentOpenRequest,
-    documentIdentity,
-    isDocumentHydrated,
-  ]);
+      pendingLibraryNavigationRef.current = pendingNavigation;
+      setPendingLibraryNavigation(pendingNavigation);
+      setIsNotesDrawerOpen(true);
+      setFocusedNoteId(note.id);
+      openingResolutionRef.current = 'pending';
+      initialNavigationApplicationRef.current = null;
+      commitDocumentOpenRequest(request);
+    },
+    [
+      commitDocumentOpenRequest,
+      createDocumentOpenRequest,
+      documentIdentity,
+      isDocumentHydrated,
+    ],
+  );
 
   const handleExplicitNavigation = useCallback(() => {
     const openRequest = documentOpenRequestRef.current;
     const isPendingAnnotationTarget = Boolean(
-      openRequest
-      && ['library-note-result', 'document-note'].includes(openRequest.source)
-      && openRequest.target?.type === 'annotation',
+      openRequest &&
+      ((['library-note-result', 'document-note'].includes(openRequest.source) &&
+        openRequest.target?.type === 'annotation') ||
+        (openRequest.source === 'document-glossary' &&
+          openRequest.target?.type === 'glossary')),
     );
     if (!isPendingAnnotationTarget) {
       if (openRequest) {
@@ -1268,11 +1586,28 @@ export function AppLayout() {
   };
 
   const largeEditorNote = largeEditorNoteId
-    ? notes.find((candidate) => candidate.id === largeEditorNoteId) ?? null
+    ? (notes.find((candidate) => candidate.id === largeEditorNoteId) ?? null)
     : null;
   const draggedNote = noteDragPreview
-    ? notes.find((candidate) => candidate.id === noteDragPreview.noteId) ?? null
+    ? (notes.find((candidate) => candidate.id === noteDragPreview.noteId) ?? null)
     : null;
+  const visibleExportAnnotations = selectAnnotationsForExport(
+    annotations,
+    notes,
+    annotationFilter,
+    false,
+  );
+  const nonEmptyNotedAnnotationIds = new Set(
+    notes
+      .filter((note) => note.content.trim().length > 0)
+      .map((note) => note.annotationId),
+  );
+  const nonEmptyNoteCount = annotations.filter((annotation) =>
+    nonEmptyNotedAnnotationIds.has(annotation.id),
+  ).length;
+  const visibleNonEmptyNoteCount = visibleExportAnnotations.filter((annotation) =>
+    nonEmptyNotedAnnotationIds.has(annotation.id),
+  ).length;
 
   return (
     <main className={`app-layout ${isSidebarCollapsed ? 'is-sidebar-collapsed' : ''}`}>
@@ -1293,6 +1628,12 @@ export function AppLayout() {
         onOpenSearch={() => viewerRef.current?.openSearch()}
         openFileRequestId={openFileRequestId}
         onOpenLibrary={openLibrary}
+        onExportAnnotatedPdf={() => {
+          setAnnotatedPdfError(null);
+          setAnnotatedPdfProgress(null);
+          setIsAnnotatedPdfDialogOpen(true);
+        }}
+        isAnnotatedPdfExporting={isAnnotatedPdfExporting}
         hasDocument={Boolean(file)}
         pageCount={pageCount}
         currentPage={currentPage}
@@ -1324,7 +1665,10 @@ export function AppLayout() {
           onCurrentPageChange={setCurrentPage}
           onEffectiveZoomChange={setEffectiveZoom}
           onDocumentReady={hydrateDocument}
+          documentId={documentIdentity?.documentId ?? null}
           annotations={annotations}
+          glossaryEntries={glossaryEntries}
+          onAddGlossaryEntry={addGlossaryEntry}
           onCreateHighlights={createHighlights}
           onCreateUnderlines={createUnderlines}
           onRemoveAnnotation={removeAnnotation}
@@ -1339,6 +1683,7 @@ export function AppLayout() {
         />
         <NotesPanel
           notes={notes}
+          glossaryEntries={glossaryEntries}
           isOpen={isNotesDrawerOpen}
           draggedNoteId={noteDragPreview?.noteId ?? null}
           isExporting={isPdfExporting}
@@ -1350,27 +1695,41 @@ export function AppLayout() {
           onUpdate={updateNote}
           onUpdateDisplayNumber={updateNoteDisplayNumber}
           onDelete={deleteNote}
+          onNavigateGlossary={navigateToGlossaryEntry}
+          onRemoveGlossary={removeGlossaryEntry}
           onExportNotes={exportCurrentNotes}
           onBeginNoteDrag={beginNoteDrag}
           onOpenLargeEditor={openLargeEditor}
         />
       </div>
-      {isLibraryOpen ? <Suspense fallback={<div className="library-loading" role="status">Opening Library…</div>}><LibraryPanel
-        isOpen={isLibraryOpen}
-        refreshToken={libraryRefreshToken}
-        onClose={() => setIsLibraryOpen(false)}
-        onForget={forgetDocument}
-        onOpenFile={openDocument}
-        onOpenStoredPdf={openStoredDocument}
-        onOpenLibraryNote={openLibraryNote}
-        onSelectPdfForLibraryNote={selectPdfForLibraryNote}
-        onRenameDocument={renameLibraryDocument}
-        onRemovePdfCopy={removeLibraryPdfCopy}
-        focusSearchRequestId={librarySearchFocusRequestId}
-        onPinDocument={updateLibraryOrganization}
-        onForgetMany={forgetLibraryDocuments}
-        onUpdateOrganization={(documentId, update) => updateDocumentOrganization([documentId], update)}
-      /></Suspense> : null}
+      {isLibraryOpen ? (
+        <Suspense
+          fallback={
+            <div className="library-loading" role="status">
+              Opening Library…
+            </div>
+          }
+        >
+          <LibraryPanel
+            isOpen={isLibraryOpen}
+            refreshToken={libraryRefreshToken}
+            onClose={() => setIsLibraryOpen(false)}
+            onForget={forgetDocument}
+            onOpenFile={openDocument}
+            onOpenStoredPdf={openStoredDocument}
+            onOpenLibraryNote={openLibraryNote}
+            onSelectPdfForLibraryNote={selectPdfForLibraryNote}
+            onRenameDocument={renameLibraryDocument}
+            onRemovePdfCopy={removeLibraryPdfCopy}
+            focusSearchRequestId={librarySearchFocusRequestId}
+            onPinDocument={updateLibraryOrganization}
+            onForgetMany={forgetLibraryDocuments}
+            onUpdateOrganization={(documentId, update) =>
+              updateDocumentOrganization([documentId], update)
+            }
+          />
+        </Suspense>
+      ) : null}
       {noteDragPreview && draggedNote ? (
         <div className="note-drop-overlay" aria-hidden="true">
           <div ref={noteDropTargetRef} className="note-drop-target">
@@ -1385,7 +1744,9 @@ export function AppLayout() {
               transform: `translate3d(${noteDragPreview.initialX}px, ${noteDragPreview.initialY}px, 0) scale(0.98)`,
             }}
           >
-            <blockquote>{draggedNote.selectedText || 'Source text unavailable'}</blockquote>
+            <blockquote>
+              {draggedNote.selectedText || 'Source text unavailable'}
+            </blockquote>
             <div className="note-drag-preview-meta">
               <span>{draggedNote.displayNumber}</span>
               <span>Page {draggedNote.pageNumber}</span>
@@ -1407,10 +1768,37 @@ export function AppLayout() {
           onUpdateDisplayNumber={updateNoteDisplayNumber}
         />
       ) : null}
-      {storageWarning || exportWarning ? (
-        <p className="storage-warning" role="status">{exportWarning ?? storageWarning}</p>
+      {isAnnotatedPdfDialogOpen ? (
+        <AnnotatedPdfExportDialog
+          annotationCount={annotations.length}
+          visibleAnnotationCount={visibleExportAnnotations.length}
+          noteCount={nonEmptyNoteCount}
+          visibleNoteCount={visibleNonEmptyNoteCount}
+          isExporting={isAnnotatedPdfExporting}
+          progress={annotatedPdfProgress}
+          error={annotatedPdfError}
+          onClose={() => {
+            if (!isAnnotatedPdfExporting) {
+              setIsAnnotatedPdfDialogOpen(false);
+              setAnnotatedPdfError(null);
+              setAnnotatedPdfProgress(null);
+            }
+          }}
+          onExport={(options) => {
+            void exportAnnotatedPdf(options);
+          }}
+        />
       ) : null}
-      {readingRestoreToast ? <p className="reading-restore-toast" role="status">{readingRestoreToast}</p> : null}
+      {storageWarning || exportWarning ? (
+        <p className="storage-warning" role="status">
+          {exportWarning ?? storageWarning}
+        </p>
+      ) : null}
+      {readingRestoreToast ? (
+        <p className="reading-restore-toast" role="status">
+          {readingRestoreToast}
+        </p>
+      ) : null}
     </main>
   );
 }
@@ -1420,5 +1808,46 @@ function isEditableElement(target: EventTarget | null): boolean {
     return false;
   }
 
-  return target.isContentEditable || Boolean(target.closest('input, textarea, [contenteditable="true"]'));
+  return (
+    target.isContentEditable ||
+    Boolean(target.closest('input, textarea, [contenteditable="true"]'))
+  );
+}
+
+async function collectPdfPageGeometries(
+  document: PDFDocumentProxy,
+): Promise<PdfPageGeometry[]> {
+  return Promise.all(
+    Array.from({ length: document.numPages }, async (_, index) => {
+      const page = await document.getPage(index + 1);
+      const [xMin, yMin, xMax, yMax] = page.view;
+      if (
+        ![xMin, yMin, xMax, yMax, page.userUnit].every(Number.isFinite) ||
+        xMax <= xMin ||
+        yMax <= yMin ||
+        page.userUnit <= 0
+      ) {
+        throw new Error(`Page ${index + 1} has unsupported PDF geometry.`);
+      }
+      return {
+        viewBox: [xMin, yMin, xMax, yMax],
+        userUnit: page.userUnit,
+        rotation: normalizePdfRotation(page.rotate),
+      };
+    }),
+  );
+}
+
+function downloadAnnotatedPdf(bytes: Uint8Array, filename: string): void {
+  const copiedBytes = new Uint8Array(bytes);
+  const blob = new Blob([copiedBytes.buffer], { type: 'application/pdf' });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = filename;
+  link.hidden = true;
+  document.body.append(link);
+  link.click();
+  link.remove();
+  window.setTimeout(() => URL.revokeObjectURL(url), 30_000);
 }

@@ -2,6 +2,7 @@ export type DocumentOpenSource =
   | 'normal-library-open'
   | 'library-note-result'
   | 'document-note'
+  | 'document-glossary'
   | 'pdf-search-result'
   | 'page-input'
   | 'outline'
@@ -13,6 +14,11 @@ export type DocumentOpenTarget =
       annotationId: string;
       pageNumber: number;
       noteId?: string;
+    }
+  | {
+      type: 'glossary';
+      glossaryEntryId: string;
+      pageNumber: number;
     }
   | {
       type: 'pdf-search';

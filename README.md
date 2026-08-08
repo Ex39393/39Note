@@ -20,9 +20,10 @@ run `npm install` automatically.
   executes the launcher instead of opening it through a file association.
 - `Start 39Note Hidden.vbs` can also be launched directly for a hidden console.
 - The Windows default browser opens at `http://127.0.0.1:5173` only after the
-  local server responds.
+  local server responds with 39Note's exact application identity marker.
 - Keep the local server running while reading. Closing it stops localhost access.
-- Port 5173 is strict: a conflict is reported instead of silently starting on 5174.
+- Port 5173 is strict: if another application owns it, that application is not opened
+  or stopped, and 39Note reports the conflict instead of silently using port 5174.
 - Hidden-start diagnostics are written to `39note-launch.log` in the project folder.
 
 For normal development, use `npm run dev`. To reproduce the launcher command, use

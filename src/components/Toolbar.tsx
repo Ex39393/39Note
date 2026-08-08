@@ -13,6 +13,8 @@ interface ToolbarProps {
   onOpenSearch: () => void;
   openFileRequestId: number;
   onOpenLibrary: () => void;
+  onExportAnnotatedPdf: () => void;
+  isAnnotatedPdfExporting: boolean;
   hasDocument: boolean;
   pageCount: number;
   currentPage: number;
@@ -31,6 +33,8 @@ export function Toolbar({
   onOpenSearch,
   openFileRequestId,
   onOpenLibrary,
+  onExportAnnotatedPdf,
+  isAnnotatedPdfExporting,
   hasDocument,
   pageCount,
   currentPage,
@@ -78,7 +82,6 @@ export function Toolbar({
     return () => window.removeEventListener('keydown', closeOnEscape);
   }, [isThemeMenuOpen]);
 
-
   const applyZoomDraft = () => {
     const parsedZoom = parseZoomPercentage(zoomDraft);
     if (parsedZoom === null) {
@@ -106,7 +109,9 @@ export function Toolbar({
   return (
     <header className="toolbar">
       <div className="toolbar-left">
-        <span className="wordmark" aria-label="39Note">39Note</span>
+        <span className="wordmark" aria-label="39Note">
+          39Note
+        </span>
         <span className="document-title">{documentTitle}</span>
       </div>
 
@@ -134,7 +139,12 @@ export function Toolbar({
           Open PDF
         </button>
         <div className="viewer-controls" aria-label="PDF viewer controls">
-          <button className="toolbar-button" type="button" disabled={!hasDocument} onClick={onZoomOut}>
+          <button
+            className="toolbar-button"
+            type="button"
+            disabled={!hasDocument}
+            onClick={onZoomOut}
+          >
             Zoom -
           </button>
           <input
@@ -157,16 +167,38 @@ export function Toolbar({
               }
             }}
           />
-          <button className="toolbar-button" type="button" disabled={!hasDocument} onClick={onZoomIn}>
+          <button
+            className="toolbar-button"
+            type="button"
+            disabled={!hasDocument}
+            onClick={onZoomIn}
+          >
             Zoom +
           </button>
-          <button className="toolbar-button" type="button" disabled={!hasDocument} onClick={onFitWidth}>
+          <button
+            className="toolbar-button"
+            type="button"
+            disabled={!hasDocument}
+            onClick={onFitWidth}
+          >
             Fit Width
           </button>
-          <button className="toolbar-button" type="button" disabled={!hasDocument} onClick={onFitPage}>
+          <button
+            className="toolbar-button"
+            type="button"
+            disabled={!hasDocument}
+            onClick={onFitPage}
+          >
             Fit Page
           </button>
-          <button aria-label="Search PDF" className="toolbar-button toolbar-search-trigger" disabled={!hasDocument} title="Search PDF (Ctrl+F)" type="button" onClick={onOpenSearch}>
+          <button
+            aria-label="Search PDF"
+            className="toolbar-button toolbar-search-trigger"
+            disabled={!hasDocument}
+            title="Search PDF (Ctrl+F)"
+            type="button"
+            onClick={onOpenSearch}
+          >
             Search
           </button>
           <label className="page-indicator">
@@ -222,8 +254,25 @@ export function Toolbar({
             </div>
           ) : null}
         </div>
-        <button aria-label="Open Library" className="toolbar-button" type="button" onClick={onOpenLibrary}>Library</button>
-        <button className="toolbar-button" type="button" disabled>Export Notes</button>
+        <button
+          aria-label="Open Library"
+          className="toolbar-button"
+          type="button"
+          onClick={onOpenLibrary}
+        >
+          Library
+        </button>
+        <button
+          className="toolbar-button"
+          disabled={!hasDocument || isAnnotatedPdfExporting}
+          type="button"
+          onClick={onExportAnnotatedPdf}
+        >
+          {isAnnotatedPdfExporting ? 'Exporting PDF...' : 'Export Annotated PDF'}
+        </button>
+        <button className="toolbar-button" type="button" disabled>
+          Export Notes
+        </button>
       </div>
     </header>
   );

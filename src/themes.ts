@@ -18,6 +18,7 @@ export interface ThemeDefinition {
   accentColor: string;
   highlightColor: string;
   underlineColor: string;
+  glossaryUnderlineColor: string;
   noteColor: string;
   scrollbarTrack: string;
   scrollbarThumb: string;
@@ -43,6 +44,7 @@ export const themes: Record<ReadingTheme, ThemeDefinition> = {
     accentColor: '#5f7d91',
     highlightColor: '#f2d985',
     underlineColor: '#b96e53',
+    glossaryUnderlineColor: '#242321',
     noteColor: '#d69b78',
     scrollbarTrack: '#e4ded2',
     scrollbarThumb: '#8f969d',
@@ -66,6 +68,7 @@ export const themes: Record<ReadingTheme, ThemeDefinition> = {
     accentColor: '#496f8a',
     highlightColor: '#d8c46f',
     underlineColor: '#b87560',
+    glossaryUnderlineColor: '#25282b',
     noteColor: '#b8826c',
     scrollbarTrack: '#cdd1d5',
     scrollbarThumb: '#7b8791',
@@ -89,6 +92,7 @@ export const themes: Record<ReadingTheme, ThemeDefinition> = {
     accentColor: '#87b9dc',
     highlightColor: '#8c7538',
     underlineColor: '#cc8977',
+    glossaryUnderlineColor: '#e4e7eb',
     noteColor: '#bd8069',
     scrollbarTrack: '#171b20',
     scrollbarThumb: '#596572',
@@ -112,6 +116,7 @@ export const themes: Record<ReadingTheme, ThemeDefinition> = {
     accentColor: '#a79ae6',
     highlightColor: '#8a7641',
     underlineColor: '#cc8eb8',
+    glossaryUnderlineColor: '#edf0f8',
     noteColor: '#bc84aa',
     scrollbarTrack: '#11182a',
     scrollbarThumb: '#59688f',
@@ -135,6 +140,7 @@ export const themes: Record<ReadingTheme, ThemeDefinition> = {
     accentColor: '#c49a4d',
     highlightColor: '#a8883c',
     underlineColor: '#d19a70',
+    glossaryUnderlineColor: '#f0dfbd',
     noteColor: '#bf8467',
     scrollbarTrack: '#2b241a',
     scrollbarThumb: '#92713d',
@@ -158,6 +164,7 @@ export const themes: Record<ReadingTheme, ThemeDefinition> = {
     accentColor: '#c98294',
     highlightColor: '#96754b',
     underlineColor: '#d18a9d',
+    glossaryUnderlineColor: '#f2dbe4',
     noteColor: '#b57489',
     scrollbarTrack: '#291c22',
     scrollbarThumb: '#875366',
@@ -169,4 +176,10 @@ export const themes: Record<ReadingTheme, ThemeDefinition> = {
 
 export function isReadingTheme(value: unknown): value is ReadingTheme {
   return typeof value === 'string' && readingThemes.includes(value as ReadingTheme);
+}
+
+export function getGlossaryUnderlineColor(themeId: string): string {
+  return isReadingTheme(themeId)
+    ? themes[themeId].glossaryUnderlineColor
+    : themes.original.glossaryUnderlineColor;
 }

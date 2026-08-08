@@ -44,11 +44,19 @@ if not exist "%READINESS_HELPER_39NOTE%" (
   exit /b 1
 )
 
-powershell.exe -NoLogo -NoProfile -Command "try { $response = Invoke-WebRequest -UseBasicParsing -Uri $env:APP_URL_39NOTE -TimeoutSec 2; if ($response.StatusCode -ge 200) { exit 0 } } catch {}; exit 1" >nul 2>nul
-if not errorlevel 1 (
+powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%READINESS_HELPER_39NOTE%" -Url "%APP_URL_39NOTE%" -ProbeOnly
+set "SERVER_STATE_39NOTE=%errorlevel%"
+if "%SERVER_STATE_39NOTE%"=="0" (
   echo 39Note is already running. Opening it in the default browser.
   start "" "%APP_URL_39NOTE%"
   exit /b 0
+)
+if "%SERVER_STATE_39NOTE%"=="2" (
+  echo.
+  echo Port 5173 is currently being used by another application. Close that application and start 39Note again.
+  echo.
+  pause
+  exit /b 2
 )
 
 echo Starting 39Note at %APP_URL_39NOTE%

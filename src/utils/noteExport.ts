@@ -1,5 +1,8 @@
 import type { Note } from '../types/note';
 import { underlineColors, type PdfAnnotation } from '../types/highlight';
+import type { GlossaryEntry, NotesPrintLayout } from '../types/glossary';
+import { getPrintLayoutClass, sortGlossaryEntries } from './glossary';
+import { createIdempotentCleanup, getSpaceSavingPrintCss } from './printSession';
 
 export function exportNotesAsMarkdown(notes: Note[], documentTitle: string): boolean {
   if (notes.length === 0) {
@@ -23,9 +26,11 @@ export function exportNotesAsPdf(
   notes: Note[],
   documentTitle: string,
   annotations: PdfAnnotation[],
+  glossaryEntries: GlossaryEntry[],
+  layout: NotesPrintLayout,
   onComplete: () => void,
 ): (() => void) | null {
-  if (notes.length === 0) {
+  if (notes.length === 0 && glossaryEntries.length === 0) {
     return null;
   }
 
@@ -37,7 +42,7 @@ export function exportNotesAsPdf(
   let hasPrinted = false;
   let hasCleanedUp = false;
   let cleanupTimer: number | null = null;
-  const cleanup = () => {
+  const cleanup = createIdempotentCleanup(() => {
     if (hasCleanedUp) {
       return;
     }
@@ -52,7 +57,7 @@ export function exportNotesAsPdf(
       printWindow.close();
     }
     onComplete();
-  };
+  });
   const printWhenReady = () => {
     if (hasPrinted || printWindow.closed) {
       return;
@@ -80,7 +85,9 @@ export function exportNotesAsPdf(
 
   window.addEventListener('pagehide', cleanup, { once: true });
   printWindow.document.open();
-  printWindow.document.write(createNotesPrintDocument(notes, documentTitle, annotations));
+  printWindow.document.write(
+    createNotesPrintDocument(notes, documentTitle, annotations, glossaryEntries, layout),
+  );
   printWindow.document.close();
   printWindow.addEventListener('load', printWhenReady, { once: true });
   window.setTimeout(printWhenReady, 0);
@@ -124,10 +131,12 @@ function isInvalidFileNameCharacter(character: string): boolean {
   return '<>:"/\\|?*'.includes(character) || character.charCodeAt(0) <= 31;
 }
 
-function createNotesPrintDocument(
+export function createNotesPrintDocument(
   notes: Note[],
   documentTitle: string,
   annotations: PdfAnnotation[],
+  glossaryEntries: GlossaryEntry[],
+  layout: NotesPrintLayout,
 ): string {
   const title = escapeHtml(documentTitle.trim() || '39Note');
   const exportDate = escapeHtml(new Intl.DateTimeFormat(undefined, {
@@ -135,6 +144,15 @@ function createNotesPrintDocument(
   }).format(new Date()));
   const annotationsById = new Map(annotations.map((annotation) => [annotation.id, annotation]));
   const noteEntries = notes.map((note) => formatNoteForPrint(note, annotationsById.get(note.annotationId))).join('\n');
+  const glossary = sortGlossaryEntries(glossaryEntries);
+  const glossarySection = glossary.length > 0
+    ? `<section class="glossary-print-section">
+      <h2>Glossary</h2>
+      ${glossary.map(formatGlossaryForPrint).join('\n')}
+      <p class="dictionary-attribution">Definitions from Princeton WordNet 3.1, used under the Princeton WordNet License.</p>
+    </section>`
+    : '';
+  const compactCss = getSpaceSavingPrintCss(layout);
 
   return `<!doctype html>
 <html lang="en">
@@ -157,17 +175,34 @@ function createNotesPrintDocument(
     .note-label { margin-right: 0.35rem; font-weight: 650; }
     .note-page { margin-left: 0.5rem; color: #777; font-size: 9.5pt; }
     .note-empty { color: #777; font-style: italic; }
+    .glossary-print-section { margin-top: 30pt; }
+    .glossary-print-section h2 { margin: 0 0 14pt; font-size: 16pt; line-height: 1.3; break-after: avoid-page; }
+    .glossary-entry { margin-bottom: 18pt; padding-bottom: 12pt; border-bottom: 0.5pt solid #ccc; break-inside: avoid-page; }
+    .glossary-entry h3 { margin: 0 0 5pt; font-size: 12.5pt; line-height: 1.3; }
+    .glossary-entry p { margin: 0 0 5pt; font-size: 11pt; line-height: 1.5; }
+    .glossary-page { color: #777; font-size: 9.5pt; }
+    .dictionary-attribution { margin: 16pt 0 0; color: #777; font-size: 8.5pt; line-height: 1.4; }
+    ${compactCss}
     @media screen { body { background: #f5f5f3; } main { max-width: 820px; margin: 30px auto; padding: 44px; background: #fff; box-shadow: 0 3px 18px rgba(0, 0, 0, 0.12); } }
   </style>
 </head>
-<body>
+<body class="${getPrintLayoutClass(layout)}" data-print-layout="${layout}">
   <main>
     <h1 class="document-title">${title}</h1>
     <p class="export-date">Exported ${exportDate}</p>
     ${noteEntries}
+    ${glossarySection}
   </main>
 </body>
 </html>`;
+}
+
+function formatGlossaryForPrint(entry: GlossaryEntry): string {
+  return `      <article class="glossary-entry">
+        <h3>${escapeHtml(entry.displayedWord)}</h3>
+        <p>${escapeHtml(entry.definition)}</p>
+        <span class="glossary-page">Page ${entry.pageNumber}</span>
+      </article>`;
 }
 
 function formatNoteForPrint(note: Note, annotation: PdfAnnotation | undefined): string {
