@@ -47,6 +47,9 @@ export interface DefinitionBubble {
   status: DefinitionBubbleStatus;
   isExpanded: boolean;
   glossaryEntryId?: string;
+  addedConfirmationToken?: number;
 }
 
-export type NotesPrintLayout = 'standard' | 'space-saving';
+export const notesPrintLayouts = ['standard', 'space-saving', 'extra-large'] as const;
+
+export type NotesPrintLayout = (typeof notesPrintLayouts)[number];

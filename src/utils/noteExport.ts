@@ -1,8 +1,8 @@
 import type { Note } from '../types/note';
 import { underlineColors, type PdfAnnotation } from '../types/highlight';
 import type { GlossaryEntry, NotesPrintLayout } from '../types/glossary';
-import { getPrintLayoutClass, sortGlossaryEntries } from './glossary';
-import { createIdempotentCleanup, getSpaceSavingPrintCss } from './printSession';
+import { getPrintContentItems, getPrintLayoutClass } from './glossary';
+import { createIdempotentCleanup, getPrintLayoutCss } from './printSession';
 
 export function exportNotesAsMarkdown(notes: Note[], documentTitle: string): boolean {
   if (notes.length === 0) {
@@ -143,8 +143,9 @@ export function createNotesPrintDocument(
     dateStyle: 'medium',
   }).format(new Date()));
   const annotationsById = new Map(annotations.map((annotation) => [annotation.id, annotation]));
-  const noteEntries = notes.map((note) => formatNoteForPrint(note, annotationsById.get(note.annotationId))).join('\n');
-  const glossary = sortGlossaryEntries(glossaryEntries);
+  const printContent = getPrintContentItems(notes, glossaryEntries);
+  const noteEntries = printContent.notes.map((note) => formatNoteForPrint(note, annotationsById.get(note.annotationId))).join('\n');
+  const glossary = printContent.glossaryEntries;
   const glossarySection = glossary.length > 0
     ? `<section class="glossary-print-section">
       <h2>Glossary</h2>
@@ -152,7 +153,7 @@ export function createNotesPrintDocument(
       <p class="dictionary-attribution">Definitions from Princeton WordNet 3.1, used under the Princeton WordNet License.</p>
     </section>`
     : '';
-  const compactCss = getSpaceSavingPrintCss(layout);
+  const layoutCss = getPrintLayoutCss(layout);
 
   return `<!doctype html>
 <html lang="en">
@@ -182,7 +183,7 @@ export function createNotesPrintDocument(
     .glossary-entry p { margin: 0 0 5pt; font-size: 11pt; line-height: 1.5; }
     .glossary-page { color: #777; font-size: 9.5pt; }
     .dictionary-attribution { margin: 16pt 0 0; color: #777; font-size: 8.5pt; line-height: 1.4; }
-    ${compactCss}
+    ${layoutCss}
     @media screen { body { background: #f5f5f3; } main { max-width: 820px; margin: 30px auto; padding: 44px; background: #fff; box-shadow: 0 3px 18px rgba(0, 0, 0, 0.12); } }
   </style>
 </head>

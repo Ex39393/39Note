@@ -1,4 +1,5 @@
 import type { PdfAnnotation } from '../types/highlight';
+import type { Note } from '../types/note';
 import type {
   DefinitionBubble,
   DictionaryDefinition,
@@ -30,6 +31,18 @@ export function createGlossaryEntryFromBubble(
   };
 }
 
+export function markDefinitionBubbleAdded(
+  bubble: DefinitionBubble,
+  glossaryEntryId: string,
+  confirmationToken = Date.now(),
+): DefinitionBubble {
+  return {
+    ...bubble,
+    glossaryEntryId,
+    addedConfirmationToken: confirmationToken,
+  };
+}
+
 export function sortGlossaryEntries(
   entries: readonly GlossaryEntry[],
 ): GlossaryEntry[] {
@@ -44,6 +57,16 @@ export function sortGlossaryEntries(
       first.glossaryEntryId.localeCompare(second.glossaryEntryId)
     );
   });
+}
+
+export function getPrintContentItems(
+  notes: readonly Note[],
+  glossaryEntries: readonly GlossaryEntry[],
+): { notes: Note[]; glossaryEntries: GlossaryEntry[] } {
+  return {
+    notes: [...notes],
+    glossaryEntries: sortGlossaryEntries(glossaryEntries),
+  };
 }
 
 export function removeGlossaryEntry(
@@ -72,7 +95,5 @@ export function getDefaultPrintLayout(): NotesPrintLayout {
 }
 
 export function getPrintLayoutClass(layout: NotesPrintLayout): string {
-  return layout === 'space-saving'
-    ? 'print-layout-space-saving'
-    : 'print-layout-standard';
+  return `print-layout-${layout}`;
 }

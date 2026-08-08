@@ -581,7 +581,6 @@ export function AppLayout() {
         preferredDefinition,
       );
       setGlossaryEntries((currentEntries) => [...currentEntries, entry]);
-      setIsNotesDrawerOpen(true);
       return entry;
     },
     [documentIdentity, isDocumentHydrated],

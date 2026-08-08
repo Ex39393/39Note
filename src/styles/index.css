@@ -2504,6 +2504,29 @@ button:focus-visible {
   font-size: 0.76rem;
 }
 
+.definition-bubble-content > .definition-added-confirmation {
+  max-height: 24px;
+  margin: 0 0 8px;
+  overflow: hidden;
+  color: var(--theme-accent);
+  font-weight: 650;
+  animation: definition-confirmation-hide 2.2s ease forwards;
+}
+
+@keyframes definition-confirmation-hide {
+  0%,
+  72% {
+    opacity: 1;
+  }
+
+  100% {
+    max-height: 0;
+    margin-bottom: 0;
+    visibility: hidden;
+    opacity: 0;
+  }
+}
+
 .definition-bubble ol {
   display: grid;
   gap: 8px;

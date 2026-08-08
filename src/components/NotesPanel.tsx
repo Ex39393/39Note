@@ -257,6 +257,16 @@ export function NotesPanel({
               />{' '}
               Space-saving
             </label>
+            <label>
+              <input
+                type="radio"
+                name="notes-print-layout"
+                value="extra-large"
+                checked={printLayout === 'extra-large'}
+                onChange={() => setPrintLayout('extra-large')}
+              />{' '}
+              Extra Large
+            </label>
           </fieldset>
           <div>
             <button type="button" onClick={() => setIsPrintDialogOpen(false)}>

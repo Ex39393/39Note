@@ -35,7 +35,9 @@ export function createGlossaryEntry(
 export {
   createGlossaryEntryFromBubble,
   getDefaultPrintLayout,
+  getPrintContentItems,
   getPrintLayoutClass,
+  markDefinitionBubbleAdded,
   removeGlossaryEntry,
   sortGlossaryEntries,
 } from './glossaryModel';

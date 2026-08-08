@@ -84,6 +84,15 @@ export function DefinitionBubble({
       </header>
 
       <div className="definition-bubble-content" aria-live="polite">
+        {bubble.addedConfirmationToken !== undefined ? (
+          <p
+            className="definition-added-confirmation"
+            key={bubble.addedConfirmationToken}
+            role="status"
+          >
+            Added to Glossary
+          </p>
+        ) : null}
         {bubble.status === 'loading' ? <p>Looking up…</p> : null}
         {bubble.status === 'not-found' ? <p>No definition found</p> : null}
         {bubble.status === 'error' ? <p>Dictionary lookup failed</p> : null}

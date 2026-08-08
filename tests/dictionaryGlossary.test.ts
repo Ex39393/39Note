@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import test from 'node:test';
 import {
   deduplicateDefinitions,
@@ -11,6 +12,8 @@ import {
 import {
   createGlossaryEntryFromBubble,
   getDefaultPrintLayout,
+  getPrintContentItems,
+  markDefinitionBubbleAdded,
   removeGlossaryEntry,
   sortGlossaryEntries,
   getPrintLayoutClass,
@@ -18,11 +21,15 @@ import {
 import { getGlossaryUnderlineColor } from '../src/themes.ts';
 import {
   createIdempotentCleanup,
-  getSpaceSavingPrintCss,
+  getPrintLayoutCss,
 } from '../src/utils/printSession.ts';
 import { resolveInitialNavigation } from '../src/utils/initialNavigation.ts';
 import { sanitizePersistedGlossaryEntries } from '../src/utils/glossaryPersistence.ts';
-import type { DictionaryDefinition, GlossaryEntry } from '../src/types/glossary.ts';
+import {
+  notesPrintLayouts,
+  type DictionaryDefinition,
+  type GlossaryEntry,
+} from '../src/types/glossary.ts';
 import type { DocumentOpenRequest } from '../src/types/documentOpen.ts';
 import type { PdfAnnotation } from '../src/types/highlight.ts';
 
@@ -40,6 +47,20 @@ const definitions: DictionaryDefinition[] = [
   { id: 'three', text: 'The third definition.', partOfSpeech: 'noun', source },
   { id: 'four', text: 'The fourth definition.', partOfSpeech: 'noun', source },
 ];
+
+const addGlossaryFlowSource = getFunctionSource(
+  readFileSync(new URL('../src/components/AppLayout.tsx', import.meta.url), 'utf8'),
+  'const addGlossaryEntry',
+  'const removeGlossaryEntry',
+);
+const definitionBubbleSource = readFileSync(
+  new URL('../src/components/pdf/DefinitionBubble.tsx', import.meta.url),
+  'utf8',
+);
+const noteExportSource = readFileSync(
+  new URL('../src/utils/noteExport.ts', import.meta.url),
+  'utf8',
+);
 
 test('punctuation trimming accepts one English lexical token', () => {
   assert.equal(extractEnglishLookupWord('“reinforcement,”'), 'reinforcement');
@@ -131,6 +152,40 @@ test('adding to Glossary stores only the currently first-ranked definition', () 
   assert.equal(entry.sourceRects[0].x, 0.1);
 });
 
+test('adding to Glossary leaves a closed or open drawer unchanged', () => {
+  assert.match(addGlossaryFlowSource, /setGlossaryEntries/);
+  assert.doesNotMatch(addGlossaryFlowSource, /setIsNotesDrawerOpen/);
+});
+
+test('adding to Glossary does not change Notes or Glossary expansion state', () => {
+  assert.doesNotMatch(
+    addGlossaryFlowSource,
+    /setIsNotesSectionOpen|setIsGlossarySectionOpen/,
+  );
+});
+
+test('successful Glossary addition marks the bubble for passive confirmation', () => {
+  const bubble = {
+    id: 'bubble-confirmation',
+    documentId: 'document-1',
+    pageNumber: 1,
+    displayedWord: 'term',
+    normalizedLookupWord: 'term',
+    rects: [{ x: 0.1, y: 0.1, width: 0.2, height: 0.03 }],
+    startOffset: 1,
+    endOffset: 5,
+    definitions,
+    status: 'ready' as const,
+    isExpanded: false,
+  };
+  const updated = markDefinitionBubbleAdded(bubble, 'glossary-entry', 123);
+  assert.equal(updated.glossaryEntryId, 'glossary-entry');
+  assert.equal(updated.addedConfirmationToken, 123);
+  assert.equal(bubble.glossaryEntryId, undefined);
+  assert.match(definitionBubbleSource, /Added to Glossary/);
+  assert.match(definitionBubbleSource, /aria-live="polite"/);
+});
+
 test('Glossary ordering is page, y, x, creation time, then id without mutation', () => {
   const entries = [
     glossary('b', 2, 0.2, 0.1, 1),
@@ -179,13 +234,58 @@ test('all six themes expose a visible semantic marker colour', () => {
   assert.ok(colors.every((color) => /^#[0-9a-f]{6}$/i.test(color)));
 });
 
-test('Standard remains the default and Space-saving emits only session-scoped compact CSS', () => {
+test('print layouts are explicit and Standard remains the default', () => {
+  assert.deepEqual(notesPrintLayouts, ['standard', 'space-saving', 'extra-large']);
   assert.equal(getDefaultPrintLayout(), 'standard');
   assert.equal(getPrintLayoutClass('standard'), 'print-layout-standard');
   assert.equal(getPrintLayoutClass('space-saving'), 'print-layout-space-saving');
-  assert.equal(getSpaceSavingPrintCss('standard'), '');
-  assert.match(getSpaceSavingPrintCss('space-saving'), /margin: 12mm/);
-  assert.match(getSpaceSavingPrintCss('space-saving'), /font-size: 10pt/);
+  assert.equal(getPrintLayoutClass('extra-large'), 'print-layout-extra-large');
+});
+
+test('Standard and Space-saving print styles remain unchanged', () => {
+  assert.equal(getPrintLayoutCss('standard'), '');
+  const compactCss = getPrintLayoutCss('space-saving');
+  assert.match(compactCss, /margin: 12mm/);
+  assert.match(compactCss, /font-size: 10pt/);
+  assert.match(compactCss, /line-height: 1\.3/);
+  assert.match(compactCss, /border-bottom-width: 0\.4pt/);
+  assert.doesNotMatch(compactCss, /print-layout-extra-large/);
+});
+
+test('Extra Large uses materially larger isolated typography', () => {
+  const largeCss = getPrintLayoutCss('extra-large');
+  assert.match(noteExportSource, /\.note-body \{[^}]*font-size: 12\.5pt/);
+  assert.match(largeCss, /margin: 18mm/);
+  assert.match(largeCss, /font-size: 16pt; line-height: 1\.5/);
+  assert.match(largeCss, /document-title[^}]*font-size: 24pt/);
+  assert.match(largeCss, /glossary-print-section h2[^}]*font-size: 20pt/);
+  assert.match(largeCss, /glossary-entry h3[^}]*font-size: 18pt/);
+  assert.match(largeCss, /border-bottom-width: 0\.8pt/);
+  assert.doesNotMatch(largeCss, /print-layout-space-saving/);
+});
+
+test('all print layouts contain identical Note and Glossary content', () => {
+  const note = {
+    id: 'note-1',
+    annotationId: 'annotation-1',
+    pageNumber: 2,
+    displayNumber: 'Review',
+    selectedText: 'Selected source text',
+    content: 'A long-form study note.',
+    createdAt: 1,
+    updatedAt: 1,
+  };
+  const entry = glossary('print-entry', 3, 0.1, 0.1, 1);
+  const contentByLayout = notesPrintLayouts.map(() =>
+    getPrintContentItems([note], [entry]),
+  );
+  assert.deepEqual(contentByLayout[0], contentByLayout[1]);
+  assert.deepEqual(contentByLayout[1], contentByLayout[2]);
+  assert.equal(contentByLayout[2].notes[0].content, 'A long-form study note.');
+  assert.equal(
+    contentByLayout[2].glossaryEntries[0].definition,
+    'Definition print-entry',
+  );
 });
 
 test('print cleanup remains idempotent', () => {
@@ -196,6 +296,23 @@ test('print cleanup remains idempotent', () => {
   cleanup();
   cleanup();
   assert.equal(calls, 1);
+});
+
+test('a cleaned print session does not block an immediate second session', () => {
+  let activeSessions = 0;
+  const beginSession = () => {
+    activeSessions += 1;
+    return createIdempotentCleanup(() => {
+      activeSessions -= 1;
+    });
+  };
+  const closeFirstSession = beginSession();
+  closeFirstSession();
+  closeFirstSession();
+  const closeSecondSession = beginSession();
+  assert.equal(activeSessions, 1);
+  closeSecondSession();
+  assert.equal(activeSessions, 0);
 });
 
 test('Glossary navigation wins over saved position and stale navigation is ignored', () => {
@@ -258,4 +375,12 @@ function glossary(
     source,
     markerAnnotationId: `marker-${id}`,
   };
+}
+
+function getFunctionSource(sourceText: string, start: string, end: string): string {
+  const startIndex = sourceText.indexOf(start);
+  const endIndex = sourceText.indexOf(end, startIndex);
+  assert.notEqual(startIndex, -1);
+  assert.notEqual(endIndex, -1);
+  return sourceText.slice(startIndex, endIndex);
 }

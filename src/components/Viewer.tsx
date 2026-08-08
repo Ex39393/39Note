@@ -35,6 +35,7 @@ import { logNavigationDiagnostic } from '../utils/navigationDiagnostics';
 import { SelectionAction } from './pdf/SelectionAction';
 import { extractEnglishLookupWord, moveDefinitionUp } from '../utils/dictionary';
 import { normalizeSelectionRectangles } from '../utils/highlights';
+import { markDefinitionBubbleAdded } from '../utils/glossary';
 
 GlobalWorkerOptions.workerSrc = pdfWorker;
 
@@ -576,7 +577,7 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(function Viewer({
     setDefinitionBubbles((current) =>
       current.map((candidate) =>
         candidate.id === bubbleId
-          ? { ...candidate, glossaryEntryId: entry.glossaryEntryId }
+          ? markDefinitionBubbleAdded(candidate, entry.glossaryEntryId)
           : candidate,
       ),
     );
