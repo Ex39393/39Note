@@ -1,4 +1,9 @@
-import type { DictionaryDefinition } from '../types/glossary';
+import type {
+  DictionaryDefinition,
+  DictionaryProvider,
+  DictionarySourceAttribution,
+} from '../types/glossary';
+import type { PdfTextSelection } from '../types/textSelection';
 
 const lexicalWordPattern = /^[A-Za-z]+(?:['-][A-Za-z]+)*$/;
 
@@ -10,6 +15,14 @@ export function extractEnglishLookupWord(selectionText: string): string | null {
     .replaceAll('\u2019', "'");
 
   return lexicalWordPattern.test(trimmed) ? trimmed : null;
+}
+
+export function getDictionaryLookupSelection(
+  selections: readonly PdfTextSelection[],
+): PdfTextSelection | null {
+  if (selections.length !== 1) return null;
+  const selectedWord = extractEnglishLookupWord(selections[0].text);
+  return selectedWord ? { ...selections[0], text: selectedWord } : null;
 }
 
 export function normalizeLookupWord(word: string): string {
@@ -64,25 +77,93 @@ export function getDictionaryShardKey(word: string): string {
 export function deduplicateDefinitions(
   definitions: readonly DictionaryDefinition[],
 ): DictionaryDefinition[] {
-  const fingerprints: string[] = [];
+  const accepted: DictionaryDefinition[] = [];
   return definitions.filter((definition) => {
-    const fingerprint = definition.text
-      .normalize('NFKC')
-      .toLocaleLowerCase('en-US')
-      .replace(/[^a-z0-9]+/g, ' ')
-      .trim();
+    const fingerprint = getDefinitionFingerprint(definition.text);
     if (!fingerprint) return false;
-    const duplicate = fingerprints.some(
-      (existing) =>
-        existing === fingerprint ||
-        (Math.min(existing.length, fingerprint.length) /
-          Math.max(existing.length, fingerprint.length) >=
-          0.94 &&
-          (existing.includes(fingerprint) || fingerprint.includes(existing))),
+    const duplicate = accepted.some((existing) =>
+      areDefinitionsNearIdentical(existing.text, definition.text),
     );
-    if (!duplicate) fingerprints.push(fingerprint);
+    if (!duplicate) accepted.push(definition);
     return !duplicate;
   });
+}
+
+export function mergeDictionaryDefinitions(
+  currentDefinitions: readonly DictionaryDefinition[],
+  incomingDefinitions: readonly DictionaryDefinition[],
+): DictionaryDefinition[] {
+  const merged = [...currentDefinitions];
+  for (const incoming of incomingDefinitions) {
+    const duplicateIndex = merged.findIndex((existing) =>
+      areDefinitionsNearIdentical(existing.text, incoming.text),
+    );
+    if (duplicateIndex === -1) {
+      merged.push(incoming);
+      continue;
+    }
+
+    if (
+      getProviderPriority(incoming.source) <
+      getProviderPriority(merged[duplicateIndex].source)
+    ) {
+      merged[duplicateIndex] = incoming;
+    }
+  }
+  return merged;
+}
+
+export function areDefinitionsNearIdentical(first: string, second: string): boolean {
+  const firstFingerprint = getDefinitionFingerprint(first);
+  const secondFingerprint = getDefinitionFingerprint(second);
+  if (!firstFingerprint || !secondFingerprint) return false;
+  if (firstFingerprint === secondFingerprint) return true;
+  const similarity =
+    Math.min(firstFingerprint.length, secondFingerprint.length) /
+    Math.max(firstFingerprint.length, secondFingerprint.length);
+  return (
+    similarity >= 0.94 &&
+    (firstFingerprint.includes(secondFingerprint) ||
+      secondFingerprint.includes(firstFingerprint))
+  );
+}
+
+export function getDictionaryProvider(
+  source: DictionarySourceAttribution,
+): DictionaryProvider {
+  return source.provider ?? 'wordnet';
+}
+
+export function getDictionarySourceLabel(
+  source: DictionarySourceAttribution,
+): string {
+  const provider = getDictionaryProvider(source);
+  if (provider === 'wiktionary') return 'English Wiktionary';
+  if (provider === 'mesh') return `NLM MeSH ${source.version}`;
+  return 'Princeton WordNet 3.1';
+}
+
+export function getDictionaryAttributionText(
+  sources: readonly DictionarySourceAttribution[],
+): string {
+  const providers = new Set(sources.map(getDictionaryProvider));
+  const statements: string[] = [];
+  if (providers.has('wordnet')) {
+    statements.push(
+      'Definitions from Princeton WordNet 3.1, used under the Princeton WordNet License.',
+    );
+  }
+  if (providers.has('wiktionary')) {
+    statements.push(
+      'Definitions from English Wiktionary contributors, available under CC BY-SA 4.0 and GFDL.',
+    );
+  }
+  if (providers.has('mesh')) {
+    statements.push(
+      'MeSH definitions courtesy of the U.S. National Library of Medicine; no endorsement is implied.',
+    );
+  }
+  return statements.join(' ');
 }
 
 export function moveDefinitionUp(
@@ -101,4 +182,19 @@ export function getVisibleDefinitions<T>(
   expanded: boolean,
 ): T[] {
   return expanded ? [...definitions] : definitions.slice(0, 3);
+}
+
+function getDefinitionFingerprint(text: string): string {
+  return text
+    .normalize('NFKC')
+    .toLocaleLowerCase('en-US')
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim();
+}
+
+function getProviderPriority(source: DictionarySourceAttribution): number {
+  const provider = getDictionaryProvider(source);
+  if (provider === 'mesh') return 0;
+  if (provider === 'wordnet') return 1;
+  return 2;
 }

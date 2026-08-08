@@ -1,4 +1,7 @@
-import type { GlossaryEntry } from '../types/glossary';
+import type {
+  DictionarySourceAttribution,
+  GlossaryEntry,
+} from '../types/glossary';
 
 export function sanitizePersistedGlossaryEntries(
   value: unknown,
@@ -23,19 +26,13 @@ export function sanitizePersistedGlossaryEntries(
       !isTimestamp(candidate.createdAt) ||
       !isNonEmptyString(candidate.markerAnnotationId) ||
       markerIds.has(candidate.markerAnnotationId) ||
-      !isRecord(candidate.source) ||
-      candidate.source.dataset !== 'Princeton WordNet' ||
-      candidate.source.version !== '3.1' ||
-      candidate.source.license !== 'Princeton WordNet License' ||
-      candidate.source.sourceUrl !== 'https://wordnet.princeton.edu/' ||
-      !['noun', 'verb', 'adjective', 'adverb'].includes(
-        String(candidate.source.partOfSpeech),
-      )
+      !sanitizeDictionarySource(candidate.source)
     )
       return [];
 
     const sourceRects = sanitizeRectangles(candidate.sourceRects);
-    if (sourceRects.length === 0) return [];
+    const source = sanitizeDictionarySource(candidate.source);
+    if (sourceRects.length === 0 || !source) return [];
     entryIds.add(candidate.glossaryEntryId);
     markerIds.add(candidate.markerAnnotationId);
     return [
@@ -50,17 +47,76 @@ export function sanitizePersistedGlossaryEntries(
         startOffset: candidate.startOffset,
         endOffset: candidate.endOffset,
         createdAt: candidate.createdAt,
-        source: {
-          dataset: 'Princeton WordNet',
-          version: '3.1',
-          license: 'Princeton WordNet License',
-          sourceUrl: 'https://wordnet.princeton.edu/',
-          partOfSpeech: candidate.source.partOfSpeech,
-        },
+        source,
         markerAnnotationId: candidate.markerAnnotationId,
       } as GlossaryEntry,
     ];
   });
+}
+
+export function sanitizeDictionarySource(
+  value: unknown,
+): DictionarySourceAttribution | null {
+  if (!isRecord(value)) return null;
+  if (
+    (value.provider === undefined || value.provider === 'wordnet') &&
+    value.dataset === 'Princeton WordNet' &&
+    value.version === '3.1' &&
+    value.license === 'Princeton WordNet License' &&
+    value.sourceUrl === 'https://wordnet.princeton.edu/' &&
+    ['noun', 'verb', 'adjective', 'adverb'].includes(String(value.partOfSpeech))
+  ) {
+    return {
+      provider: 'wordnet',
+      dataset: 'Princeton WordNet',
+      version: '3.1',
+      license: 'Princeton WordNet License',
+      sourceUrl: 'https://wordnet.princeton.edu/',
+      partOfSpeech: value.partOfSpeech as 'noun' | 'verb' | 'adjective' | 'adverb',
+    };
+  }
+  if (
+    value.provider === 'wiktionary' &&
+    value.dataset === 'English Wiktionary' &&
+    value.version === 'structured-definitions-v1' &&
+    value.license === 'CC BY-SA 4.0 / GFDL' &&
+    value.sourceUrl === 'https://en.wiktionary.org/'
+  ) {
+    return {
+      provider: 'wiktionary',
+      dataset: 'English Wiktionary',
+      version: 'structured-definitions-v1',
+      license: 'CC BY-SA 4.0 / GFDL',
+      sourceUrl: 'https://en.wiktionary.org/',
+      ...(isNonEmptyString(value.partOfSpeech)
+        ? { partOfSpeech: value.partOfSpeech }
+        : {}),
+      ...(isNonEmptyString(value.domain) ? { domain: value.domain } : {}),
+      ...(isNonEmptyString(value.sourceId) ? { sourceId: value.sourceId } : {}),
+    };
+  }
+  if (
+    value.provider === 'mesh' &&
+    value.dataset === 'NLM MeSH' &&
+    isNonEmptyString(value.version) &&
+    value.license === 'NLM MeSH Terms and Conditions' &&
+    value.sourceUrl === 'https://www.nlm.nih.gov/mesh/' &&
+    value.domain === 'Biomedical terminology' &&
+    isNonEmptyString(value.sourceId) &&
+    isNonEmptyString(value.preferredHeading)
+  ) {
+    return {
+      provider: 'mesh',
+      dataset: 'NLM MeSH',
+      version: value.version,
+      license: 'NLM MeSH Terms and Conditions',
+      sourceUrl: 'https://www.nlm.nih.gov/mesh/',
+      domain: 'Biomedical terminology',
+      sourceId: value.sourceId,
+      preferredHeading: value.preferredHeading,
+    };
+  }
+  return null;
 }
 
 function sanitizeRectangles(value: unknown): GlossaryEntry['sourceRects'] {

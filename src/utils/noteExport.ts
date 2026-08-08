@@ -3,6 +3,7 @@ import { underlineColors, type PdfAnnotation } from '../types/highlight';
 import type { GlossaryEntry, NotesPrintLayout } from '../types/glossary';
 import { getPrintContentItems, getPrintLayoutClass } from './glossary';
 import { createIdempotentCleanup, getPrintLayoutCss } from './printSession';
+import { getDictionaryAttributionText } from './dictionary';
 
 export function exportNotesAsMarkdown(notes: Note[], documentTitle: string): boolean {
   if (notes.length === 0) {
@@ -146,11 +147,14 @@ export function createNotesPrintDocument(
   const printContent = getPrintContentItems(notes, glossaryEntries);
   const noteEntries = printContent.notes.map((note) => formatNoteForPrint(note, annotationsById.get(note.annotationId))).join('\n');
   const glossary = printContent.glossaryEntries;
+  const dictionaryAttribution = getDictionaryAttributionText(
+    glossary.map((entry) => entry.source),
+  );
   const glossarySection = glossary.length > 0
     ? `<section class="glossary-print-section">
       <h2>Glossary</h2>
       ${glossary.map(formatGlossaryForPrint).join('\n')}
-      <p class="dictionary-attribution">Definitions from Princeton WordNet 3.1, used under the Princeton WordNet License.</p>
+      <p class="dictionary-attribution">${escapeHtml(dictionaryAttribution)}</p>
     </section>`
     : '';
   const layoutCss = getPrintLayoutCss(layout);

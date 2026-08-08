@@ -57,6 +57,9 @@ export function NotesPanel({
   const [isPrintDialogOpen, setIsPrintDialogOpen] = useState(false);
   const [printLayout, setPrintLayout] =
     useState<NotesPrintLayout>(getDefaultPrintLayout);
+  const [dictionaryCacheStatus, setDictionaryCacheStatus] = useState<
+    'idle' | 'clearing' | 'cleared' | 'error'
+  >('idle');
   const matchingNotes = useMemo(
     () => notes.filter((note) => noteMatchesSearch(note, searchQuery)),
     [notes, searchQuery],
@@ -220,8 +223,48 @@ export function NotesPanel({
                   target="_blank"
                   rel="noreferrer"
                 >
-                  Source and licence
+                  WordNet source and licence
                 </a>
+                <p>English Wiktionary · CC BY-SA 4.0 / GFDL</p>
+                <a href="https://en.wiktionary.org/" target="_blank" rel="noreferrer">
+                  English Wiktionary
+                </a>
+                <p>
+                  NLM MeSH 2026 · Courtesy of the U.S. National Library of
+                  Medicine · No endorsement implied
+                </p>
+                <a
+                  href="https://www.nlm.nih.gov/databases/download/terms_and_conditions_mesh.html"
+                  target="_blank"
+                  rel="noreferrer"
+                >
+                  MeSH terms and conditions
+                </a>
+                <p>
+                  Online providers receive only the normalized selected word—never
+                  PDF text, filenames, Notes, annotations, or document identifiers.
+                </p>
+                <button
+                  type="button"
+                  disabled={dictionaryCacheStatus === 'clearing'}
+                  onClick={() => {
+                    setDictionaryCacheStatus('clearing');
+                    void import('../services/dictionary/dictionaryCache')
+                      .then(({ clearDictionaryCache }) => clearDictionaryCache())
+                      .then(() => setDictionaryCacheStatus('cleared'))
+                      .catch(() => setDictionaryCacheStatus('error'));
+                  }}
+                >
+                  {dictionaryCacheStatus === 'clearing'
+                    ? 'Clearing…'
+                    : 'Clear Dictionary Cache'}
+                </button>
+                {dictionaryCacheStatus === 'cleared' ? (
+                  <p role="status">Dictionary cache cleared.</p>
+                ) : null}
+                {dictionaryCacheStatus === 'error' ? (
+                  <p role="status">Dictionary cache could not be cleared.</p>
+                ) : null}
               </details>
             </div>
           ) : null}

@@ -20,6 +20,7 @@ interface SelectionActionProps {
   selectedColor?: AnnotationColor;
   onColorChange?: (color: AnnotationColor) => void;
   onActivate?: () => void;
+  onLookupWord?: () => void;
   actions?: Array<{ label: string; onActivate: () => void }>;
 }
 
@@ -30,6 +31,7 @@ export function SelectionAction({
   selectedColor,
   onColorChange,
   onActivate,
+  onLookupWord,
   actions,
 }: SelectionActionProps) {
   const colors = annotationType === 'highlight' ? highlightColors : underlineColors;
@@ -88,9 +90,26 @@ export function SelectionAction({
           </button>
         ))
       ) : (
-        <button type="button" onMouseDown={(event) => event.preventDefault()} onClick={onActivate}>
-          Apply
-        </button>
+        <>
+          <button type="button" onMouseDown={(event) => event.preventDefault()} onClick={onActivate}>
+            Apply
+          </button>
+          {onLookupWord ? (
+            <button
+              className="dictionary-lookup-button"
+              aria-label="Look up word"
+              title="Look up word"
+              type="button"
+              onMouseDown={(event) => event.preventDefault()}
+              onClick={onLookupWord}
+            >
+              <svg aria-hidden="true" viewBox="0 0 24 24">
+                <circle cx="10.5" cy="10.5" r="6.5" />
+                <path d="m15.3 15.3 5 5" />
+              </svg>
+            </button>
+          ) : null}
+        </>
       )}
     </div>
   );

@@ -15,7 +15,6 @@ import {
 import type { ElementSize } from '../../hooks/useElementSize';
 import type { PdfSearchResult } from '../../types/pdfSearch';
 import type { DefinitionBubble as DefinitionBubbleModel, GlossaryEntry } from '../../types/glossary';
-import type { PdfTextSelection } from '../../types/textSelection';
 import {
   highlightColors,
   underlineColors,
@@ -23,8 +22,6 @@ import {
 } from '../../types/highlight';
 import { correctTextLayerReadingOrder } from '../../utils/textLayerReadingOrder';
 import { getHighlightRenderGroups, normalizeAnnotationVisualGeometry } from '../../utils/highlights';
-import { extractEnglishLookupWord } from '../../utils/dictionary';
-import { getPdfTextSelections } from '../../utils/textSelection';
 import { DefinitionBubble } from './DefinitionBubble';
 
 type FitMode = 'width' | 'page' | null;
@@ -61,7 +58,6 @@ interface PdfPageProps {
   onScaleChange: (pageNumber: number, scale: number) => void;
   onGoToPage: (pageNumber: number) => void;
   onAnnotationSelect: (annotationId: string, left: number, top: number) => void;
-  onWordLookup: (selection: PdfTextSelection) => void;
   onAddBubbleToGlossary: (bubbleId: string) => void;
   onCloseDefinitionBubble: (bubbleId: string) => void;
   onMoveDefinitionUp: (bubbleId: string, definitionId: string) => void;
@@ -88,7 +84,6 @@ export function PdfPage({
   onScaleChange,
   onGoToPage,
   onAnnotationSelect,
-  onWordLookup,
   onAddBubbleToGlossary,
   onCloseDefinitionBubble,
   onMoveDefinitionUp,
@@ -399,24 +394,6 @@ export function PdfPage({
     }
   };
 
-  const handleTextLayerDoubleClick = () => {
-    const selection = window.getSelection();
-    const shell = shellRef.current;
-    if (!selection || !shell || selection.isCollapsed || selection.rangeCount !== 1) {
-      return;
-    }
-
-    const pageSelection = getPdfTextSelections(selection, shell).find(
-      (candidate) => candidate.pageNumber === pageNumber,
-    );
-    const lookupWord = pageSelection ? extractEnglishLookupWord(pageSelection.text) : null;
-    if (!pageSelection || !lookupWord) {
-      return;
-    }
-
-    onWordLookup({ ...pageSelection, text: lookupWord });
-  };
-
   const shellStyle = dimensions
     ? ({
         width: dimensions.width,
@@ -530,7 +507,6 @@ export function PdfPage({
           data-pdf-text-layer
           data-page-number={pageNumber}
           onClick={handleTextLayerClick}
-          onDoubleClick={handleTextLayerDoubleClick}
         />
         {links.map((link) => (
           <a

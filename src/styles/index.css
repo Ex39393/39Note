@@ -757,13 +757,23 @@ button:focus-visible {
 }
 
 .glossary-card button,
-.dictionary-sources a {
+.dictionary-sources a,
+.dictionary-sources button {
   padding: 0;
   border: 0;
   background: transparent;
   color: var(--theme-accent);
   cursor: pointer;
   font: inherit;
+}
+
+.dictionary-sources button {
+  margin-top: 9px;
+}
+
+.dictionary-sources button:disabled {
+  cursor: default;
+  opacity: 0.55;
 }
 
 .dictionary-sources {
@@ -2552,7 +2562,22 @@ button:focus-visible {
   font-weight: 650;
 }
 
+.definition-bubble li > span {
+  grid-column: 1;
+  grid-row: 1;
+}
+
+.definition-bubble li > small {
+  grid-column: 1;
+  grid-row: 2;
+  color: var(--theme-text);
+  font-size: 0.62rem;
+  opacity: 0.68;
+}
+
 .definition-bubble li button {
+  grid-column: 2;
+  grid-row: 1 / span 2;
   width: 26px;
   height: 25px;
   padding: 0;
@@ -2829,6 +2854,22 @@ button:focus-visible {
   cursor: pointer;
   font-size: 0.76rem;
   font-weight: 650;
+}
+
+.selection-action .dictionary-lookup-button {
+  display: inline-grid;
+  width: 30px;
+  padding: 0;
+  place-items: center;
+}
+
+.dictionary-lookup-button svg {
+  width: 17px;
+  height: 17px;
+  fill: none;
+  stroke: currentcolor;
+  stroke-linecap: round;
+  stroke-width: 1.8;
 }
 
 .highlight-colors {

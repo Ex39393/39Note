@@ -1,6 +1,9 @@
 import type { NormalizedHighlightRectangle } from './highlight';
 
-export interface DictionarySourceAttribution {
+export type DictionaryProvider = 'wordnet' | 'wiktionary' | 'mesh';
+
+export interface WordNetSourceAttribution {
+  provider?: 'wordnet';
   dataset: 'Princeton WordNet';
   version: '3.1';
   license: 'Princeton WordNet License';
@@ -8,13 +11,45 @@ export interface DictionarySourceAttribution {
   partOfSpeech: DictionaryPartOfSpeech;
 }
 
+export interface WiktionarySourceAttribution {
+  provider: 'wiktionary';
+  dataset: 'English Wiktionary';
+  version: 'structured-definitions-v1';
+  license: 'CC BY-SA 4.0 / GFDL';
+  sourceUrl: 'https://en.wiktionary.org/';
+  partOfSpeech?: string;
+  domain?: string;
+  sourceId?: string;
+}
+
+export interface MeshSourceAttribution {
+  provider: 'mesh';
+  dataset: 'NLM MeSH';
+  version: string;
+  license: 'NLM MeSH Terms and Conditions';
+  sourceUrl: 'https://www.nlm.nih.gov/mesh/';
+  domain: 'Biomedical terminology';
+  sourceId: string;
+  preferredHeading: string;
+}
+
+export type DictionarySourceAttribution =
+  | WordNetSourceAttribution
+  | WiktionarySourceAttribution
+  | MeshSourceAttribution;
+
 export type DictionaryPartOfSpeech = 'noun' | 'verb' | 'adjective' | 'adverb';
 
 export interface DictionaryDefinition {
   id: string;
   text: string;
-  partOfSpeech: DictionaryPartOfSpeech;
+  partOfSpeech?: string;
   source: DictionarySourceAttribution;
+}
+
+export interface DictionaryLookupResult {
+  normalizedWord: string;
+  definitions: DictionaryDefinition[];
 }
 
 export interface GlossaryEntry {
@@ -46,6 +81,8 @@ export interface DefinitionBubble {
   definitions: DictionaryDefinition[];
   status: DefinitionBubbleStatus;
   isExpanded: boolean;
+  isEnriching?: boolean;
+  userHasReordered?: boolean;
   glossaryEntryId?: string;
   addedConfirmationToken?: number;
 }

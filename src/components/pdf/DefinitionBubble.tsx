@@ -1,6 +1,9 @@
 import { useEffect, useRef } from 'react';
 import type { DefinitionBubble as DefinitionBubbleModel } from '../../types/glossary';
-import { getVisibleDefinitions } from '../../utils/dictionary';
+import {
+  getDictionarySourceLabel,
+  getVisibleDefinitions,
+} from '../../utils/dictionary';
 
 interface DefinitionBubbleProps {
   bubble: DefinitionBubbleModel;
@@ -37,6 +40,13 @@ export function DefinitionBubble({
     bubble.isExpanded,
   );
   const hiddenDefinitionCount = bubble.definitions.length - 3;
+  const sourceLabels = [
+    ...new Set(
+      bubble.definitions.map((definition) =>
+        getDictionarySourceLabel(definition.source),
+      ),
+    ),
+  ];
 
   useEffect(() => {
     const element = bubbleRef.current;
@@ -101,6 +111,7 @@ export function DefinitionBubble({
             {visibleDefinitions.map((definition, index) => (
               <li key={definition.id}>
                 <span>{definition.text}</span>
+                <small>{getDictionarySourceLabel(definition.source)}</small>
                 <button
                   aria-label={`Move definition ${index + 1} up`}
                   disabled={index === 0}
@@ -124,8 +135,11 @@ export function DefinitionBubble({
             {bubble.isExpanded ? 'Show fewer' : `Show ${hiddenDefinitionCount} more`}
           </button>
         ) : null}
+        {bubble.status === 'ready' && bubble.isEnriching ? (
+          <p className="dictionary-enrichment-status">Checking online sources…</p>
+        ) : null}
       </div>
-      <footer>Princeton WordNet 3.1</footer>
+      <footer>{sourceLabels.join(' · ') || 'Local dictionary first'}</footer>
     </aside>
   );
 }
