@@ -18,6 +18,7 @@ import { AnnotatedPdfExportDialog } from './AnnotatedPdfExportDialog';
 import type { AnnotationFilterState } from './pdf/AnnotationFilterControl';
 import type { HighlightColor, PdfAnnotation, UnderlineColor } from '../types/highlight';
 import type { Note } from '../types/note';
+import type { NoteAnchor } from '../types/noteAnchor';
 import type {
   DefinitionBubble,
   DictionaryDefinition,
@@ -37,6 +38,11 @@ import type {
   DocumentOpenTarget,
 } from '../types/documentOpen';
 import type { ReadingPosition } from '../types/library';
+import {
+  createNoteAnchorFromAnnotation,
+  createNoteAnchorFromSelection,
+  findMatchingNote,
+} from '../utils/annotationOverlap';
 import {
   deleteDocumentState,
   deleteDocumentStates,
@@ -110,6 +116,7 @@ export function AppLayout() {
   const [pageCount, setPageCount] = useState(0);
   const [currentPage, setCurrentPage] = useState(0);
   const [annotations, setAnnotations] = useState<PdfAnnotation[]>([]);
+  const [noteAnchors, setNoteAnchors] = useState<NoteAnchor[]>([]);
   const [notes, setNotes] = useState<Note[]>([]);
   const [glossaryEntries, setGlossaryEntries] = useState<GlossaryEntry[]>([]);
   const [nextNoteNumber, setNextNoteNumber] = useState(1);
@@ -176,6 +183,7 @@ export function AppLayout() {
   const documentStateRef = useRef({
     documentIdentity,
     annotations,
+    noteAnchors,
     notes,
     glossaryEntries,
     nextNoteNumber,
@@ -186,6 +194,7 @@ export function AppLayout() {
   documentStateRef.current = {
     documentIdentity,
     annotations,
+    noteAnchors,
     notes,
     glossaryEntries,
     nextNoteNumber,
@@ -210,6 +219,7 @@ export function AppLayout() {
     const wasSaved = await saveDocumentState(
       currentState.documentIdentity,
       currentState.annotations,
+      currentState.noteAnchors,
       currentState.notes,
       currentState.glossaryEntries,
       currentState.nextNoteNumber,
@@ -252,6 +262,7 @@ export function AppLayout() {
     };
   }, [
     annotations,
+    noteAnchors,
     documentIdentity,
     isDocumentHydrated,
     notes,
@@ -342,6 +353,7 @@ export function AppLayout() {
       setPageCount(0);
       setCurrentPage(0);
       setAnnotations([]);
+      setNoteAnchors([]);
       setAnnotationFilter({
         types: ['highlight', 'underline'],
         noteStatus: 'all',
@@ -390,6 +402,7 @@ export function AppLayout() {
       setDocumentDisplayTitle(identity.documentName);
       setIsDocumentHydrated(false);
       setAnnotations([]);
+      setNoteAnchors([]);
       setNotes([]);
       setGlossaryEntries([]);
       setFocusedNoteId(null);
@@ -414,6 +427,7 @@ export function AppLayout() {
         }
 
         setAnnotations(persistedState?.annotations ?? []);
+        setNoteAnchors(persistedState?.noteAnchors ?? []);
         setNotes(persistedState?.notes ?? []);
         setGlossaryEntries(persistedState?.glossaryEntries ?? []);
         hydratedReadingPositionRef.current = persistedState?.readingPosition ?? null;
@@ -475,79 +489,69 @@ export function AppLayout() {
   );
 
   const removeAnnotation = useCallback((annotationId: string) => {
-    setAnnotations((currentAnnotations) =>
-      currentAnnotations.filter((annotation) => annotation.id !== annotationId),
-    );
-    setNotes((currentNotes) =>
-      currentNotes.filter((note) => note.annotationId !== annotationId),
-    );
-  }, []);
-
-  const updateAnnotationColor = useCallback(
-    (annotationId: string, color: HighlightColor | UnderlineColor) => {
-      setAnnotations((currentAnnotations) =>
-        currentAnnotations.map((annotation) => {
-          if (annotation.id !== annotationId || annotation.color === color) {
-            return annotation;
-          }
-
-          if (
-            annotation.type === 'highlight' &&
-            !['yellow', 'green', 'blue', 'pink'].includes(color)
-          ) {
-            return annotation;
-          }
-          if (
-            annotation.type === 'underline' &&
-            !['red', 'blue', 'green', 'black'].includes(color)
-          ) {
-            return annotation;
-          }
-
-          return { ...annotation, color, updatedAt: Date.now() } as PdfAnnotation;
-        }),
+    const annotation = annotations.find((candidate) => candidate.id === annotationId);
+    if (!annotation) return;
+    const linkedNotes = notes.filter((note) => note.annotationId === annotationId);
+    if (linkedNotes.length > 0) {
+      const anchor = createNoteAnchorFromAnnotation(annotation);
+      setNoteAnchors((currentAnchors) => [...currentAnchors, anchor]);
+      setNotes((currentNotes) =>
+        currentNotes.map((note) =>
+          note.annotationId === annotationId
+            ? { ...note, annotationId: anchor.id, updatedAt: Date.now() }
+            : note,
+        ),
       );
-    },
-    [],
-  );
+    }
+    setAnnotations((currentAnnotations) =>
+      currentAnnotations.filter((candidate) => candidate.id !== annotationId),
+    );
+  }, [annotations, notes]);
 
-  const addNote = useCallback(
-    (annotationId: string) => {
+  const addNoteFromSelection = useCallback(
+    (selections: PdfTextSelection[]) => {
       if (!isDocumentHydrated) {
         return;
       }
 
-      const annotation = annotations.find((candidate) => candidate.id === annotationId);
-      if (!annotation) {
-        return;
-      }
-
-      const existingNote = notes.find((note) => note.annotationId === annotationId);
+      const existingNote = findMatchingNote(
+        selections,
+        notes,
+        annotations,
+        noteAnchors,
+      );
       if (existingNote) {
         setFocusedNoteId(existingNote.id);
         setIsNotesDrawerOpen(true);
-        viewerRef.current?.navigateToAnnotation(annotationId);
+        viewerRef.current?.navigateToAnnotation(existingNote.annotationId);
         return;
       }
+
+      const anchor = selections.flatMap((selection) => {
+        const nextAnchor = createNoteAnchorFromSelection(selection);
+        return nextAnchor ? [nextAnchor] : [];
+      })[0];
+      if (!anchor) return;
 
       const timestamp = Date.now();
       const note: Note = {
         id: crypto.randomUUID(),
-        annotationId,
-        pageNumber: annotation.pageNumber,
+        annotationId: anchor.id,
+        pageNumber: anchor.pageNumber,
         displayNumber: String(nextNoteNumber),
-        selectedText: annotation.text,
+        selectedText: anchor.text,
         content: '',
         createdAt: timestamp,
         updatedAt: timestamp,
       };
 
+      setNoteAnchors((currentAnchors) => [...currentAnchors, anchor]);
       setNotes((currentNotes) => [note, ...currentNotes]);
       setNextNoteNumber((currentNumber) => currentNumber + 1);
       setFocusedNoteId(note.id);
       setIsNotesDrawerOpen(true);
     },
-    [annotations, isDocumentHydrated, nextNoteNumber, notes],
+    [annotations, isDocumentHydrated, nextNoteNumber, noteAnchors, notes],
   );
 
   const updateNote = useCallback((noteId: string, content: string) => {
@@ -559,8 +563,21 @@ export function AppLayout() {
   }, []);
 
   const deleteNote = useCallback((noteId: string) => {
-    setNotes((currentNotes) => currentNotes.filter((note) => note.id !== noteId));
-  }, []);
+    const note = notes.find((candidate) => candidate.id === noteId);
+    if (!note) return;
+    setNotes((currentNotes) => currentNotes.filter((candidate) => candidate.id !== noteId));
+    if (
+      noteAnchors.some((anchor) => anchor.id === note.annotationId) &&
+      !notes.some(
+        (candidate) =>
+          candidate.id !== noteId && candidate.annotationId === note.annotationId,
+      )
+    ) {
+      setNoteAnchors((currentAnchors) =>
+        currentAnchors.filter((anchor) => anchor.id !== note.annotationId),
+      );
+    }
+  }, [noteAnchors, notes]);
 
   const addGlossaryEntry = useCallback(
     (
@@ -697,6 +714,7 @@ export function AppLayout() {
           documentTitle: documentDisplayTitle ?? file.name ?? '39Note',
           annotations: exportAnnotations,
           notes,
+          noteAnchors,
           pageGeometries,
           options,
           onProgress: setAnnotatedPdfProgress,
@@ -728,6 +746,7 @@ export function AppLayout() {
       isAnnotatedPdfExporting,
       isDocumentHydrated,
       notes,
+      noteAnchors,
       pdfDocument,
     ],
   );
@@ -1203,7 +1222,9 @@ export function AppLayout() {
     const target = openRequest.target;
     const targetAnnotation =
       target?.type === 'annotation'
-        ? annotations.find((candidate) => candidate.id === target.annotationId)
+        ? [...annotations, ...noteAnchors].find(
+            (candidate) => candidate.id === target.annotationId,
+          )
         : undefined;
     const targetNote =
       target?.type === 'annotation' && target.noteId
@@ -1467,6 +1488,7 @@ export function AppLayout() {
     documentIdentity,
     isDocumentHydrated,
     notes,
+    noteAnchors,
     pageCount,
     pendingLibraryNavigation,
     showReadingPositionToast,
@@ -1601,11 +1623,15 @@ export function AppLayout() {
       .filter((note) => note.content.trim().length > 0)
       .map((note) => note.annotationId),
   );
-  const nonEmptyNoteCount = annotations.filter((annotation) =>
-    nonEmptyNotedAnnotationIds.has(annotation.id),
-  ).length;
-  const visibleNonEmptyNoteCount = visibleExportAnnotations.filter((annotation) =>
-    nonEmptyNotedAnnotationIds.has(annotation.id),
+  const nonEmptyNoteCount = nonEmptyNotedAnnotationIds.size;
+  const visibleAnnotationIds = new Set(
+    visibleExportAnnotations.map((annotation) => annotation.id),
+  );
+  const noteAnchorIds = new Set(noteAnchors.map((anchor) => anchor.id));
+  const visibleNonEmptyNoteCount = notes.filter(
+    (note) =>
+      note.content.trim().length > 0 &&
+      (visibleAnnotationIds.has(note.annotationId) || noteAnchorIds.has(note.annotationId)),
   ).length;
 
   return (
@@ -1666,14 +1692,15 @@ export function AppLayout() {
           onDocumentReady={hydrateDocument}
           documentId={documentIdentity?.documentId ?? null}
           annotations={annotations}
+          noteAnchors={noteAnchors}
+          notes={notes}
           glossaryEntries={glossaryEntries}
           onAddGlossaryEntry={addGlossaryEntry}
           onCreateHighlights={createHighlights}
           onCreateUnderlines={createUnderlines}
           onRemoveAnnotation={removeAnnotation}
-          onUpdateAnnotationColor={updateAnnotationColor}
           notedAnnotationIds={notes.map((note) => note.annotationId)}
-          onAddNote={addNote}
+          onAddNote={addNoteFromSelection}
           zoomOperationId={zoomOperationId}
           annotationFilter={annotationFilter}
           onPdfDocumentChange={setPdfDocument}

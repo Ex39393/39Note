@@ -1,5 +1,5 @@
 import type { DictionaryDefinition } from '../../../types/glossary';
-import { fetchJsonWithTimeout } from './request';
+import { fetchNcbiJson } from './ncbiRequestQueue';
 import { parseMeshDefinitions, parseMeshSearchIdentifier } from './meshParser';
 
 export { MESH_PROVIDER_VERSION } from './meshParser';
@@ -18,7 +18,7 @@ export async function lookupMesh(
   searchUrl.searchParams.set('retmax', '3');
   searchUrl.searchParams.set('tool', '39Note');
   const identifier = parseMeshSearchIdentifier(
-    await fetchJsonWithTimeout(searchUrl, signal),
+    await fetchNcbiJson(searchUrl, signal),
   );
   if (!identifier) return [];
 
@@ -30,7 +30,7 @@ export async function lookupMesh(
   summaryUrl.searchParams.set('retmode', 'json');
   summaryUrl.searchParams.set('tool', '39Note');
   return parseMeshDefinitions(
-    await fetchJsonWithTimeout(summaryUrl, signal),
+    await fetchNcbiJson(summaryUrl, signal),
     normalizedWord,
     identifier,
   );

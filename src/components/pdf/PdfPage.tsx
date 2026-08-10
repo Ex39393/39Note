@@ -5,7 +5,6 @@ import {
   useRef,
   useState,
   type CSSProperties,
-  type MouseEvent as ReactMouseEvent,
 } from 'react';
 import {
   TextLayer,
@@ -14,6 +13,7 @@ import {
 } from 'pdfjs-dist';
 import type { ElementSize } from '../../hooks/useElementSize';
 import type { PdfSearchResult } from '../../types/pdfSearch';
+import type { NoteAnchor } from '../../types/noteAnchor';
 import type { DefinitionBubble as DefinitionBubbleModel, GlossaryEntry } from '../../types/glossary';
 import {
   highlightColors,
@@ -50,6 +50,7 @@ interface PdfPageProps {
   fitMode: FitMode;
   zoom: number;
   annotations: PdfAnnotation[];
+  noteAnchors: NoteAnchor[];
   glossaryEntries: GlossaryEntry[];
   definitionBubbles: DefinitionBubbleModel[];
   activeAnnotationId: string | null;
@@ -57,7 +58,6 @@ interface PdfPageProps {
   onCurrentPageChange: (pageNumber: number) => void;
   onScaleChange: (pageNumber: number, scale: number) => void;
   onGoToPage: (pageNumber: number) => void;
-  onAnnotationSelect: (annotationId: string, left: number, top: number) => void;
   onAddBubbleToGlossary: (bubbleId: string) => void;
   onCloseDefinitionBubble: (bubbleId: string) => void;
   onMoveDefinitionUp: (bubbleId: string, definitionId: string) => void;
@@ -76,6 +76,7 @@ export function PdfPage({
   fitMode,
   zoom,
   annotations,
+  noteAnchors,
   glossaryEntries,
   definitionBubbles,
   activeAnnotationId,
@@ -83,7 +84,6 @@ export function PdfPage({
   onCurrentPageChange,
   onScaleChange,
   onGoToPage,
-  onAnnotationSelect,
   onAddBubbleToGlossary,
   onCloseDefinitionBubble,
   onMoveDefinitionUp,
@@ -352,48 +352,6 @@ export function PdfPage({
     onGoToPage(targetPage);
   };
 
-  const handleTextLayerClick = (event: ReactMouseEvent<HTMLDivElement>) => {
-    const selection = window.getSelection();
-
-    if (selection && !selection.isCollapsed) {
-      return;
-    }
-
-    const textLayer = textLayerRef.current;
-    if (!textLayer || textLayer.clientWidth === 0 || textLayer.clientHeight === 0) {
-      return;
-    }
-
-    const layerRectangle = textLayer.getBoundingClientRect();
-    const x = (event.clientX - layerRectangle.left) / textLayer.clientWidth;
-    const y = (event.clientY - layerRectangle.top) / textLayer.clientHeight;
-    const annotation = annotations.find((candidate) =>
-      candidate.rects.some((rectangle) => {
-        if (candidate.type === 'underline') {
-          const underline = getUnderlineMetrics(rectangle, textLayer.clientHeight);
-          const hitPadding = Math.min(4, Math.max(2, underline.thickness * 1.25));
-          return (
-            x >= rectangle.x &&
-            x <= rectangle.x + rectangle.width &&
-            event.clientY >= layerRectangle.top + underline.y - hitPadding &&
-            event.clientY <= layerRectangle.top + underline.y + underline.thickness + hitPadding
-          );
-        }
-
-        return (
-          x >= rectangle.x &&
-          x <= rectangle.x + rectangle.width &&
-          y >= rectangle.y &&
-          y <= rectangle.y + rectangle.height
-        );
-      }),
-    );
-
-    if (annotation) {
-      onAnnotationSelect(annotation.id, event.clientX, event.clientY - 40);
-    }
-  };
-
   const shellStyle = dimensions
     ? ({
         width: dimensions.width,
@@ -403,7 +361,9 @@ export function PdfPage({
     : undefined;
   const highlights = annotations.filter((annotation) => annotation.type === 'highlight');
   const underlines = annotations.filter((annotation) => annotation.type === 'underline');
-  const activeAnnotation = annotations.find((annotation) => annotation.id === activeAnnotationId);
+  const activeAnnotation = [...annotations, ...noteAnchors].find(
+    (annotation) => annotation.id === activeAnnotationId,
+  );
 
   return (
     <article
@@ -506,7 +466,6 @@ export function PdfPage({
           className="textLayer"
           data-pdf-text-layer
           data-page-number={pageNumber}
-          onClick={handleTextLayerClick}
         />
         {links.map((link) => (
           <a

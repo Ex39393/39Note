@@ -20,6 +20,8 @@ import type {
 import type { DocumentIdentity } from '../types/persistence';
 import type { ReadingPosition } from '../types/library';
 import type { PdfTextSelection } from '../types/textSelection';
+import type { Note } from '../types/note';
+import type { NoteAnchor } from '../types/noteAnchor';
 import type {
   DefinitionBubble,
   DictionaryDefinition,
@@ -39,6 +41,10 @@ import {
   moveDefinitionUp,
 } from '../utils/dictionary';
 import { normalizeSelectionRectangles } from '../utils/highlights';
+import {
+  findMatchingNote,
+  findOverlappingAnnotations,
+} from '../utils/annotationOverlap';
 import { markDefinitionBubbleAdded } from '../utils/glossary';
 
 GlobalWorkerOptions.workerSrc = pdfWorker;
@@ -57,6 +63,8 @@ interface ViewerProps {
   documentId: string | null;
   onTextSelectionChange?: (selection: PdfTextSelection[]) => void;
   annotations: PdfAnnotation[];
+  noteAnchors: NoteAnchor[];
+  notes: Note[];
   glossaryEntries: GlossaryEntry[];
   onAddGlossaryEntry: (
     bubble: DefinitionBubble,
@@ -65,9 +73,8 @@ interface ViewerProps {
   onCreateHighlights: (selections: PdfTextSelection[], color: HighlightColor) => void;
   onCreateUnderlines: (selections: PdfTextSelection[], color: UnderlineColor) => void;
   onRemoveAnnotation: (annotationId: string) => void;
-  onUpdateAnnotationColor: (annotationId: string, color: HighlightColor | UnderlineColor) => void;
   notedAnnotationIds: string[];
-  onAddNote: (annotationId: string) => void;
+  onAddNote: (selections: PdfTextSelection[]) => void;
   zoomOperationId: number;
   onSearchStateChange?: (state: PdfSearchToolbarState) => void;
   annotationFilter: AnnotationFilterState;
@@ -124,12 +131,13 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(function Viewer({
   documentId,
   onTextSelectionChange,
   annotations,
+  noteAnchors,
+  notes,
   glossaryEntries,
   onAddGlossaryEntry,
   onCreateHighlights,
   onCreateUnderlines,
   onRemoveAnnotation,
-  onUpdateAnnotationColor,
   notedAnnotationIds,
   onAddNote,
   zoomOperationId,
@@ -166,12 +174,7 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(function Viewer({
     left: number;
     top: number;
   } | null>(null);
-  const [selectedHighlight, setSelectedHighlight] = useState<{
-    id: string;
-    left: number;
-    top: number;
-  } | null>(null);
-  const [annotationType, setAnnotationType] = useState<AnnotationType>('highlight');
+  const [annotationType, setAnnotationType] = useState<AnnotationType | null>(null);
   const [highlightColor, setHighlightColor] = useState<HighlightColor>('yellow');
   const [underlineColor, setUnderlineColor] = useState<UnderlineColor>('blue');
   const [activeAnnotationId, setActiveAnnotationId] = useState<string | null>(null);
@@ -238,7 +241,9 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(function Viewer({
   }, []);
 
   const applyAnnotationNavigation = useCallback((annotationId: string) => {
-    const annotation = annotations.find((candidate) => candidate.id === annotationId);
+    const annotation = [...annotations, ...noteAnchors].find(
+      (candidate) => candidate.id === annotationId,
+    );
     if (!annotation) {
       return false;
     }
@@ -275,7 +280,7 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(function Viewer({
     pendingAnnotationNavigationRef.current = null;
     onAnnotationNavigationApplied?.(annotationId);
     return true;
-  }, [annotations, onAnnotationNavigationApplied, onExplicitNavigation]);
+  }, [annotations, noteAnchors, onAnnotationNavigationApplied, onExplicitNavigation]);
 
   const navigateToAnnotation = useCallback((annotationId: string) => {
     pendingAnnotationNavigationRef.current = annotationId;
@@ -688,7 +693,7 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(function Viewer({
       textSelectionRef.current = selection;
       onTextSelectionChange?.(selection);
       setSelectionActionPosition(getSelectionActionPosition(selection));
-      setSelectedHighlight(null);
+      setAnnotationType(null);
     },
     [onTextSelectionChange],
   );
@@ -741,11 +746,13 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(function Viewer({
       applyPendingReadingPosition();
     }
     const annotationId = pendingAnnotationNavigationRef.current;
-    const annotation = annotations.find((candidate) => candidate.id === annotationId);
+    const annotation = [...annotations, ...noteAnchors].find(
+      (candidate) => candidate.id === annotationId,
+    );
     if (annotation?.pageNumber === pageNumber) {
       applyAnnotationNavigation(annotation.id);
     }
-  }, [annotations, applyAnnotationNavigation, applyPendingReadingPosition, restoreZoomAnchor]);
+  }, [annotations, noteAnchors, applyAnnotationNavigation, applyPendingReadingPosition, restoreZoomAnchor]);
 
   useEffect(
     () => () => {
@@ -770,10 +777,9 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(function Viewer({
         return;
       }
 
-      if (selectionActionPosition || selectedHighlight) {
+      if (selectionActionPosition) {
         window.getSelection()?.removeAllRanges();
         setSelectionActionPosition(null);
-        setSelectedHighlight(null);
       } else if (search.isOpen) {
         search.close();
       }
@@ -781,7 +787,7 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(function Viewer({
 
     window.addEventListener('keydown', dismissActions);
     return () => window.removeEventListener('keydown', dismissActions);
-  }, [document, search, selectedHighlight, selectionActionPosition]);
+  }, [document, search, selectionActionPosition]);
 
   useEffect(() => {
     if (!file) {
@@ -915,8 +921,10 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(function Viewer({
   const createAnnotation = () => {
     if (annotationType === 'highlight') {
       onCreateHighlights(textSelectionRef.current, highlightColor);
-    } else {
+    } else if (annotationType === 'underline') {
       onCreateUnderlines(textSelectionRef.current, underlineColor);
+    } else {
+      return;
     }
     window.getSelection()?.removeAllRanges();
     setSelectionActionPosition(null);
@@ -928,11 +936,6 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(function Viewer({
     lookupWord(selection);
     window.getSelection()?.removeAllRanges();
     setSelectionActionPosition(null);
-  };
-
-  const selectHighlight = (highlightId: string, left: number, top: number) => {
-    setSelectionActionPosition(null);
-    setSelectedHighlight({ id: highlightId, left, top });
   };
 
   if (!file) {
@@ -1001,6 +1004,9 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(function Viewer({
                   document={document}
                   fitMode={fitMode}
                   annotations={annotationsForPage(index + 1)}
+                  noteAnchors={noteAnchors.filter(
+                    (anchor) => anchor.pageNumber === index + 1,
+                  )}
                   glossaryEntries={glossaryEntries.filter(
                     (entry) => entry.pageNumber === index + 1,
                   )}
@@ -1017,7 +1023,6 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(function Viewer({
                     }
                   }}
                   onGoToPage={goToPage}
-                  onAnnotationSelect={selectHighlight}
                   onAddBubbleToGlossary={addBubbleToGlossary}
                   onCloseDefinitionBubble={closeDefinitionBubble}
                   onMoveDefinitionUp={moveBubbleDefinitionUp}
@@ -1042,7 +1047,30 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(function Viewer({
           position={selectionActionPosition}
           annotationType={annotationType}
           onAnnotationTypeChange={setAnnotationType}
-          onActivate={createAnnotation}
+          onApply={createAnnotation}
+          noteLabel={
+            findMatchingNote(
+              textSelectionRef.current,
+              notes,
+              annotations,
+              noteAnchors,
+            )
+              ? 'Open Note'
+              : 'Add Note'
+          }
+          onNote={() => {
+            onAddNote(textSelectionRef.current);
+            window.getSelection()?.removeAllRanges();
+            setSelectionActionPosition(null);
+          }}
+          deleteActions={createSelectionDeleteActions(
+            findOverlappingAnnotations(textSelectionRef.current, annotations),
+            (annotationId) => {
+              onRemoveAnnotation(annotationId);
+              window.getSelection()?.removeAllRanges();
+              setSelectionActionPosition(null);
+            },
+          )}
           onLookupWord={
             getDictionaryLookupSelection(textSelectionRef.current)
               ? activateDictionaryLookup
@@ -1075,30 +1103,6 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(function Viewer({
           onNext={search.goToNextResult}
           onPrevious={search.goToPreviousResult}
           onQueryChange={search.setQuery}
-        />
-      ) : null}
-      {selectedHighlight ? (
-        <SelectionAction
-          position={selectedHighlight}
-          annotationType={annotations.find((annotation) => annotation.id === selectedHighlight.id)?.type}
-          selectedColor={annotations.find((annotation) => annotation.id === selectedHighlight.id)?.color}
-          onColorChange={(color) => onUpdateAnnotationColor(selectedHighlight.id, color)}
-          actions={[
-            {
-              label: 'Delete',
-              onActivate: () => {
-                onRemoveAnnotation(selectedHighlight.id);
-                setSelectedHighlight(null);
-              },
-            },
-            {
-              label: notedAnnotationIds.includes(selectedHighlight.id) ? 'Open/Edit Note' : 'Add Note',
-              onActivate: () => {
-                onAddNote(selectedHighlight.id);
-                setSelectedHighlight(null);
-              },
-            },
-          ]}
         />
       ) : null}
     </section>
@@ -1135,9 +1139,37 @@ function getSelectionActionPosition(
   }
 
   return {
-    left: Math.min(Math.max(anchor.left, 8), window.innerWidth - 110),
+    left: Math.min(Math.max(anchor.left, 8), Math.max(8, window.innerWidth - 390)),
     top: Math.max(anchor.top - 42, 8),
   };
+}
+
+function createSelectionDeleteActions(
+  annotations: PdfAnnotation[],
+  onDelete: (annotationId: string) => void,
+) {
+  const counts = new Map<AnnotationType, number>();
+  for (const annotation of annotations) {
+    counts.set(annotation.type, (counts.get(annotation.type) ?? 0) + 1);
+  }
+  const indexes = new Map<AnnotationType, number>();
+  return annotations.map((annotation) => {
+    const index = (indexes.get(annotation.type) ?? 0) + 1;
+    indexes.set(annotation.type, index);
+    const typeLabel = annotation.type === 'highlight' ? 'Highlight' : 'Underline';
+    const suffix = (counts.get(annotation.type) ?? 0) > 1 ? ` ${index}` : '';
+    return {
+      id: annotation.id,
+      label: `Delete ${typeLabel}${suffix}`,
+      detail: `${annotation.color} · ${truncateSelectionText(annotation.text)}`,
+      onActivate: () => onDelete(annotation.id),
+    };
+  });
+}
+
+function truncateSelectionText(text: string): string {
+  const normalized = text.replaceAll(/\s+/g, ' ').trim();
+  return normalized.length > 42 ? `${normalized.slice(0, 39)}…` : normalized;
 }
 
 function createDefinitionBubbleId(

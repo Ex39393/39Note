@@ -1,3 +1,4 @@
+import { useState } from 'react';
 import {
   highlightColors,
   underlineColors,
@@ -13,28 +14,40 @@ interface FloatingActionPosition {
 
 type AnnotationColor = HighlightColor | UnderlineColor;
 
+export interface SelectionDeleteAction {
+  id: string;
+  label: string;
+  detail: string;
+  onActivate: () => void;
+}
+
 interface SelectionActionProps {
   position: FloatingActionPosition;
-  annotationType?: AnnotationType;
-  onAnnotationTypeChange?: (type: AnnotationType) => void;
-  selectedColor?: AnnotationColor;
-  onColorChange?: (color: AnnotationColor) => void;
-  onActivate?: () => void;
+  annotationType: AnnotationType | null;
+  onAnnotationTypeChange: (type: AnnotationType) => void;
+  selectedColor: AnnotationColor;
+  onColorChange: (color: AnnotationColor) => void;
+  onApply: () => void;
+  noteLabel: 'Add Note' | 'Open Note';
+  onNote: () => void;
+  deleteActions: SelectionDeleteAction[];
   onLookupWord?: () => void;
-  actions?: Array<{ label: string; onActivate: () => void }>;
 }
 
 export function SelectionAction({
   position,
-  annotationType = 'highlight',
+  annotationType,
   onAnnotationTypeChange,
   selectedColor,
   onColorChange,
-  onActivate,
+  onApply,
+  noteLabel,
+  onNote,
+  deleteActions,
   onLookupWord,
-  actions,
 }: SelectionActionProps) {
-  const colors = annotationType === 'highlight' ? highlightColors : underlineColors;
+  const [isDeleteExpanded, setIsDeleteExpanded] = useState(false);
+  const colors = annotationType === 'underline' ? underlineColors : highlightColors;
 
   return (
     <div
@@ -42,26 +55,67 @@ export function SelectionAction({
       role="toolbar"
       style={{ left: position.left, top: position.top }}
     >
-      {onAnnotationTypeChange ? (
-        <div className="annotation-type-actions" aria-label="Annotation type">
-          {(['highlight', 'underline'] as const).map((type) => (
-            <button
-              aria-pressed={annotationType === type}
-              className={annotationType === type ? 'is-selected' : ''}
-              key={type}
-              type="button"
-              onMouseDown={(event) => event.preventDefault()}
-              onClick={() => onAnnotationTypeChange(type)}
-            >
-              {type === 'highlight' ? 'Highlight' : 'Underline'}
-            </button>
-          ))}
-        </div>
-      ) : null}
-      {selectedColor && onColorChange ? (
-        <>
-          {actions && !onAnnotationTypeChange ? <span className="annotation-colour-label">Change colour</span> : null}
-          <div className="highlight-colors" aria-label={`${annotationType} colour`} role="radiogroup">
+      <div className="selection-primary-actions">
+        {(['highlight', 'underline'] as const).map((type) => (
+          <button
+            aria-pressed={annotationType === type}
+            className={annotationType === type ? 'is-selected' : ''}
+            key={type}
+            type="button"
+            onMouseDown={(event) => event.preventDefault()}
+            onClick={() => {
+              setIsDeleteExpanded(false);
+              onAnnotationTypeChange(type);
+            }}
+          >
+            {type === 'highlight' ? 'Highlight' : 'Underline'}
+          </button>
+        ))}
+        <button
+          type="button"
+          onMouseDown={(event) => event.preventDefault()}
+          onClick={onNote}
+        >
+          {noteLabel}
+        </button>
+        {deleteActions.length > 0 ? (
+          <button
+            type="button"
+            aria-expanded={deleteActions.length > 1 ? isDeleteExpanded : undefined}
+            onMouseDown={(event) => event.preventDefault()}
+            onClick={() => {
+              if (deleteActions.length === 1) deleteActions[0].onActivate();
+              else {
+                setIsDeleteExpanded((expanded) => !expanded);
+              }
+            }}
+          >
+            Delete
+          </button>
+        ) : null}
+        {onLookupWord ? (
+          <button
+            className="dictionary-lookup-button"
+            aria-label="Look up word"
+            title="Look up word"
+            type="button"
+            onMouseDown={(event) => event.preventDefault()}
+            onClick={onLookupWord}
+          >
+            <svg aria-hidden="true" viewBox="0 0 24 24">
+              <circle cx="10.5" cy="10.5" r="6.5" />
+              <path d="m15.3 15.3 5 5" />
+            </svg>
+          </button>
+        ) : null}
+      </div>
+      {annotationType ? (
+        <div className="selection-secondary-actions">
+          <div
+            className="highlight-colors"
+            aria-label={`${annotationType} colour`}
+            role="radiogroup"
+          >
             {Object.entries(colors).map(([color, option]) => (
               <button
                 aria-checked={selectedColor === color}
@@ -76,41 +130,31 @@ export function SelectionAction({
               />
             ))}
           </div>
-        </>
-      ) : null}
-      {actions ? (
-        actions.map((action) => (
           <button
-            key={action.label}
             type="button"
             onMouseDown={(event) => event.preventDefault()}
-            onClick={action.onActivate}
+            onClick={onApply}
           >
-            {action.label}
-          </button>
-        ))
-      ) : (
-        <>
-          <button type="button" onMouseDown={(event) => event.preventDefault()} onClick={onActivate}>
             Apply
           </button>
-          {onLookupWord ? (
+        </div>
+      ) : null}
+      {deleteActions.length > 1 && isDeleteExpanded ? (
+        <div className="selection-delete-actions" aria-label="Choose annotation to delete">
+          {deleteActions.map((action) => (
             <button
-              className="dictionary-lookup-button"
-              aria-label="Look up word"
-              title="Look up word"
+              key={action.id}
               type="button"
+              title={action.detail}
               onMouseDown={(event) => event.preventDefault()}
-              onClick={onLookupWord}
+              onClick={action.onActivate}
             >
-              <svg aria-hidden="true" viewBox="0 0 24 24">
-                <circle cx="10.5" cy="10.5" r="6.5" />
-                <path d="m15.3 15.3 5 5" />
-              </svg>
+              {action.label}
+              <span>{action.detail}</span>
             </button>
-          ) : null}
-        </>
-      )}
+          ))}
+        </div>
+      ) : null}
     </div>
   );
 }

@@ -34,6 +34,10 @@ structured definition endpoint provided by English Wiktionary:
 The provider is isolated behind a replaceable adapter because Wikimedia documents the
 structured definition endpoint as experimental. Returned markup is converted to plain
 text and rendered as untrusted React text; it is never inserted as HTML.
+Browser requests identify this client with the provider-specific
+`Api-User-Agent: 39Note/0.1.0 (https://github.com/Ex39393/39Note)` header, as
+recommended by Wikimedia for browser JavaScript. This header is not sent to other
+providers.
 
 ## NLM MeSH enrichment
 
@@ -47,14 +51,22 @@ MeSH heading or entry term and the record has a non-empty Scope Note.
 - Terms: https://www.nlm.nih.gov/databases/download/terms_and_conditions_mesh.html
 - Acknowledgement: Courtesy of the U.S. National Library of Medicine
 
-NLM does not endorse 39Note. MeSH is supplemental specialist terminology and is not
-used as a general-purpose replacement for WordNet or Wiktionary.
+NLM does not endorse 39Note. MeSH is a specialist fallback, not a parallel general
+provider: it is requested only after WordNet and Wiktionary have both completed and
+their combined usable definition count is zero. NCBI E-utilities requests share one
+application-wide serialized queue with at least 350 ms between request starts. HTTP
+429 and transient failures receive at most three attempts with bounded exponential
+backoff. Closing a bubble or changing documents cancels its queued work.
+
+Every NCBI request retains `tool=39Note`. No `email` parameter is included because the
+project does not publish an application contact address suitable for disclosure by a
+client-side request; 39Note does not invent or expose a private address.
 
 ## Privacy and caching
 
-Online requests contain only the normalized single selected word. 39Note never sends
-the surrounding PDF passage, PDF title or filename, document ID, annotations, Notes,
-Glossary contents, or user identity to a dictionary provider.
+39Note sends only the selected word as dictionary query content. No PDF text,
+filenames, Notes, annotations, Glossary contents, or document identifiers are sent.
+Normal network metadata may still be visible to the dictionary provider.
 
 Successful remote definitions are cached in the separate
 `39note-dictionary-cache` IndexedDB database. Wiktionary entries expire after 30 days;

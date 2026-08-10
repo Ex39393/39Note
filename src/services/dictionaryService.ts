@@ -59,7 +59,7 @@ export async function lookupDictionary(
   await runProgressiveDictionaryLookup({
     fallbackNormalizedWord: normalizedWord,
     localLookup: () => lookupLocalDictionary(word),
-    remoteLookups: canUseRemoteProviders
+    generalLookups: canUseRemoteProviders
       ? [
           () =>
             lookupCachedRemoteProvider(
@@ -69,16 +69,18 @@ export async function lookupDictionary(
               lookupWiktionary,
               signal,
             ),
-          () =>
-            lookupCachedRemoteProvider(
-              'mesh',
-              normalizedWord,
-              MESH_PROVIDER_VERSION,
-              lookupMesh,
-              signal,
-            ),
         ]
       : [],
+    specialistLookup: canUseRemoteProviders
+      ? () =>
+          lookupCachedRemoteProvider(
+            'mesh',
+            normalizedWord,
+            MESH_PROVIDER_VERSION,
+            lookupMesh,
+            signal,
+          )
+      : undefined,
     callbacks,
     signal,
   });

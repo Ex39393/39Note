@@ -1,5 +1,6 @@
 import type { NormalizedHighlightRectangle, PdfAnnotation } from '../types/highlight';
 import type { Note } from '../types/note';
+import type { NoteAnchor } from '../types/noteAnchor';
 import type {
   AnnotationExportReference,
   AppendixLayoutItem,
@@ -204,18 +205,22 @@ export function sortAnnotationsForExport(
 export function buildAnnotationExportReferences(
   annotations: PdfAnnotation[],
   notes: Note[],
+  noteAnchors: NoteAnchor[] = [],
 ): AnnotationExportReference[] {
-  const notesByAnnotation = new Map(
-    notes
-      .filter((note) => note.content.trim().length > 0)
-      .map((note) => [note.annotationId, note]),
-  );
-
-  return sortAnnotationsForExport(annotations)
-    .flatMap((annotation) => {
-      const note = notesByAnnotation.get(annotation.id);
-      return note ? [{ annotation, note }] : [];
+  const sources = [...annotations, ...noteAnchors];
+  const sourceById = new Map(sources.map((source) => [source.id, source]));
+  return notes
+    .filter((note) => note.content.trim().length > 0)
+    .flatMap((note) => {
+      const annotation = sourceById.get(note.annotationId);
+      return annotation ? [{ annotation, note }] : [];
     })
+    .sort((first, second) =>
+      first.annotation.pageNumber - second.annotation.pageNumber ||
+      getAnnotationPosition(first.annotation).y - getAnnotationPosition(second.annotation).y ||
+      getAnnotationPosition(first.annotation).x - getAnnotationPosition(second.annotation).x ||
+      first.annotation.id.localeCompare(second.annotation.id),
+    )
     .map((reference, index) => ({
       ...reference,
       referenceNumber: index + 1,
@@ -333,7 +338,9 @@ export function paginateAppendixItems<T extends AppendixLayoutItem>(
   return pages;
 }
 
-function getAnnotationPosition(annotation: PdfAnnotation): { x: number; y: number } {
+function getAnnotationPosition(
+  annotation: Pick<PdfAnnotation, 'rects'> | Pick<NoteAnchor, 'rects'>,
+): { x: number; y: number } {
   return annotation.rects.reduce(
     (position, rectangle) => ({
       x: Math.min(position.x, rectangle.x),

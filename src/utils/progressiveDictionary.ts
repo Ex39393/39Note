@@ -9,7 +9,8 @@ export interface ProgressiveDictionaryCallbacks {
 export interface ProgressiveDictionaryOptions {
   fallbackNormalizedWord: string;
   localLookup: () => Promise<DictionaryLookupResult>;
-  remoteLookups: Array<() => Promise<DictionaryDefinition[]>>;
+  generalLookups: Array<() => Promise<DictionaryDefinition[]>>;
+  specialistLookup?: () => Promise<DictionaryDefinition[]>;
   callbacks: ProgressiveDictionaryCallbacks;
   signal: AbortSignal;
 }
@@ -17,7 +18,8 @@ export interface ProgressiveDictionaryOptions {
 export async function runProgressiveDictionaryLookup({
   fallbackNormalizedWord,
   localLookup,
-  remoteLookups,
+  generalLookups,
+  specialistLookup,
   callbacks,
   signal,
 }: ProgressiveDictionaryOptions): Promise<void> {
@@ -30,18 +32,45 @@ export async function runProgressiveDictionaryLookup({
   if (signal.aborted) return;
   callbacks.onLocalResult(localResult);
 
-  const requests = remoteLookups.map(async (lookup) => {
-    try {
-      const definitions = await lookup();
-      if (!signal.aborted && definitions.length > 0) {
-        callbacks.onRemoteResult(definitions);
-      }
-    } catch (error) {
-      if (isAbortError(error)) throw error;
+  let combinedDefinitions = [...localResult.definitions];
+  for (const lookup of generalLookups) {
+    const definitions = await runProviderLookup(lookup, signal);
+    if (signal.aborted) return;
+    if (definitions.length > 0) {
+      callbacks.onRemoteResult(definitions);
+      combinedDefinitions = [...combinedDefinitions, ...definitions];
     }
-  });
-  await Promise.allSettled(requests);
+  }
+
+  if (
+    specialistLookup &&
+    shouldQuerySpecialistDictionary(combinedDefinitions)
+  ) {
+    const definitions = await runProviderLookup(specialistLookup, signal);
+    if (signal.aborted) return;
+    if (definitions.length > 0) callbacks.onRemoteResult(definitions);
+  }
+
   if (!signal.aborted) callbacks.onComplete();
+}
+
+/** Conservative fallback: specialist traffic is allowed only after no usable general sense remains. */
+export function shouldQuerySpecialistDictionary(
+  definitions: readonly DictionaryDefinition[],
+): boolean {
+  return definitions.filter((definition) => definition.text.trim().length > 0).length === 0;
+}
+
+async function runProviderLookup(
+  lookup: () => Promise<DictionaryDefinition[]>,
+  signal: AbortSignal,
+): Promise<DictionaryDefinition[]> {
+  try {
+    return await lookup();
+  } catch (error) {
+    if (isAbortError(error) || signal.aborted) return [];
+    return [];
+  }
 }
 
 function isAbortError(error: unknown): boolean {

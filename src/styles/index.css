@@ -2600,15 +2600,55 @@ button:focus-visible {
 .selection-action {
   position: fixed;
   z-index: 10;
-  display: flex;
-  align-items: center;
+  display: grid;
   gap: 4px;
+  max-width: calc(100vw - 16px);
   padding: 4px;
   border: 1px solid var(--theme-border);
   border-radius: 7px;
   background: var(--theme-toolbar);
   box-shadow: 0 6px 16px
     color-mix(in srgb, var(--theme-text) 18%, var(--theme-background));
+}
+
+.selection-primary-actions,
+.selection-secondary-actions {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+}
+
+.selection-primary-actions {
+  flex-wrap: wrap;
+}
+
+.selection-secondary-actions {
+  padding-top: 4px;
+  border-top: 1px solid color-mix(in srgb, var(--theme-border) 70%, transparent);
+}
+
+.selection-delete-actions {
+  display: grid;
+  gap: 3px;
+  padding-top: 4px;
+  border-top: 1px solid color-mix(in srgb, var(--theme-border) 70%, transparent);
+}
+
+.selection-delete-actions button {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  max-width: 300px;
+  text-align: left;
+}
+
+.selection-delete-actions span {
+  overflow: hidden;
+  opacity: 0.72;
+  font-size: 0.68rem;
+  font-weight: 400;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .pdf-search-bar {
@@ -2877,18 +2917,7 @@ button:focus-visible {
   gap: 4px;
 }
 
-.annotation-type-actions {
-  display: flex;
-  gap: 2px;
-}
-
-.annotation-colour-label {
-  color: var(--theme-heading);
-  font-size: 0.68rem;
-  white-space: nowrap;
-}
-
-.selection-action .annotation-type-actions button.is-selected {
+.selection-action .selection-primary-actions button.is-selected {
   background: color-mix(in srgb, var(--theme-surface) 18%, var(--theme-toolbar));
 }
 

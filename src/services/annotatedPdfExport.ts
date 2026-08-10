@@ -118,10 +118,14 @@ export async function createAnnotatedPdf(
   const annotations = sortAnnotationsForExport(request.annotations);
   const references =
     request.options.contentMode === 'annotations-and-notes'
-      ? buildAnnotationExportReferences(annotations, request.notes)
+      ? buildAnnotationExportReferences(annotations, request.notes, request.noteAnchors)
       : [];
   const referenceByAnnotationId = new Map(
-    references.map((reference) => [reference.annotation.id, reference]),
+    references.flatMap((reference) =>
+      reference.annotation.type === 'note-anchor'
+        ? []
+        : [[reference.annotation.id, reference] as const],
+    ),
   );
   const appendixFont =
     references.length > 0 ? await pdfDocument.embedFont(StandardFonts.Helvetica) : null;
@@ -409,7 +413,11 @@ function createAppendixItems(
 ): AppendixLayoutItem[] {
   return references.flatMap((reference) => {
     const typeLabel =
-      reference.annotation.type === 'highlight' ? 'Highlight' : 'Underline';
+      reference.annotation.type === 'note-anchor'
+        ? 'Direct Note'
+        : reference.annotation.type === 'highlight'
+          ? 'Highlight'
+          : 'Underline';
     const heading = `[${reference.referenceNumber}] Page ${reference.annotation.pageNumber} - ${typeLabel}`;
     const items: AppendixLayoutItem[] = [
       {

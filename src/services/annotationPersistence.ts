@@ -7,6 +7,7 @@ import {
   type UnderlineColor,
 } from '../types/highlight';
 import type { Note } from '../types/note';
+import type { NoteAnchor } from '../types/noteAnchor';
 import type { GlossaryEntry } from '../types/glossary';
 import type { DocumentIdentity } from '../types/persistence';
 import type {
@@ -24,18 +25,20 @@ const DOCUMENT_STATE_STORE = 'document-states';
 const PDF_FILE_STORE = 'pdf-files';
 const COLLECTION_STORE = 'collections';
 const TAG_STORE = 'tags';
-export const PERSISTENCE_SCHEMA_VERSION = 6;
+export const PERSISTENCE_SCHEMA_VERSION = 7;
 const LEGACY_SCHEMA_VERSION = 1;
 const PREVIOUS_SCHEMA_VERSION = 2;
 const HIGHLIGHT_NOTE_SCHEMA_VERSION = 3;
 const DOCUMENT_METADATA_SCHEMA_VERSION = 4;
 const PREVIOUS_PERSISTENCE_SCHEMA_VERSION = 5;
+const NOTE_ANCHOR_PREVIOUS_SCHEMA_VERSION = 6;
 
 export interface PersistedDocumentState extends DocumentIdentity, DocumentLibraryMetadata {
   schemaVersion: typeof PERSISTENCE_SCHEMA_VERSION;
   originalFileName: string;
   displayTitle: string;
   annotations: PdfAnnotation[];
+  noteAnchors: NoteAnchor[];
   notes: Note[];
   glossaryEntries: GlossaryEntry[];
   nextNoteNumber: number;
@@ -326,6 +329,7 @@ export function validateBackupDocumentState(value: unknown): PersistedDocumentSt
 
   if (
     !Array.isArray(value.annotations) ||
+    (value.noteAnchors !== undefined && !Array.isArray(value.noteAnchors)) ||
     !Array.isArray(value.notes) ||
     (value.glossaryEntries !== undefined && !Array.isArray(value.glossaryEntries)) ||
     value.annotations.some((annotation) => (
@@ -340,6 +344,7 @@ export function validateBackupDocumentState(value: unknown): PersistedDocumentSt
   if (
     !state ||
     state.annotations.length !== value.annotations.length ||
+    state.noteAnchors.length !== (Array.isArray(value.noteAnchors) ? value.noteAnchors.length : 0) ||
     state.notes.length !== value.notes.length ||
     state.glossaryEntries.length !== (Array.isArray(value.glossaryEntries) ? value.glossaryEntries.length : 0) ||
     !isSafeBackupFilename(state.originalFileName)
@@ -610,6 +615,7 @@ async function deleteNamedRecord(
 export async function saveDocumentState(
   identity: DocumentIdentity,
   annotations: PdfAnnotation[],
+  noteAnchors: NoteAnchor[],
   notes: Note[],
   glossaryEntries: GlossaryEntry[],
   nextNoteNumber: number,
@@ -626,7 +632,8 @@ export async function saveDocumentState(
     }
 
     const sanitizedAnnotations = sanitizeAnnotations(annotations);
-    const sanitizedNotes = sanitizeNotes(notes, sanitizedAnnotations);
+    const sanitizedNoteAnchors = sanitizeNoteAnchors(noteAnchors);
+    const sanitizedNotes = sanitizeNotes(notes, sanitizedAnnotations, sanitizedNoteAnchors);
     const sanitizedGlossaryEntries = sanitizePersistedGlossaryEntries(
       glossaryEntries,
       identity.documentId,
@@ -643,6 +650,7 @@ export async function saveDocumentState(
       originalFileName: identity.documentName,
       displayTitle: normalizeDisplayTitle(displayTitle, identity.documentName),
       annotations: sanitizedAnnotations,
+      noteAnchors: sanitizedNoteAnchors,
       notes: sanitizedNotes,
       glossaryEntries: sanitizedGlossaryEntries,
       nextNoteNumber: normalizeNextNoteNumber(nextNoteNumber, sanitizedNotes),
@@ -692,6 +700,7 @@ function createEmptyDocumentState(identity: DocumentIdentity): PersistedDocument
     originalFileName: identity.documentName,
     displayTitle: identity.documentName,
     annotations: [],
+    noteAnchors: [],
     notes: [],
     glossaryEntries: [],
     nextNoteNumber: 1,
@@ -735,6 +744,7 @@ function sanitizeDocumentState(
   if (
     !isRecord(value) ||
     (value.schemaVersion !== PERSISTENCE_SCHEMA_VERSION &&
+      value.schemaVersion !== NOTE_ANCHOR_PREVIOUS_SCHEMA_VERSION &&
       value.schemaVersion !== HIGHLIGHT_NOTE_SCHEMA_VERSION &&
       value.schemaVersion !== DOCUMENT_METADATA_SCHEMA_VERSION &&
       value.schemaVersion !== PREVIOUS_PERSISTENCE_SCHEMA_VERSION &&
@@ -753,7 +763,8 @@ function sanitizeDocumentState(
   }
 
   const annotations = sanitizeAnnotations(value.annotations ?? value.highlights);
-  const notes = sanitizeNotes(value.notes, annotations);
+  const noteAnchors = sanitizeNoteAnchors(value.noteAnchors);
+  const notes = sanitizeNotes(value.notes, annotations, noteAnchors);
   const glossaryEntries = sanitizePersistedGlossaryEntries(value.glossaryEntries, expectedDocumentId);
   const originalFileName = isNonEmptyString(value.originalFileName)
     ? value.originalFileName
@@ -766,6 +777,7 @@ function sanitizeDocumentState(
     originalFileName,
     displayTitle: normalizeDisplayTitle(value.displayTitle, originalFileName),
     annotations,
+    noteAnchors,
     notes,
     glossaryEntries,
     nextNoteNumber: normalizeNextNoteNumber(value.nextNoteNumber, notes),
@@ -889,12 +901,54 @@ function sanitizeAnnotations(value: unknown): PdfAnnotation[] {
   });
 }
 
-function sanitizeNotes(value: unknown, annotations: PdfAnnotation[]): Note[] {
+function sanitizeNoteAnchors(value: unknown): NoteAnchor[] {
+  if (!Array.isArray(value)) return [];
+  const seenIds = new Set<string>();
+  return value.flatMap((candidate) => {
+    if (
+      !isRecord(candidate) ||
+      candidate.type !== 'note-anchor' ||
+      !isNonEmptyString(candidate.id) ||
+      seenIds.has(candidate.id) ||
+      !isPositiveInteger(candidate.pageNumber) ||
+      typeof candidate.text !== 'string' ||
+      !isPositiveIntegerOrZero(candidate.startOffset) ||
+      !isPositiveIntegerOrZero(candidate.endOffset) ||
+      candidate.endOffset < candidate.startOffset ||
+      !isTimestamp(candidate.createdAt) ||
+      !isTimestamp(candidate.updatedAt)
+    ) {
+      return [];
+    }
+    const rects = sanitizeRectangles(candidate.rects);
+    if (rects.length === 0) return [];
+    seenIds.add(candidate.id);
+    return [{
+      id: candidate.id,
+      type: 'note-anchor' as const,
+      pageNumber: candidate.pageNumber,
+      text: candidate.text,
+      rects,
+      startOffset: candidate.startOffset,
+      endOffset: candidate.endOffset,
+      createdAt: candidate.createdAt,
+      updatedAt: candidate.updatedAt,
+    }];
+  });
+}
+
+function sanitizeNotes(
+  value: unknown,
+  annotations: PdfAnnotation[],
+  noteAnchors: NoteAnchor[],
+): Note[] {
   if (!Array.isArray(value)) {
     return [];
   }
 
-  const annotationIds = new Set(annotations.map((annotation) => annotation.id));
+  const sourceIds = new Set(
+    [...annotations, ...noteAnchors].map((source) => source.id),
+  );
   const notedAnnotationIds = new Set<string>();
   const noteIds = new Set<string>();
   const validNotes: Array<Omit<Note, 'displayNumber'> & { displayNumber?: string }> = [];
@@ -916,7 +970,7 @@ function sanitizeNotes(value: unknown, annotations: PdfAnnotation[]): Note[] {
 
     if (
       !annotationId ||
-      !annotationIds.has(annotationId) ||
+      !sourceIds.has(annotationId) ||
       notedAnnotationIds.has(annotationId) ||
       !isPositiveInteger(candidate.pageNumber) ||
       typeof candidate.selectedText !== 'string' ||

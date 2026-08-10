@@ -9,6 +9,10 @@ import {
   moveDefinitionUp,
 } from '../src/utils/dictionary.ts';
 import { runProgressiveDictionaryLookup } from '../src/utils/progressiveDictionary.ts';
+import {
+  NcbiRequestQueue,
+  runBoundedRetry,
+} from '../src/utils/ncbiRequestPolicy.ts';
 import { createSharedRequestRegistry } from '../src/services/dictionary/sharedRequest.ts';
 import { parseWiktionaryDefinitions } from '../src/services/dictionary/providers/wiktionaryParser.ts';
 import {
@@ -31,6 +35,11 @@ const selectionHookSource = source('../src/hooks/usePdfTextSelection.ts');
 const dictionaryServiceSource = source('../src/services/dictionaryService.ts');
 const dictionaryCacheSource = source('../src/services/dictionary/dictionaryCache.ts');
 const libraryBackupSource = source('../src/services/libraryBackup.ts');
+const meshProviderSource = source('../src/services/dictionary/providers/mesh.ts');
+const ncbiQueueSource = source('../src/services/dictionary/providers/ncbiRequestQueue.ts');
+const wiktionaryProviderSource = source('../src/services/dictionary/providers/wiktionary.ts');
+const notesPanelSource = source('../src/components/NotesPanel.tsx');
+const dictionarySourcesDocumentation = source('../DICTIONARY_SOURCES.md');
 
 const wordNetSource: DictionarySourceAttribution = {
   provider: 'wordnet',
@@ -254,7 +263,7 @@ test('WordNet results are delivered before unresolved remote providers', async (
       normalizedWord: 'term',
       definitions: [definition('local', 'Local.', wordNetSource)],
     }),
-    remoteLookups: [() => remote.promise],
+    generalLookups: [() => remote.promise],
     callbacks: {
       onLocalResult: () => events.push('local'),
       onRemoteResult: () => events.push('remote'),
@@ -270,6 +279,54 @@ test('WordNet results are delivered before unresolved remote providers', async (
   assert.deepEqual(events, ['local', 'remote', 'complete']);
 });
 
+test('useful general coverage prevents unnecessary MeSH fallback', async () => {
+  let specialistCalls = 0;
+  const events: string[] = [];
+  await runProgressiveDictionaryLookup({
+    fallbackNormalizedWord: 'participant',
+    localLookup: async () => ({
+      normalizedWord: 'participant',
+      definitions: [definition('local', 'Someone who takes part.', wordNetSource)],
+    }),
+    generalLookups: [async () => [definition('wiki', 'One who participates.', wiktionarySource)]],
+    specialistLookup: async () => {
+      specialistCalls += 1;
+      return [definition('mesh', 'Specialist.', meshSource)];
+    },
+    callbacks: {
+      onLocalResult: () => events.push('local'),
+      onRemoteResult: () => events.push('remote'),
+      onComplete: () => events.push('complete'),
+    },
+    signal: new AbortController().signal,
+  });
+  assert.equal(specialistCalls, 0);
+  assert.deepEqual(events, ['local', 'remote', 'complete']);
+});
+
+test('empty general coverage allows MeSH only after Wiktionary completes', async () => {
+  const events: string[] = [];
+  await runProgressiveDictionaryLookup({
+    fallbackNormalizedWord: 'specialistterm',
+    localLookup: async () => ({ normalizedWord: 'specialistterm', definitions: [] }),
+    generalLookups: [async () => {
+      events.push('wiktionary');
+      return [];
+    }],
+    specialistLookup: async () => {
+      events.push('mesh');
+      return [definition('mesh', 'Specialist definition.', meshSource)];
+    },
+    callbacks: {
+      onLocalResult: () => events.push('local'),
+      onRemoteResult: () => events.push('remote'),
+      onComplete: () => events.push('complete'),
+    },
+    signal: new AbortController().signal,
+  });
+  assert.deepEqual(events, ['local', 'wiktionary', 'mesh', 'remote', 'complete']);
+});
+
 test('remote failure preserves WordNet and offline mode completes locally', async () => {
   const events: string[] = [];
   const controller = new AbortController();
@@ -279,7 +336,7 @@ test('remote failure preserves WordNet and offline mode completes locally', asyn
       normalizedWord: 'term',
       definitions: [definition('local', 'Local.', wordNetSource)],
     }),
-    remoteLookups: [async () => Promise.reject(new Error('offline'))],
+    generalLookups: [async () => Promise.reject(new Error('offline'))],
     callbacks: {
       onLocalResult: (result) => events.push(`local:${result.definitions.length}`),
       onRemoteResult: () => events.push('remote'),
@@ -293,7 +350,7 @@ test('remote failure preserves WordNet and offline mode completes locally', asyn
   await runProgressiveDictionaryLookup({
     fallbackNormalizedWord: 'term',
     localLookup: async () => ({ normalizedWord: 'term', definitions: [] }),
-    remoteLookups: [],
+    generalLookups: [],
     callbacks: {
       onLocalResult: () => offlineEvents.push('local'),
       onRemoteResult: () => offlineEvents.push('remote'),
@@ -311,7 +368,7 @@ test('closing a lookup prevents stale remote callbacks', async () => {
   const lookup = runProgressiveDictionaryLookup({
     fallbackNormalizedWord: 'term',
     localLookup: async () => ({ normalizedWord: 'term', definitions: [] }),
-    remoteLookups: [() => remote.promise],
+    generalLookups: [() => remote.promise],
     callbacks: {
       onLocalResult: () => events.push('local'),
       onRemoteResult: () => events.push('remote'),
@@ -348,6 +405,85 @@ test('simultaneous identical provider requests share one network operation', asy
   await assert.rejects(first, { name: 'AbortError' });
   assert.equal(await second, 'shared');
   assert.equal(registry.size(), 0);
+});
+
+test('NCBI queue serializes starts below three E-utilities requests per second', async () => {
+  let now = 0;
+  const starts: number[] = [];
+  const waits: number[] = [];
+  const queue = new NcbiRequestQueue(
+    350,
+    () => now,
+    async (milliseconds) => {
+      waits.push(milliseconds);
+      now += milliseconds;
+    },
+  );
+  const signal = new AbortController().signal;
+  await Promise.all(
+    [1, 2, 3].map((value) =>
+      queue.schedule(async () => {
+        starts.push(now);
+        return value;
+      }, signal),
+    ),
+  );
+  assert.deepEqual(starts, [0, 350, 700]);
+  assert.deepEqual(waits, [350, 350]);
+});
+
+test('AbortController cancels queued NCBI work before it starts', async () => {
+  const first = deferred<string>();
+  let secondStarted = false;
+  const queue = new NcbiRequestQueue(0);
+  const firstRequest = queue.schedule(() => first.promise, new AbortController().signal);
+  const secondController = new AbortController();
+  const secondRequest = queue.schedule(async () => {
+    secondStarted = true;
+    return 'second';
+  }, secondController.signal);
+  secondController.abort();
+  first.resolve('first');
+  assert.equal(await firstRequest, 'first');
+  await assert.rejects(secondRequest, { name: 'AbortError' });
+  assert.equal(secondStarted, false);
+});
+
+test('HTTP 429/transient retry uses bounded exponential backoff', async () => {
+  let calls = 0;
+  const delays: number[] = [];
+  const result = await runBoundedRetry(
+    async () => {
+      calls += 1;
+      if (calls < 3) throw { status: 429, retryAfterMs: calls === 1 ? 800 : null };
+      return 'ok';
+    },
+    new AbortController().signal,
+    {
+      maxAttempts: 3,
+      baseBackoffMs: 500,
+      maxBackoffMs: 2_000,
+      isTransient: (error) => (error as { status?: number }).status === 429,
+      getRetryAfterMs: (error) => (error as { retryAfterMs?: number | null }).retryAfterMs ?? null,
+      delay: async (milliseconds) => {
+        delays.push(milliseconds);
+      },
+    },
+  );
+  assert.equal(result, 'ok');
+  assert.equal(calls, 3);
+  assert.deepEqual(delays, [800, 1_000]);
+});
+
+test('provider identification and privacy wording remain provider-specific', () => {
+  assert.match(wiktionaryProviderSource, /'Api-User-Agent'/);
+  assert.match(wiktionaryProviderSource, /39Note\/0\.1\.0 \(https:\/\/github\.com\/Ex39393\/39Note\)/);
+  assert.match(meshProviderSource, /searchParams\.set\('tool', '39Note'\)/);
+  assert.doesNotMatch(meshProviderSource, /searchParams\.set\('email'/);
+  assert.match(ncbiQueueSource, /runBoundedRetry/);
+  assert.match(notesPanelSource, /Normal network metadata may still be/);
+  assert.match(dictionarySourcesDocumentation, /Normal network metadata may still be visible/);
+  assert.doesNotMatch(dictionarySourcesDocumentation, /never sends.*user identity/i);
 });
 
 test('Glossary stores the current top definition and remote attribution', () => {

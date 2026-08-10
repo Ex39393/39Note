@@ -147,7 +147,7 @@ export function NotesPanel({
               <div className="notes-card-list">
                 {notes.length === 0 ? (
                   <p className="notes-empty">
-                    Select a highlight and choose Add Note to begin.
+                    Select PDF text and choose Add Note to begin.
                   </p>
                 ) : matchingNotes.length === 0 ? (
                   <p className="notes-empty">No notes match this search.</p>
@@ -241,8 +241,10 @@ export function NotesPanel({
                   MeSH terms and conditions
                 </a>
                 <p>
-                  Online providers receive only the normalized selected word—never
-                  PDF text, filenames, Notes, annotations, or document identifiers.
+                  39Note sends only the selected word as dictionary query content. No
+                  PDF text, filenames, Notes, annotations, Glossary contents, or
+                  document identifiers are sent. Normal network metadata may still be
+                  visible to the provider.
                 </p>
                 <button
                   type="button"

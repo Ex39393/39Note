@@ -1,5 +1,6 @@
 import type { PdfAnnotation } from './highlight';
 import type { Note } from './note';
+import type { NoteAnchor } from './noteAnchor';
 
 export type AnnotatedPdfContentMode = 'annotations' | 'annotations-and-notes';
 
@@ -36,7 +37,7 @@ export interface PdfCoordinateLine {
 }
 
 export interface AnnotationExportReference {
-  annotation: PdfAnnotation;
+  annotation: PdfAnnotation | NoteAnchor;
   note: Note;
   referenceNumber: number;
 }
@@ -53,6 +54,7 @@ export interface AnnotatedPdfExportRequest {
   documentTitle: string;
   annotations: PdfAnnotation[];
   notes: Note[];
+  noteAnchors: NoteAnchor[];
   pageGeometries: PdfPageGeometry[];
   options: AnnotatedPdfExportOptions;
   onProgress?: (progress: AnnotatedPdfExportProgress) => void;
