@@ -18,7 +18,11 @@ import {
   sortGlossaryEntries,
   getPrintLayoutClass,
 } from '../src/utils/glossaryModel.ts';
-import { getGlossaryUnderlineColor } from '../src/themes.ts';
+import {
+  getGlossaryUnderlineColor,
+  readingThemes,
+  themes,
+} from '../src/themes.ts';
 import {
   createIdempotentCleanup,
   getPrintLayoutCss,
@@ -59,6 +63,14 @@ const definitionBubbleSource = readFileSync(
 );
 const noteExportSource = readFileSync(
   new URL('../src/utils/noteExport.ts', import.meta.url),
+  'utf8',
+);
+const themeProviderSource = readFileSync(
+  new URL('../src/components/ThemeProvider.tsx', import.meta.url),
+  'utf8',
+);
+const themeCssSource = readFileSync(
+  new URL('../src/styles/index.css', import.meta.url),
   'utf8',
 );
 
@@ -225,13 +237,107 @@ test('Glossary deletion removes only the linked semantic marker', () => {
   assert.deepEqual(result.annotations, annotations);
 });
 
-test('all six themes expose a visible semantic marker colour', () => {
-  const colors = ['original', 'soft-gray', 'dark', 'midnight', 'twilight', 'dawn'].map(
-    getGlossaryUnderlineColor,
-  );
-  assert.equal(colors.length, 6);
-  assert.equal(new Set(colors).size, 6);
+test('all seven themes expose a visible semantic marker colour', () => {
+  const colors = readingThemes.map(getGlossaryUnderlineColor);
+  assert.deepEqual(readingThemes, [
+    'original',
+    'soft-gray',
+    'mint',
+    'dark',
+    'midnight',
+    'twilight',
+    'dawn',
+  ]);
+  assert.equal(colors.length, 7);
+  assert.equal(new Set(colors).size, 7);
   assert.ok(colors.every((color) => /^#[0-9a-f]{6}$/i.test(color)));
+});
+
+test('Mint exposes its complete built-in semantic palette', () => {
+  const mint = themes.mint;
+  assert.equal(mint.label, 'Mint');
+  assert.equal(mint.appBackground, '#EEF7F3');
+  assert.equal(mint.surfaceBackground, '#F7FCFA');
+  assert.equal(mint.elevatedBackground, '#FFFFFF');
+  assert.equal(mint.panelBackground, '#DDEFE8');
+  assert.equal(mint.textColor, '#223238');
+  assert.equal(mint.mutedTextColor, '#6E8488');
+  assert.equal(mint.borderColor, '#C8DDD5');
+  assert.equal(mint.accentColor, '#4FAF8F');
+  assert.equal(mint.glossaryUnderlineColor, '#2F6E5A');
+  assert.equal(mint.canvasFilter, 'none');
+  assert.deepEqual(mint.semanticPalette, {
+    mainBackground: '#F7FCFA',
+    cardBackground: '#FFFFFF',
+    drawerBackground: '#F1FAF6',
+    sectionBackground: '#F1FAF6',
+    toolbarBackground: '#E8F5F0',
+    dictionaryBackground: '#FFFFFF',
+    selectionToolbarBackground: '#FFFFFF',
+    selectionToolbarActive: '#CFEDE2',
+    noteFocusBackground: '#D8F1E7',
+    glossaryCardBackground: '#F1FAF6',
+    navigationFocusColor: '#BEE7D8',
+    secondaryAccentColor: '#67B7E8',
+    secondaryAccentHover: '#52A8DD',
+    secondaryAccentActive: '#3D97CF',
+    secondarySoftFill: '#DCEFFD',
+    secondaryTextColor: '#4C6469',
+    faintTextColor: '#8BA0A3',
+    strongerBorderColor: '#B7D0C8',
+    dividerColor: '#D6E8E1',
+    accentHover: '#3E9F80',
+    accentActive: '#2F8E70',
+    accentSoftFill: '#D9F0E7',
+    accentBorderColor: '#8FCBB8',
+    chipBackground: '#D9F0E7',
+    chipSelectedBackground: '#4FAF8F',
+    chipSelectedText: '#223238',
+    informationalTint: '#D9EEFA',
+    destructiveColor: '#9A5D55',
+  });
+  assert.deepEqual(
+    [
+      mint.scrollbarTrack,
+      mint.scrollbarThumb,
+      mint.scrollbarThumbHover,
+    ],
+    ['#EAF4F0', '#9BCDBB', '#7FBBA6'],
+  );
+});
+
+test('Mint semantic tokens drive app-owned UI without recolouring PDF or print output', () => {
+  for (const token of [
+    '--theme-card',
+    '--theme-drawer',
+    '--theme-dictionary',
+    '--theme-selection-toolbar',
+    '--theme-navigation-focus',
+    '--theme-link',
+    '--theme-divider',
+  ]) {
+    assert.match(themeProviderSource, new RegExp(token));
+    assert.match(themeCssSource, new RegExp(token));
+  }
+  assert.match(themeCssSource, /data-reading-theme='mint'/);
+  assert.doesNotMatch(noteExportSource, /data-reading-theme|--theme-/);
+});
+
+test('Mint reading and control colour pairs retain practical text contrast', () => {
+  const mint = themes.mint;
+  const semantic = mint.semanticPalette;
+  assert.ok(semantic);
+
+  assert.ok(contrastRatio(mint.textColor, mint.surfaceBackground) >= 7);
+  assert.ok(
+    contrastRatio(semantic.secondaryTextColor, semantic.drawerBackground) >= 4.5,
+  );
+  assert.ok(
+    contrastRatio(semantic.chipSelectedText, mint.accentColor) >= 4.5,
+  );
+  assert.ok(
+    contrastRatio(mint.glossaryUnderlineColor, mint.pageBackground) >= 4.5,
+  );
 });
 
 test('print layouts are explicit and Standard remains the default', () => {
@@ -383,4 +489,26 @@ function getFunctionSource(sourceText: string, start: string, end: string): stri
   assert.notEqual(startIndex, -1);
   assert.notEqual(endIndex, -1);
   return sourceText.slice(startIndex, endIndex);
+}
+
+function contrastRatio(first: string, second: string): number {
+  const firstLuminance = relativeLuminance(first);
+  const secondLuminance = relativeLuminance(second);
+  const lighter = Math.max(firstLuminance, secondLuminance);
+  const darker = Math.min(firstLuminance, secondLuminance);
+  return (lighter + 0.05) / (darker + 0.05);
+}
+
+function relativeLuminance(hex: string): number {
+  const channels = [1, 3, 5].map((index) => {
+    const channel = Number.parseInt(hex.slice(index, index + 2), 16) / 255;
+    return channel <= 0.04045
+      ? channel / 12.92
+      : ((channel + 0.055) / 1.055) ** 2.4;
+  });
+  return (
+    0.2126 * channels[0] +
+    0.7152 * channels[1] +
+    0.0722 * channels[2]
+  );
 }

@@ -1,6 +1,45 @@
-export const readingThemes = ['original', 'soft-gray', 'dark', 'midnight', 'twilight', 'dawn'] as const;
+export const readingThemes = [
+  'original',
+  'soft-gray',
+  'mint',
+  'dark',
+  'midnight',
+  'twilight',
+  'dawn',
+] as const;
 
 export type ReadingTheme = (typeof readingThemes)[number];
+
+export interface ThemeSemanticPalette {
+  mainBackground: string;
+  cardBackground: string;
+  drawerBackground: string;
+  sectionBackground: string;
+  toolbarBackground: string;
+  dictionaryBackground: string;
+  selectionToolbarBackground: string;
+  selectionToolbarActive: string;
+  noteFocusBackground: string;
+  glossaryCardBackground: string;
+  navigationFocusColor: string;
+  secondaryAccentColor: string;
+  secondaryAccentHover: string;
+  secondaryAccentActive: string;
+  secondarySoftFill: string;
+  secondaryTextColor: string;
+  faintTextColor: string;
+  strongerBorderColor: string;
+  dividerColor: string;
+  accentHover: string;
+  accentActive: string;
+  accentSoftFill: string;
+  accentBorderColor: string;
+  chipBackground: string;
+  chipSelectedBackground: string;
+  chipSelectedText: string;
+  informationalTint: string;
+  destructiveColor: string;
+}
 
 export interface ThemeDefinition {
   id: ReadingTheme;
@@ -25,6 +64,7 @@ export interface ThemeDefinition {
   scrollbarThumbHover: string;
   scrollbarThumbActive: string;
   scrollbarBorder: string;
+  semanticPalette?: ThemeSemanticPalette;
 }
 
 export const themes: Record<ReadingTheme, ThemeDefinition> = {
@@ -75,6 +115,60 @@ export const themes: Record<ReadingTheme, ThemeDefinition> = {
     scrollbarThumbHover: '#65727d',
     scrollbarThumbActive: '#53606a',
     scrollbarBorder: '#cdd1d5',
+  },
+  mint: {
+    id: 'mint',
+    label: 'Mint',
+    appBackground: '#EEF7F3',
+    surfaceBackground: '#F7FCFA',
+    elevatedBackground: '#FFFFFF',
+    panelBackground: '#DDEFE8',
+    inputBackground: '#FFFFFF',
+    textColor: '#223238',
+    mutedTextColor: '#6E8488',
+    borderColor: '#C8DDD5',
+    pageBackground: '#FFFFFF',
+    canvasFilter: 'none',
+    accentColor: '#4FAF8F',
+    highlightColor: '#D8F1E7',
+    underlineColor: '#9A5D55',
+    glossaryUnderlineColor: '#2F6E5A',
+    noteColor: '#4FAF8F',
+    scrollbarTrack: '#EAF4F0',
+    scrollbarThumb: '#9BCDBB',
+    scrollbarThumbHover: '#7FBBA6',
+    scrollbarThumbActive: '#69A890',
+    scrollbarBorder: '#EAF4F0',
+    semanticPalette: {
+      mainBackground: '#F7FCFA',
+      cardBackground: '#FFFFFF',
+      drawerBackground: '#F1FAF6',
+      sectionBackground: '#F1FAF6',
+      toolbarBackground: '#E8F5F0',
+      dictionaryBackground: '#FFFFFF',
+      selectionToolbarBackground: '#FFFFFF',
+      selectionToolbarActive: '#CFEDE2',
+      noteFocusBackground: '#D8F1E7',
+      glossaryCardBackground: '#F1FAF6',
+      navigationFocusColor: '#BEE7D8',
+      secondaryAccentColor: '#67B7E8',
+      secondaryAccentHover: '#52A8DD',
+      secondaryAccentActive: '#3D97CF',
+      secondarySoftFill: '#DCEFFD',
+      secondaryTextColor: '#4C6469',
+      faintTextColor: '#8BA0A3',
+      strongerBorderColor: '#B7D0C8',
+      dividerColor: '#D6E8E1',
+      accentHover: '#3E9F80',
+      accentActive: '#2F8E70',
+      accentSoftFill: '#D9F0E7',
+      accentBorderColor: '#8FCBB8',
+      chipBackground: '#D9F0E7',
+      chipSelectedBackground: '#4FAF8F',
+      chipSelectedText: '#223238',
+      informationalTint: '#D9EEFA',
+      destructiveColor: '#9A5D55',
+    },
   },
   dark: {
     id: 'dark',
