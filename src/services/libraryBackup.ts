@@ -16,8 +16,15 @@ import {
   isSafeLegacyDocumentIdForArchive,
   isValidDocumentId,
 } from '../utils/documentId';
+import {
+  getProductivityBackupData,
+  restoreProductivityBackupData,
+  sanitizeProductivityBackupData,
+  type ProductivityBackupDocument,
+} from './productivityPersistence';
 
-export const BACKUP_FORMAT_VERSION = 2;
+export const BACKUP_FORMAT_VERSION = 3;
+const PREVIOUS_BACKUP_FORMAT_VERSION = 2;
 const LEGACY_BACKUP_FORMAT_VERSION = 1;
 const BACKUP_ROOT = '39note-backup/';
 
@@ -26,6 +33,7 @@ export interface BackupManifestDocument {
   hasStoredPdf: boolean;
   recordEntry?: string;
   pdfEntry?: string;
+  productivityEntry?: string;
 }
 
 export interface BackupManifest {
@@ -38,6 +46,8 @@ export interface BackupManifest {
   documents: BackupManifestDocument[];
   backupScope?: 'library' | 'selected';
   selectedDocumentCount?: number;
+  printDraftCount?: number;
+  aiConversationCount?: number;
 }
 
 export interface RestorePreview {
@@ -50,6 +60,7 @@ export interface RestorePreview {
   noteCount: number;
   collections: CollectionRecord[];
   tags: TagRecord[];
+  productivity: ProductivityBackupDocument[];
 }
 
 export async function downloadLibraryBackup(
@@ -90,6 +101,12 @@ async function downloadBackupArchive(
 ): Promise<void> {
   const JSZip = await loadJsZip();
   const zip = new JSZip();
+  const productivity = await getProductivityBackupData(
+    documents.map(({ state }) => state.documentId),
+  );
+  const productivityByDocument = new Map(
+    productivity.map((record) => [record.documentId, record] as const),
+  );
   const manifest: BackupManifest = {
     backupFormatVersion: BACKUP_FORMAT_VERSION,
     application: '39Note',
@@ -97,8 +114,20 @@ async function downloadBackupArchive(
     documentCount: documents.length,
     annotationCount: documents.reduce((count, document) => count + document.state.annotations.length, 0),
     noteCount: documents.reduce((count, document) => count + document.state.notes.length, 0),
-    documents: documents.map(({ state, pdf }) => createManifestDocument(state.documentId, Boolean(pdf))),
+    documents: documents.map(({ state, pdf }) => {
+      const record = productivityByDocument.get(state.documentId);
+      return createManifestDocument(
+        state.documentId,
+        Boolean(pdf),
+        Boolean(record?.printDraft || record?.aiConversations.length),
+      );
+    }),
     backupScope: scope,
+    printDraftCount: productivity.filter((record) => record.printDraft).length,
+    aiConversationCount: productivity.reduce(
+      (count, record) => count + record.aiConversations.length,
+      0,
+    ),
     ...(scope === 'selected' ? { selectedDocumentCount: documents.length } : {}),
   };
 
@@ -110,6 +139,13 @@ async function downloadBackupArchive(
     zip.file(`${BACKUP_ROOT}${manifestDocument.recordEntry}`, JSON.stringify(document.state));
     if (document.pdf && manifestDocument.pdfEntry) {
       zip.file(`${BACKUP_ROOT}${manifestDocument.pdfEntry}`, document.pdf.blob);
+    }
+    const productivityRecord = productivityByDocument.get(document.state.documentId);
+    if (manifestDocument.productivityEntry && productivityRecord) {
+      zip.file(
+        `${BACKUP_ROOT}${manifestDocument.productivityEntry}`,
+        JSON.stringify(productivityRecord),
+      );
     }
     onProgress(index + 1, documents.length);
     await yieldToBrowser();
@@ -163,7 +199,23 @@ export async function inspectBackup(file: File): Promise<RestorePreview> {
     }
 
     const pdf = pdfFile ? createStoredPdf(state, await pdfFile.async('uint8array')) : null;
-    return { state, pdf };
+    const productivityEntry = getProductivityEntry(manifest, manifestDocument);
+    const productivityFile = productivityEntry
+      ? zip.file(`${BACKUP_ROOT}${productivityEntry}`)
+      : null;
+    if (Boolean(productivityEntry) !== Boolean(productivityFile)) {
+      throw new Error(`Backup document ${index + 1} has inconsistent productivity data.`);
+    }
+    const productivity = productivityFile
+      ? sanitizeProductivityBackupData(
+          JSON.parse(await productivityFile.async('text')),
+          state.documentId,
+        )
+      : null;
+    if (productivityFile && !productivity) {
+      throw new Error(`Backup document ${index + 1} has invalid productivity data.`);
+    }
+    return { state, pdf, productivity };
   }));
   const collections = await readEntities<CollectionRecord>(zip, 'collections.json');
   const tags = await readEntities<TagRecord>(zip, 'tags.json');
@@ -179,6 +231,9 @@ export async function inspectBackup(file: File): Promise<RestorePreview> {
     noteCount: documents.reduce((count, { state }) => count + state.notes.length, 0),
     collections,
     tags,
+    productivity: documents.flatMap((document) =>
+      document.productivity ? [document.productivity] : [],
+    ),
   };
 }
 
@@ -186,11 +241,18 @@ export async function restoreBackup(preview: RestorePreview, replaceExisting: bo
   const existingIds = new Set((await listLibraryDocuments()).map((document) => document.documentId));
   let imported = 0;
   let failed = 0;
+  const restoredDocumentIds = new Set<string>();
   for (const document of preview.documents) {
     if (existingIds.has(document.state.documentId) && !replaceExisting) continue;
-    if (await restoreBackupDocument(document.state, document.pdf, replaceExisting)) imported += 1;
+    if (await restoreBackupDocument(document.state, document.pdf, replaceExisting)) {
+      imported += 1;
+      restoredDocumentIds.add(document.state.documentId);
+    }
     else failed += 1;
   }
+  await restoreProductivityBackupData(
+    preview.productivity.filter((record) => restoredDocumentIds.has(record.documentId)),
+  );
   await restoreLibraryEntities(preview.collections, preview.tags);
   return { imported, failed };
 }
@@ -202,7 +264,11 @@ async function readEntities<T>(zip: JSZipType, entryName: string): Promise<T[]> 
   return Array.isArray(value) ? value as T[] : [];
 }
 
-function createManifestDocument(documentId: string, hasStoredPdf: boolean): BackupManifestDocument {
+function createManifestDocument(
+  documentId: string,
+  hasStoredPdf: boolean,
+  hasProductivityData: boolean,
+): BackupManifestDocument {
   if (!isValidDocumentId(documentId)) {
     throw new Error('A Library document has an invalid identifier and cannot be backed up.');
   }
@@ -213,6 +279,9 @@ function createManifestDocument(documentId: string, hasStoredPdf: boolean): Back
     hasStoredPdf,
     recordEntry: `documents/${archiveKey}.json`,
     ...(hasStoredPdf ? { pdfEntry: `pdfs/${archiveKey}.pdf` } : {}),
+    ...(hasProductivityData
+      ? { productivityEntry: `productivity/${archiveKey}.json` }
+      : {}),
   };
 }
 
@@ -222,7 +291,9 @@ function parseManifest(value: unknown): BackupManifest {
   }
   if (
     typeof value.backupFormatVersion !== 'number' ||
-    (value.backupFormatVersion !== BACKUP_FORMAT_VERSION && value.backupFormatVersion !== LEGACY_BACKUP_FORMAT_VERSION) ||
+    (value.backupFormatVersion !== BACKUP_FORMAT_VERSION &&
+      value.backupFormatVersion !== PREVIOUS_BACKUP_FORMAT_VERSION &&
+      value.backupFormatVersion !== LEGACY_BACKUP_FORMAT_VERSION) ||
     value.application !== '39Note' ||
     !Array.isArray(value.documents)
   ) {
@@ -268,6 +339,9 @@ function parseManifest(value: unknown): BackupManifest {
     ...(value.backupScope === 'selected' && typeof value.selectedDocumentCount === 'number'
       ? { selectedDocumentCount: value.selectedDocumentCount }
       : {}),
+    printDraftCount: typeof value.printDraftCount === 'number' ? value.printDraftCount : 0,
+    aiConversationCount:
+      typeof value.aiConversationCount === 'number' ? value.aiConversationCount : 0,
   };
 }
 
@@ -293,11 +367,25 @@ function parseManifestDocument(
   const expectedKey = getArchiveEntryKey(value.documentId);
   const expectedRecordEntry = `documents/${expectedKey}.json`;
   const expectedPdfEntry = `pdfs/${expectedKey}.pdf`;
+  const expectedProductivityEntry = `productivity/${expectedKey}.json`;
   if (value.recordEntry !== expectedRecordEntry || (value.hasStoredPdf && value.pdfEntry !== expectedPdfEntry)) {
     throw new Error(`Backup document ${index + 1} has an unsafe archive entry path.`);
   }
   if (!value.hasStoredPdf && value.pdfEntry !== undefined) {
     throw new Error(`Backup document ${index + 1} has inconsistent PDF metadata.`);
+  }
+  if (
+    backupFormatVersion === BACKUP_FORMAT_VERSION &&
+    value.productivityEntry !== undefined &&
+    value.productivityEntry !== expectedProductivityEntry
+  ) {
+    throw new Error(`Backup document ${index + 1} has an unsafe productivity entry path.`);
+  }
+  if (
+    backupFormatVersion !== BACKUP_FORMAT_VERSION &&
+    value.productivityEntry !== undefined
+  ) {
+    throw new Error(`Backup document ${index + 1} has unsupported productivity metadata.`);
   }
 
   return {
@@ -305,6 +393,9 @@ function parseManifestDocument(
     hasStoredPdf: value.hasStoredPdf,
     recordEntry: expectedRecordEntry,
     ...(value.hasStoredPdf ? { pdfEntry: expectedPdfEntry } : {}),
+    ...(value.productivityEntry === expectedProductivityEntry
+      ? { productivityEntry: expectedProductivityEntry }
+      : {}),
   };
 }
 
@@ -320,6 +411,11 @@ function getExpectedEntries(manifest: BackupManifest): Set<string> {
     if (pdfEntry) {
       expectedEntries.add(`${BACKUP_ROOT}pdfs/`);
       expectedEntries.add(`${BACKUP_ROOT}${pdfEntry}`);
+    }
+    const productivityEntry = getProductivityEntry(manifest, document);
+    if (productivityEntry) {
+      expectedEntries.add(`${BACKUP_ROOT}productivity/`);
+      expectedEntries.add(`${BACKUP_ROOT}${productivityEntry}`);
     }
   }
   return expectedEntries;
@@ -338,6 +434,15 @@ function getPdfEntry(manifest: BackupManifest, document: BackupManifestDocument)
   return manifest.backupFormatVersion === LEGACY_BACKUP_FORMAT_VERSION
     ? `pdfs/${document.documentId}.pdf`
     : document.pdfEntry ?? null;
+}
+
+function getProductivityEntry(
+  manifest: BackupManifest,
+  document: BackupManifestDocument,
+): string | null {
+  return manifest.backupFormatVersion === BACKUP_FORMAT_VERSION
+    ? document.productivityEntry ?? null
+    : null;
 }
 
 function assertSafeZipEntries(zip: JSZipType, entries: string[]): void {

@@ -25,6 +25,7 @@ interface NotesPanelProps {
   onUpdateDisplayNumber: (noteId: string, displayNumber: string) => void;
   onDelete: (noteId: string) => void;
   onExportNotes: (layout: NotesPrintLayout) => void;
+  onEditBeforePrinting: (layout: NotesPrintLayout) => void;
   onNavigateGlossary: (entry: GlossaryEntry) => void;
   onRemoveGlossary: (glossaryEntryId: string) => void;
   onBeginNoteDrag: (note: Note, event: ReactPointerEvent<HTMLButtonElement>) => void;
@@ -46,6 +47,7 @@ export function NotesPanel({
   onUpdateDisplayNumber,
   onDelete,
   onExportNotes,
+  onEditBeforePrinting,
   onNavigateGlossary,
   onRemoveGlossary,
   onBeginNoteDrag,
@@ -316,6 +318,15 @@ export function NotesPanel({
           <div>
             <button type="button" onClick={() => setIsPrintDialogOpen(false)}>
               Cancel
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setIsPrintDialogOpen(false);
+                onEditBeforePrinting(printLayout);
+              }}
+            >
+              Edit before printing
             </button>
             <button
               type="button"

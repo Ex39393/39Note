@@ -32,6 +32,7 @@ import type {
 } from '../types/annotatedPdfExport';
 import type { DocumentIdentity } from '../types/persistence';
 import type { PdfTextSelection } from '../types/textSelection';
+import type { PrintDraftAddition } from '../types/productivity';
 import type {
   DocumentOpenRequest,
   DocumentOpenSource,
@@ -73,9 +74,19 @@ import {
   createGlossaryEntryFromBubble,
   removeGlossaryEntry as removeGlossaryEntryFromState,
 } from '../utils/glossary';
+import {
+  appendPrintDraftAddition,
+  deleteProductivityDocumentData,
+} from '../services/productivityPersistence';
 
 const LibraryPanel = lazy(() =>
   import('./LibraryPanel').then((module) => ({ default: module.LibraryPanel })),
+);
+const PrintComposer = lazy(() =>
+  import('../print/PrintComposer').then((module) => ({ default: module.PrintComposer })),
+);
+const AssistantPanel = lazy(() =>
+  import('../ai/AssistantPanel').then((module) => ({ default: module.AssistantPanel })),
 );
 
 type FitMode = 'width' | 'page' | null;
@@ -149,6 +160,14 @@ export function AppLayout() {
     null,
   );
   const [largeEditorNoteId, setLargeEditorNoteId] = useState<string | null>(null);
+  const [selectedPdfText, setSelectedPdfText] = useState<PdfTextSelection[]>([]);
+  const [isPrintComposerOpen, setIsPrintComposerOpen] = useState(false);
+  const [printComposerLayout, setPrintComposerLayout] =
+    useState<NotesPrintLayout>('standard');
+  const [isAiOpen, setIsAiOpen] = useState(false);
+  const [aiStatus, setAiStatus] = useState<
+    'disconnected' | 'connected' | 'generating'
+  >('disconnected');
   const [readingRestoreToast, setReadingRestoreToast] = useState<string | null>(null);
   const [annotationFilter, setAnnotationFilter] = useState<AnnotationFilterState>({
     types: ['highlight', 'underline'],
@@ -368,6 +387,8 @@ export function AppLayout() {
       setFocusedNoteId(null);
       setNoteDragPreview(null);
       setLargeEditorNoteId(null);
+      setSelectedPdfText([]);
+      setIsPrintComposerOpen(false);
       setExportWarning(null);
       setIsLibraryOpen(false);
     },
@@ -561,6 +582,50 @@ export function AppLayout() {
       ),
     );
   }, []);
+
+  const addAiOutputToNote = useCallback(
+    (content: string) => {
+      if (!isDocumentHydrated || !documentIdentity || !content.trim()) return;
+      const timestamp = Date.now();
+      const selectedAnchor = selectedPdfText[0]
+        ? createNoteAnchorFromSelection(selectedPdfText[0])
+        : null;
+      const anchor: NoteAnchor = selectedAnchor ?? {
+        id: crypto.randomUUID(),
+        type: 'note-anchor',
+        pageNumber: Math.max(1, currentPage),
+        text: 'AI Assistant response',
+        rects: [{ x: 0.04, y: 0.04, width: 0.01, height: 0.01 }],
+        startOffset: 0,
+        endOffset: 0,
+        createdAt: timestamp,
+        updatedAt: timestamp,
+      };
+      const note: Note = {
+        id: crypto.randomUUID(),
+        annotationId: anchor.id,
+        pageNumber: anchor.pageNumber,
+        displayNumber: String(nextNoteNumber),
+        selectedText: selectedAnchor?.text ?? 'AI Assistant response',
+        content: content.trim(),
+        createdAt: timestamp,
+        updatedAt: timestamp,
+      };
+      setNoteAnchors((current) => [...current, anchor]);
+      setNotes((current) => [note, ...current]);
+      setNextNoteNumber((current) => current + 1);
+      setFocusedNoteId(note.id);
+      setIsNotesDrawerOpen(true);
+    }, [currentPage, documentIdentity, isDocumentHydrated, nextNoteNumber, selectedPdfText],
+  );
+
+  const sendAiOutputToPrintDraft = useCallback(
+    async (addition: PrintDraftAddition): Promise<boolean> => {
+      if (!documentIdentity) return false;
+      return appendPrintDraftAddition(documentIdentity.documentId, addition);
+    },
+    [documentIdentity],
+  );
 
   const deleteNote = useCallback((noteId: string) => {
     const note = notes.find((candidate) => candidate.id === noteId);
@@ -943,6 +1008,7 @@ export function AppLayout() {
       if (!wasForgotten) {
         return false;
       }
+      await deleteProductivityDocumentData(documentId);
 
       if (documentIdentity?.documentId === documentId) {
         hydrationRequestRef.current += 1;
@@ -973,6 +1039,7 @@ export function AppLayout() {
     async (ids: string[]): Promise<{ deleted: string[]; failed: string[] }> => {
       await flushPersistence();
       const result = await deleteDocumentStates(ids);
+      await Promise.all(result.deleted.map(deleteProductivityDocumentData));
       if (documentIdentity && result.deleted.includes(documentIdentity.documentId)) {
         setFile(null);
         setDocumentIdentity(null);
@@ -1664,6 +1731,9 @@ export function AppLayout() {
         currentPage={currentPage}
         documentTitle={documentDisplayTitle ?? file?.name ?? 'No document opened'}
         effectiveZoom={effectiveZoom}
+        isAiOpen={isAiOpen}
+        aiStatus={aiStatus}
+        onToggleAi={() => setIsAiOpen((open) => !open)}
       />
       <WebLocalDataNotice />
       <div className="app-content">
@@ -1704,9 +1774,29 @@ export function AppLayout() {
           zoomOperationId={zoomOperationId}
           annotationFilter={annotationFilter}
           onPdfDocumentChange={setPdfDocument}
+          onTextSelectionChange={setSelectedPdfText}
           onExplicitNavigation={handleExplicitNavigation}
           onAnnotationNavigationApplied={handleInitialAnnotationNavigationApplied}
         />
+        {isAiOpen && file ? (
+          <Suspense
+            fallback={<aside className="ai-assistant-panel ai-panel-loading" role="status">Opening AI Assistant...</aside>}
+          >
+            <AssistantPanel
+              isOpen={isAiOpen}
+              document={pdfDocument}
+              documentId={documentIdentity?.documentId ?? null}
+              documentTitle={documentDisplayTitle ?? file.name}
+              currentPage={currentPage}
+              selectedText={selectedPdfText}
+              onClose={() => setIsAiOpen(false)}
+              onNavigateToPage={navigateToPage}
+              onAddToNote={addAiOutputToNote}
+              onSendToPrintDraft={sendAiOutputToPrintDraft}
+              onStatusChange={setAiStatus}
+            />
+          </Suspense>
+        ) : null}
         <NotesPanel
           notes={notes}
           glossaryEntries={glossaryEntries}
@@ -1724,6 +1814,11 @@ export function AppLayout() {
           onNavigateGlossary={navigateToGlossaryEntry}
           onRemoveGlossary={removeGlossaryEntry}
           onExportNotes={exportCurrentNotes}
+          onEditBeforePrinting={(layout) => {
+            if (!documentIdentity || !isDocumentHydrated) return;
+            setPrintComposerLayout(layout);
+            setIsPrintComposerOpen(true);
+          }}
           onBeginNoteDrag={beginNoteDrag}
           onOpenLargeEditor={openLargeEditor}
         />
@@ -1793,6 +1888,20 @@ export function AppLayout() {
           onUpdate={updateNote}
           onUpdateDisplayNumber={updateNoteDisplayNumber}
         />
+      ) : null}
+      {isPrintComposerOpen && documentIdentity ? (
+        <Suspense
+          fallback={<div className="print-composer-overlay" role="status">Opening Print Composer…</div>}
+        >
+          <PrintComposer
+            documentId={documentIdentity.documentId}
+            documentTitle={documentDisplayTitle ?? file?.name ?? '39Note'}
+            notes={notes}
+            glossaryEntries={glossaryEntries}
+            initialLayout={printComposerLayout}
+            onClose={() => setIsPrintComposerOpen(false)}
+          />
+        </Suspense>
       ) : null}
       {isAnnotatedPdfDialogOpen ? (
         <AnnotatedPdfExportDialog

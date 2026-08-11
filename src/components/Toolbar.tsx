@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { useTheme } from '../theme/ThemeContext';
 import { readingThemes, themes } from '../themes';
+import { ProductivityTimer } from './ProductivityTimer';
 
 interface ToolbarProps {
   onOpenFile: (file: File) => void;
@@ -20,6 +21,9 @@ interface ToolbarProps {
   currentPage: number;
   effectiveZoom: number;
   documentTitle: string;
+  isAiOpen: boolean;
+  aiStatus: 'disconnected' | 'connected' | 'generating';
+  onToggleAi: () => void;
 }
 
 export function Toolbar({
@@ -40,6 +44,9 @@ export function Toolbar({
   currentPage,
   effectiveZoom,
   documentTitle,
+  isAiOpen,
+  aiStatus,
+  onToggleAi,
 }: ToolbarProps) {
   const { themeId, setTheme } = useTheme();
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -116,6 +123,20 @@ export function Toolbar({
       </div>
 
       <div className="toolbar-actions">
+        <ProductivityTimer />
+        <button
+          aria-expanded={isAiOpen}
+          aria-label={`AI Assistant: ${aiStatus}`}
+          className={`toolbar-button ai-toolbar-trigger is-${aiStatus}`}
+          disabled={!hasDocument}
+          title="Open AI Assistant"
+          type="button"
+          onClick={onToggleAi}
+        >
+          <span aria-hidden="true">✦</span>
+          <span className="ai-toolbar-label">AI</span>
+          <span className="ai-status-dot" aria-hidden="true" />
+        </button>
         <input
           ref={fileInputRef}
           aria-hidden="true"
