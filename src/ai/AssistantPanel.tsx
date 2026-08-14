@@ -32,7 +32,13 @@ import {
   saveDefaultPromptProfileId,
 } from './configuration';
 import { isValidPageCitation } from './citations';
-import { openAiCompatibleAdapter } from './provider';
+import { resolveProviderAdapter } from './provider';
+import {
+  PROVIDER_DEFINITIONS,
+  createProviderPreset,
+  getProviderDefinition,
+  resolveQwenBaseUrl,
+} from './registry';
 import {
   chunkDocumentPages,
   extractDocumentText,
@@ -45,8 +51,10 @@ import type {
   AiContextScope,
   AiPromptProfile,
   AiProviderConfig,
+  AiProviderId,
   AiRequestContextPreview,
   ProviderMessage,
+  QwenRegion,
 } from './types';
 
 interface AssistantPanelProps {
@@ -84,7 +92,10 @@ export function AssistantPanel({
   const [config, setConfig] = useState<AiProviderConfig>(
     () => loadAiConfiguration() ?? DEFAULT_AI_CONFIG,
   );
-  const [apiKey, setApiKey] = useState(loadApiKey);
+  const [apiKey, setApiKey] = useState(() => {
+    const storedConfig = loadAiConfiguration() ?? DEFAULT_AI_CONFIG;
+    return loadApiKey(storedConfig);
+  });
   const [hasSavedConfiguration, setHasSavedConfiguration] = useState(
     () => loadAiConfiguration() !== null,
   );
@@ -138,13 +149,36 @@ export function AssistantPanel({
     [profiles, selectedProfileId],
   );
   const isConnected = hasSavedConfiguration && Boolean(config.model.trim() && apiKey);
+  const providerName = getProviderDefinition(config.providerId).displayName;
+  const connectionLabel = isGenerating
+    ? 'Generating'
+    : connectionStatus === 'testing'
+      ? 'Testing…'
+      : connectionStatus === 'success'
+        ? `Connected to ${providerName}`
+        : connectionStatus === 'error'
+          ? 'Connection failed'
+          : isConnected
+            ? 'Configured · not tested'
+            : 'Not configured';
+  const connectionTone = isGenerating
+    ? 'generating'
+    : connectionStatus === 'success'
+      ? 'connected'
+      : connectionStatus === 'error'
+        ? 'failed'
+        : 'disconnected';
   selectedProfileIdRef.current = selectedProfileId;
 
   useEffect(() => {
     onStatusChange(
-      isGenerating ? 'generating' : isConnected ? 'connected' : 'disconnected',
+      isGenerating
+        ? 'generating'
+        : connectionStatus === 'success'
+          ? 'connected'
+          : 'disconnected',
     );
-  }, [isConnected, isGenerating, onStatusChange]);
+  }, [connectionStatus, isGenerating, onStatusChange]);
 
   useEffect(() => {
     generationRef.current += 1;
@@ -343,7 +377,7 @@ export function AssistantPanel({
           context.excerpts,
           priorMessages,
         );
-        const result = await openAiCompatibleAdapter.complete({
+        const result = await resolveProviderAdapter(config).complete({
           config,
           apiKey,
           messages,
@@ -457,9 +491,15 @@ export function AssistantPanel({
     setConnectionMessage('Testing connection…');
     const controller = new AbortController();
     try {
-      await openAiCompatibleAdapter.testConnection(config, apiKey, controller.signal);
+      await resolveProviderAdapter(config).testConnection(
+        config,
+        apiKey,
+        controller.signal,
+      );
       setConnectionStatus('success');
-      setConnectionMessage('Connected successfully.');
+      setConnectionMessage(
+        `Connected to ${getProviderDefinition(config.providerId).displayName}.`,
+      );
     } catch (error) {
       setConnectionStatus('error');
       setConnectionMessage(getErrorMessage(error));
@@ -474,8 +514,8 @@ export function AssistantPanel({
     }
     saveAiConfiguration(config, apiKey);
     setHasSavedConfiguration(true);
-    setConnectionStatus('success');
-    setConnectionMessage('Connection settings saved.');
+    setConnectionStatus('idle');
+    setConnectionMessage('Connection settings saved. Test again after changes.');
     setIsSettingsOpen(false);
   };
 
@@ -527,7 +567,7 @@ export function AssistantPanel({
     const partials: string[] = [];
     try {
       for (const group of groups) {
-        const partial = await openAiCompatibleAdapter.complete({
+        const partial = await resolveProviderAdapter(config).complete({
           config,
           apiKey,
           signal: controller.signal,
@@ -543,7 +583,7 @@ export function AssistantPanel({
       }
       let outline = partials[0] ?? '';
       if (partials.length > 1) {
-        const merged = await openAiCompatibleAdapter.complete({
+        const merged = await resolveProviderAdapter(config).complete({
           config,
           apiKey,
           signal: controller.signal,
@@ -616,10 +656,8 @@ export function AssistantPanel({
       <header className="ai-panel-header">
         <div>
           <h2>AI Assistant</h2>
-          <span
-            className={`ai-connection-status is-${isGenerating ? 'generating' : isConnected ? 'connected' : 'disconnected'}`}
-          >
-            {isGenerating ? 'Generating' : isConnected ? 'Connected' : 'Disconnected'}
+          <span className={`ai-connection-status is-${connectionTone}`}>
+            {connectionLabel}
           </span>
         </div>
         <div>
@@ -665,12 +703,20 @@ export function AssistantPanel({
               apiKey={apiKey}
               status={connectionStatus}
               message={connectionMessage}
-              onConfigChange={setConfig}
-              onApiKeyChange={setApiKey}
+              onConfigChange={(next) => {
+                setConfig(next);
+                setConnectionStatus('idle');
+                setConnectionMessage('Settings changed. Test the connection again.');
+              }}
+              onApiKeyChange={(next) => {
+                setApiKey(next);
+                setConnectionStatus('idle');
+                setConnectionMessage('API key changed. Test the connection again.');
+              }}
               onTest={() => void testConnection()}
               onSave={saveConnection}
               onForgetKey={() => {
-                clearApiKey();
+                clearApiKey(config);
                 setApiKey('');
                 setConfig((current) => ({ ...current, rememberApiKey: false }));
                 setConnectionMessage('API key removed from this browser.');
@@ -952,39 +998,179 @@ function ConnectionSettings({
       .map(([name, value]) => `${name}: ${value}`)
       .join('\n'),
   );
+  const [discoveredModels, setDiscoveredModels] = useState<string[]>([]);
+  const [modelDiscoveryStatus, setModelDiscoveryStatus] = useState('');
+  const [isLoadingModels, setIsLoadingModels] = useState(false);
+  const definition = getProviderDefinition(config.providerId);
+  const isCustom = config.providerId === 'custom-openai-compatible';
+
+  useEffect(() => {
+    setHeadersText(
+      Object.entries(config.customHeaders)
+        .map(([name, value]) => `${name}: ${value}`)
+        .join('\n'),
+    );
+  }, [config.customHeaders]);
+
   const update = (change: Partial<AiProviderConfig>) =>
     onConfigChange({ ...config, ...change });
+
+  const switchProvider = (providerId: AiProviderId) => {
+    const next = createProviderPreset(providerId, config);
+    onConfigChange(next);
+    onApiKeyChange(loadApiKey(next));
+    setDiscoveredModels([]);
+    setModelDiscoveryStatus('');
+  };
+
+  const updateQwenConnection = (region: QwenRegion, workspaceId: string) => {
+    const next = {
+      ...config,
+      qwenRegion: region,
+      qwenWorkspaceId: workspaceId,
+      baseUrl: resolveQwenBaseUrl(region, workspaceId, config.baseUrl),
+    };
+    onConfigChange(next);
+    onApiKeyChange(loadApiKey(next));
+    setDiscoveredModels([]);
+  };
+
+  const loadModels = async () => {
+    setIsLoadingModels(true);
+    setModelDiscoveryStatus('Loading models…');
+    try {
+      const models = await resolveProviderAdapter(config).discoverModels(
+        config,
+        apiKey,
+      );
+      setDiscoveredModels(models);
+      setModelDiscoveryStatus(
+        `${models.length} models loaded. Manual entry remains available.`,
+      );
+    } catch (error) {
+      setDiscoveredModels([]);
+      setModelDiscoveryStatus(`${getErrorMessage(error)} Enter a model manually.`);
+    } finally {
+      setIsLoadingModels(false);
+    }
+  };
   return (
     <div className="ai-connection-settings">
       <h3>Connect your AI</h3>
       <p>
-        39Note does not provide an AI account or API key. Connect an OpenAI-compatible
-        chat-completions endpoint you control.
+        Choose a provider for the existing 39Note Assistant. 39Note does not provide an
+        AI account or API key.
       </p>
       <label>
-        Provider label
-        <input
-          value={config.providerLabel}
-          onChange={(event) => update({ providerLabel: event.target.value })}
-        />
+        Provider
+        <select
+          aria-label="AI provider"
+          value={config.providerId}
+          onChange={(event) => switchProvider(event.target.value as AiProviderId)}
+        >
+          {PROVIDER_DEFINITIONS.map((provider) => (
+            <option key={provider.id} value={provider.id}>
+              {provider.displayName}
+            </option>
+          ))}
+        </select>
       </label>
-      <label>
-        Base URL
-        <input
-          inputMode="url"
-          placeholder="https://api.example.com"
-          value={config.baseUrl}
-          onChange={(event) => update({ baseUrl: event.target.value })}
-        />
-      </label>
-      <label>
-        API endpoint/path
-        <input
-          placeholder="/v1/chat/completions"
-          value={config.endpointPath}
-          onChange={(event) => update({ endpointPath: event.target.value })}
-        />
-      </label>
+      <p className="ai-provider-hint">{definition.documentationHint}</p>
+      {isCustom ? (
+        <>
+          <label>
+            Provider label
+            <input
+              value={config.providerLabel}
+              onChange={(event) => update({ providerLabel: event.target.value })}
+            />
+          </label>
+          <label>
+            Base URL
+            <input
+              inputMode="url"
+              placeholder="https://api.example.com"
+              value={config.baseUrl}
+              onChange={(event) => update({ baseUrl: event.target.value })}
+            />
+          </label>
+          <label>
+            API endpoint/path
+            <input
+              placeholder="/v1/chat/completions"
+              value={config.endpointPath}
+              onChange={(event) => update({ endpointPath: event.target.value })}
+            />
+          </label>
+        </>
+      ) : null}
+      {config.providerId === 'qwen' ? (
+        <div className="ai-provider-card">
+          <label>
+            Region / endpoint preset
+            <select
+              value={config.qwenRegion}
+              onChange={(event) =>
+                updateQwenConnection(
+                  event.target.value as QwenRegion,
+                  config.qwenWorkspaceId,
+                )
+              }
+            >
+              <option value="international">International (Singapore)</option>
+              <option value="us">US (Virginia)</option>
+              <option value="china">China (Beijing)</option>
+              <option value="custom">Custom</option>
+            </select>
+          </label>
+          {config.qwenRegion === 'international' || config.qwenRegion === 'china' ? (
+            <label>
+              Workspace ID (optional)
+              <input
+                pattern="[A-Za-z0-9-]+"
+                placeholder="Uses the shared endpoint when blank"
+                value={config.qwenWorkspaceId}
+                onChange={(event) =>
+                  updateQwenConnection(config.qwenRegion, event.target.value)
+                }
+              />
+            </label>
+          ) : null}
+          {config.qwenRegion === 'us' ? (
+            <p>Alibaba currently documents the shared US endpoint for Virginia.</p>
+          ) : null}
+        </div>
+      ) : null}
+      <div className="ai-model-row">
+        <label>
+          Model
+          <input
+            list="ai-discovered-models"
+            placeholder="Enter a current model name"
+            value={config.model}
+            onChange={(event) => update({ model: event.target.value })}
+          />
+          <datalist id="ai-discovered-models">
+            {discoveredModels.map((model) => (
+              <option key={model} value={model} />
+            ))}
+          </datalist>
+        </label>
+        {definition.supportsModelDiscovery ? (
+          <button
+            type="button"
+            disabled={isLoadingModels}
+            onClick={() => void loadModels()}
+          >
+            {isLoadingModels ? 'Loading…' : 'Load models'}
+          </button>
+        ) : null}
+      </div>
+      {modelDiscoveryStatus ? (
+        <p className="ai-model-status" role="status">
+          {modelDiscoveryStatus}
+        </p>
+      ) : null}
       <label>
         API key
         <input
@@ -994,63 +1180,83 @@ function ConnectionSettings({
           onChange={(event) => onApiKeyChange(event.target.value)}
         />
       </label>
-      <label>
-        Model
-        <input
-          placeholder="Model name"
-          value={config.model}
-          onChange={(event) => update({ model: event.target.value })}
-        />
-      </label>
-      <div className="ai-settings-grid">
+      <details className="ai-provider-advanced">
+        <summary>Advanced</summary>
+        {!isCustom ? (
+          <div className="ai-settings-grid">
+            <label>
+              Base URL
+              <input
+                inputMode="url"
+                value={config.baseUrl}
+                onChange={(event) => update({ baseUrl: event.target.value })}
+              />
+            </label>
+            <label>
+              API endpoint/path
+              <input
+                value={config.endpointPath}
+                onChange={(event) => update({ endpointPath: event.target.value })}
+              />
+            </label>
+          </div>
+        ) : null}
+        <div className="ai-settings-grid">
+          {definition.supportsTemperature ? (
+            <label>
+              Temperature
+              <input
+                min="0"
+                max="2"
+                step="0.1"
+                type="number"
+                value={config.temperature}
+                onChange={(event) =>
+                  update({ temperature: Number(event.target.value) })
+                }
+              />
+            </label>
+          ) : null}
+          <label>
+            Maximum output tokens
+            <input
+              min="1"
+              type="number"
+              value={config.maximumOutputTokens}
+              onChange={(event) =>
+                update({ maximumOutputTokens: Number(event.target.value) })
+              }
+            />
+          </label>
+          <label>
+            Context character budget
+            <input
+              min="2000"
+              type="number"
+              value={config.contextCharacterBudget}
+              onChange={(event) =>
+                update({ contextCharacterBudget: Number(event.target.value) })
+              }
+            />
+          </label>
+        </div>
         <label>
-          Temperature
-          <input
-            min="0"
-            max="2"
-            step="0.1"
-            type="number"
-            value={config.temperature}
-            onChange={(event) => update({ temperature: Number(event.target.value) })}
+          Custom headers
+          <textarea
+            aria-label="Custom request headers"
+            placeholder="X-Provider-Header: value"
+            rows={3}
+            value={headersText}
+            onChange={(event) => {
+              const nextText = event.target.value;
+              setHeadersText(nextText);
+              update({ customHeaders: parseHeaders(nextText) });
+            }}
           />
         </label>
-        <label>
-          Maximum output tokens
-          <input
-            min="1"
-            type="number"
-            value={config.maximumOutputTokens}
-            onChange={(event) =>
-              update({ maximumOutputTokens: Number(event.target.value) })
-            }
-          />
-        </label>
-        <label>
-          Context character budget
-          <input
-            min="2000"
-            type="number"
-            value={config.contextCharacterBudget}
-            onChange={(event) =>
-              update({ contextCharacterBudget: Number(event.target.value) })
-            }
-          />
-        </label>
-      </div>
-      <details>
-        <summary>Advanced custom headers</summary>
-        <textarea
-          aria-label="Custom request headers"
-          placeholder="X-Provider-Header: value"
-          rows={3}
-          value={headersText}
-          onChange={(event) => {
-            const nextText = event.target.value;
-            setHeadersText(nextText);
-            update({ customHeaders: parseHeaders(nextText) });
-          }}
-        />
-        <p>Authorization, Cookie, Host, and Content-Length cannot be overridden.</p>
+        <p>
+          Authentication headers, Cookie, Host, and Content-Length cannot be overridden.
+        </p>
       </details>
       <label className="ai-remember-key">
         <input
@@ -1067,8 +1273,13 @@ function ConnectionSettings({
         </p>
       ) : null}
       <p>
-        Browser requests work only when the endpoint permits CORS and satisfies HTTPS
-        security policy. 39Note never uses a public CORS proxy.
+        39Note connects directly from your browser to the provider you select. Your API
+        key is available to this browser session. Extensions or scripts in the same
+        browser profile may be able to access browser-stored credentials.
+      </p>
+      <p>
+        Some providers may block direct browser requests with CORS or account policy.
+        39Note never uses a public CORS proxy or a 39Note-owned relay.
       </p>
       <div className="ai-settings-actions">
         <button type="button" disabled={status === 'testing'} onClick={onTest}>
@@ -1375,7 +1586,9 @@ function parseHeaders(value: string): Record<string, string> {
       const headerValue = line.slice(separator + 1).trim();
       if (
         !/^[A-Za-z0-9-]{1,80}$/.test(name) ||
-        /^(authorization|cookie|host|content-length)$/i.test(name)
+        /^(authorization|cookie|host|content-length|x-api-key|x-goog-api-key)$/i.test(
+          name,
+        )
       )
         return [];
       return [[name, headerValue]];

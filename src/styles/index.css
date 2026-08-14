@@ -3361,6 +3361,7 @@ button:focus-visible {
 
 .ai-connection-status.is-connected { color: #31a66a; }
 .ai-connection-status.is-generating { color: var(--theme-note); }
+.ai-connection-status.is-failed { color: var(--destructive-text); }
 
 .ai-settings {
   min-height: 0;
@@ -3392,6 +3393,9 @@ button:focus-visible {
 .ai-connection-settings > label,
 .ai-prompt-settings > label,
 .ai-settings-grid label,
+.ai-provider-card label,
+.ai-model-row label,
+.ai-provider-advanced > label,
 .ai-chat-toolbar label,
 .ai-compose > label {
   display: grid;
@@ -3425,6 +3429,25 @@ button:focus-visible {
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 8px;
 }
+
+.ai-provider-hint,
+.ai-provider-card,
+.ai-provider-advanced {
+  padding: 9px;
+  border: 1px solid var(--theme-border);
+  border-radius: 8px;
+  background: var(--theme-section);
+}
+
+.ai-provider-hint { color: var(--theme-text) !important; }
+.ai-provider-card { display: grid; gap: 8px; }
+.ai-model-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: end; gap: 8px; }
+.ai-model-row > button { min-height: 34px; }
+.ai-model-status { overflow-wrap: anywhere; }
+.ai-provider-advanced > summary { cursor: pointer; color: var(--theme-heading); font-size: 0.74rem; font-weight: 700; }
+.ai-provider-advanced[open] > summary { margin-bottom: 9px; }
+.ai-provider-advanced .ai-settings-grid + .ai-settings-grid { margin-top: 8px; }
+.ai-provider-advanced textarea { margin-top: 4px; }
 
 .ai-remember-key {
   display: flex !important;

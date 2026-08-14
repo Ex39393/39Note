@@ -8,7 +8,7 @@
     "start:local": "vite --host 127.0.0.1 --port 5173 --strictPort",
     "build": "tsc -b && vite build",
     "lint": "eslint .",
-    "test": "node --test tests/initialNavigation.test.ts tests/annotatedPdfExport.test.ts tests/launcherIdentity.test.ts tests/dictionaryGlossary.test.ts tests/dictionaryProviders.test.ts tests/annotationWorkflow.test.ts tests/productivityExtensions.test.ts tests/pdfRuntimeIntegrity.test.ts",
+    "test": "node --test tests/initialNavigation.test.ts tests/annotatedPdfExport.test.ts tests/launcherIdentity.test.ts tests/dictionaryGlossary.test.ts tests/dictionaryProviders.test.ts tests/annotationWorkflow.test.ts tests/productivityExtensions.test.ts tests/pdfRuntimeIntegrity.test.ts tests/aiProviders.test.ts",
     "dictionary:build": "node scripts/build-wordnet-shards.mjs",
     "format": "prettier --write .",
     "format:check": "prettier --check .",

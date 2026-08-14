@@ -1,4 +1,25 @@
+export type AiProviderId =
+  | 'openai'
+  | 'anthropic'
+  | 'gemini'
+  | 'xai'
+  | 'deepseek'
+  | 'mistral'
+  | 'qwen'
+  | 'cohere'
+  | 'custom-openai-compatible';
+
+export type AiProviderProtocol =
+  'openai-chat-completions' | 'anthropic-messages' | 'google-gemini' | 'cohere-v2-chat';
+
+export type AiAuthenticationStrategy =
+  'bearer' | 'anthropic-api-key' | 'google-api-key';
+
+export type QwenRegion = 'international' | 'us' | 'china' | 'custom';
+
 export interface AiProviderConfig {
+  providerId: AiProviderId;
+  protocol: AiProviderProtocol;
   providerLabel: string;
   baseUrl: string;
   endpointPath: string;
@@ -8,6 +29,8 @@ export interface AiProviderConfig {
   contextCharacterBudget: number;
   customHeaders: Record<string, string>;
   rememberApiKey: boolean;
+  qwenRegion: QwenRegion;
+  qwenWorkspaceId: string;
 }
 
 export interface AiPromptProfile {
