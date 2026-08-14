@@ -3648,6 +3648,15 @@ button:focus-visible {
 }
 
 .print-toolbar-group:last-child { border-right: 0; }
+.print-editor-toolbar button[aria-pressed='true'] {
+  border-color: var(--theme-accent);
+  background: var(--theme-accent-soft);
+  color: var(--theme-heading);
+}
+.print-editor-toolbar button:disabled {
+  cursor: not-allowed;
+  opacity: 0.48;
+}
 .print-editor-toolbar select { max-width: 138px; }
 .print-color-control { display: inline-flex; align-items: center; gap: 4px; color: var(--theme-selection); font-size: 0.66rem; }
 .print-color-control input { width: 28px; height: 27px; padding: 1px; border: 1px solid var(--theme-border); background: var(--theme-input); }

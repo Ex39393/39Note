@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { LexicalComposer } from '@lexical/react/LexicalComposer';
 import { ContentEditable } from '@lexical/react/LexicalContentEditable';
 import { HistoryPlugin } from '@lexical/react/LexicalHistoryPlugin';
@@ -38,7 +38,7 @@ import {
   TableNode,
   TableRowNode,
 } from '@lexical/table';
-import { $insertNodeToNearestRoot } from '@lexical/utils';
+import { $insertNodeToNearestRoot, mergeRegister } from '@lexical/utils';
 import {
   $createParagraphNode,
   $createTextNode,
@@ -47,11 +47,15 @@ import {
   $isElementNode,
   $isRangeSelection,
   $isTextNode,
+  CAN_REDO_COMMAND,
+  CAN_UNDO_COMMAND,
+  COMMAND_PRIORITY_LOW,
   FORMAT_ELEMENT_COMMAND,
   FORMAT_TEXT_COMMAND,
   INDENT_CONTENT_COMMAND,
   OUTDENT_CONTENT_COMMAND,
   REDO_COMMAND,
+  SELECTION_CHANGE_COMMAND,
   UNDO_COMMAND,
   type ElementNode,
   type LexicalEditor,
@@ -251,6 +255,61 @@ function InitialContentPlugin({
 
 function PrintEditorToolbar() {
   const [editor] = useLexicalComposerContext();
+  const [canUndo, setCanUndo] = useState(false);
+  const [canRedo, setCanRedo] = useState(false);
+  const [activeFormats, setActiveFormats] = useState({
+    bold: false,
+    italic: false,
+    underline: false,
+    strikethrough: false,
+    superscript: false,
+    subscript: false,
+  });
+  const updateActiveFormats = useCallback(() => {
+    const selection = $getSelection();
+    if (!$isRangeSelection(selection)) return;
+    setActiveFormats({
+      bold: selection.hasFormat('bold'),
+      italic: selection.hasFormat('italic'),
+      underline: selection.hasFormat('underline'),
+      strikethrough: selection.hasFormat('strikethrough'),
+      superscript: selection.hasFormat('superscript'),
+      subscript: selection.hasFormat('subscript'),
+    });
+  }, []);
+  useEffect(
+    () =>
+      mergeRegister(
+        editor.registerUpdateListener(({ editorState }) => {
+          editorState.read(updateActiveFormats);
+        }),
+        editor.registerCommand(
+          SELECTION_CHANGE_COMMAND,
+          () => {
+            updateActiveFormats();
+            return false;
+          },
+          COMMAND_PRIORITY_LOW,
+        ),
+        editor.registerCommand(
+          CAN_UNDO_COMMAND,
+          (available) => {
+            setCanUndo(available);
+            return false;
+          },
+          COMMAND_PRIORITY_LOW,
+        ),
+        editor.registerCommand(
+          CAN_REDO_COMMAND,
+          (available) => {
+            setCanRedo(available);
+            return false;
+          },
+          COMMAND_PRIORITY_LOW,
+        ),
+      ),
+    [editor, updateActiveFormats],
+  );
   const patchTextStyle = (style: Record<string, string | null>) => {
     editor.update(() => {
       const selection = $getSelection();
@@ -314,6 +373,8 @@ function PrintEditorToolbar() {
       <div className="print-toolbar-group">
         <button
           aria-label="Undo"
+          disabled={!canUndo}
+          title="Undo (Ctrl+Z)"
           type="button"
           onClick={() => editor.dispatchCommand(UNDO_COMMAND, undefined)}
         >
@@ -321,6 +382,8 @@ function PrintEditorToolbar() {
         </button>
         <button
           aria-label="Redo"
+          disabled={!canRedo}
+          title="Redo (Ctrl+Y or Ctrl+Shift+Z)"
           type="button"
           onClick={() => editor.dispatchCommand(REDO_COMMAND, undefined)}
         >
@@ -346,6 +409,8 @@ function PrintEditorToolbar() {
       <div className="print-toolbar-group">
         <button
           aria-label="Bold"
+          aria-pressed={activeFormats.bold}
+          title="Bold (Ctrl+B)"
           type="button"
           onClick={() => editor.dispatchCommand(FORMAT_TEXT_COMMAND, 'bold')}
         >
@@ -353,6 +418,8 @@ function PrintEditorToolbar() {
         </button>
         <button
           aria-label="Italic"
+          aria-pressed={activeFormats.italic}
+          title="Italic (Ctrl+I)"
           type="button"
           onClick={() => editor.dispatchCommand(FORMAT_TEXT_COMMAND, 'italic')}
         >
@@ -360,6 +427,8 @@ function PrintEditorToolbar() {
         </button>
         <button
           aria-label="Underline"
+          aria-pressed={activeFormats.underline}
+          title="Underline (Ctrl+U)"
           type="button"
           onClick={() => editor.dispatchCommand(FORMAT_TEXT_COMMAND, 'underline')}
         >
@@ -367,6 +436,8 @@ function PrintEditorToolbar() {
         </button>
         <button
           aria-label="Strikethrough"
+          aria-pressed={activeFormats.strikethrough}
+          title="Strikethrough"
           type="button"
           onClick={() => editor.dispatchCommand(FORMAT_TEXT_COMMAND, 'strikethrough')}
         >
@@ -374,6 +445,8 @@ function PrintEditorToolbar() {
         </button>
         <button
           aria-label="Superscript"
+          aria-pressed={activeFormats.superscript}
+          title="Superscript"
           type="button"
           onClick={() => editor.dispatchCommand(FORMAT_TEXT_COMMAND, 'superscript')}
         >
@@ -381,6 +454,8 @@ function PrintEditorToolbar() {
         </button>
         <button
           aria-label="Subscript"
+          aria-pressed={activeFormats.subscript}
+          title="Subscript"
           type="button"
           onClick={() => editor.dispatchCommand(FORMAT_TEXT_COMMAND, 'subscript')}
         >

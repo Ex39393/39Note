@@ -8,6 +8,7 @@ import {
   getDisplayedMilliseconds,
 } from '../src/utils/productivityClock.ts';
 import { BUILT_IN_PROMPTS } from '../src/ai/configuration.ts';
+import { isValidPageCitation } from '../src/ai/citations.ts';
 
 const source = (path: string) => readFileSync(new URL(path, import.meta.url), 'utf8');
 
@@ -95,6 +96,23 @@ test('AI includes required prompt profiles and keeps request boundaries explicit
   assert.match(panel, /SYSTEM INSTRUCTION|SECURITY BOUNDARY/);
   assert.match(panel, /DOCUMENT EXCERPTS/);
   assert.match(panel, /AbortController/);
+});
+
+test('AI links only citations that refer to real PDF pages', () => {
+  assert.equal(isValidPageCitation(1, 12), true);
+  assert.equal(isValidPageCitation(12, 12), true);
+  assert.equal(isValidPageCitation(0, 12), false);
+  assert.equal(isValidPageCitation(13, 12), false);
+  assert.equal(isValidPageCitation(1.5, 12), false);
+  assert.equal(isValidPageCitation(1, 0), false);
+});
+
+test('Print Composer exposes formatting and history state accessibly', () => {
+  const editor = source('../src/print/PrintComposerEditor.tsx');
+  assert.match(editor, /CAN_UNDO_COMMAND/);
+  assert.match(editor, /CAN_REDO_COMMAND/);
+  assert.match(editor, /aria-pressed=\{activeFormats\.bold\}/);
+  assert.match(editor, /title="Bold \(Ctrl\+B\)"/);
 });
 
 test('heavy productivity modules are lazy and credentials are outside backup records', () => {

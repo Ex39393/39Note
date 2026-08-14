@@ -31,6 +31,7 @@ import {
   saveCustomPromptProfiles,
   saveDefaultPromptProfileId,
 } from './configuration';
+import { isValidPageCitation } from './citations';
 import { openAiCompatibleAdapter } from './provider';
 import {
   chunkDocumentPages,
@@ -758,6 +759,7 @@ export function AssistantPanel({
                 <ChatMessage
                   key={message.id}
                   message={message}
+                  pageCount={document?.numPages ?? 0}
                   onNavigateToPage={onNavigateToPage}
                   onAddToNote={onAddToNote}
                   onSendToPrintDraft={onSendToPrintDraft}
@@ -1204,11 +1206,13 @@ function PromptSettings({
 
 function ChatMessage({
   message,
+  pageCount,
   onNavigateToPage,
   onAddToNote,
   onSendToPrintDraft,
 }: {
   message: AiChatMessage;
+  pageCount: number;
   onNavigateToPage: (page: number) => void;
   onAddToNote: (content: string) => void;
   onSendToPrintDraft: (addition: PrintDraftAddition) => Promise<boolean>;
@@ -1221,6 +1225,7 @@ function ChatMessage({
     >
       <div className="ai-message-content">
         <SafeResponseText
+          pageCount={pageCount}
           text={message.content || '…'}
           onNavigateToPage={onNavigateToPage}
         />
@@ -1269,9 +1274,11 @@ function ChatMessage({
 
 function SafeResponseText({
   text,
+  pageCount,
   onNavigateToPage,
 }: {
   text: string;
+  pageCount: number;
   onNavigateToPage: (page: number) => void;
 }) {
   const parts = text.split(/(\[p\.\s*\d+\])/gi);
@@ -1279,12 +1286,13 @@ function SafeResponseText({
     <p>
       {parts.map((part, index) => {
         const match = /^\[p\.\s*(\d+)\]$/i.exec(part);
-        return match ? (
+        const pageNumber = match ? Number(match[1]) : null;
+        return pageNumber !== null && isValidPageCitation(pageNumber, pageCount) ? (
           <button
             className="ai-page-citation"
             key={`${part}-${index}`}
             type="button"
-            onClick={() => onNavigateToPage(Number(match[1]))}
+            onClick={() => onNavigateToPage(pageNumber)}
           >
             {part}
           </button>
