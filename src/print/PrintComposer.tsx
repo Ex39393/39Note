@@ -2,7 +2,12 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { $generateHtmlFromNodes } from '@lexical/html';
 import type { LexicalEditor } from 'lexical';
 import type { Note } from '../types/note';
-import type { GlossaryEntry, NotesPrintLayout } from '../types/glossary';
+import {
+  notesPrintLayouts,
+  type GlossaryEntry,
+  type NotesPrintLayout,
+} from '../types/glossary';
+import type { PdfAnnotation } from '../types/highlight';
 import type { PrintDraftRecord } from '../types/productivity';
 import {
   clearPrintDraft,
@@ -17,6 +22,7 @@ interface PrintComposerProps {
   documentId: string;
   documentTitle: string;
   notes: readonly Note[];
+  annotations: readonly PdfAnnotation[];
   glossaryEntries: readonly GlossaryEntry[];
   initialLayout: NotesPrintLayout;
   onClose: () => void;
@@ -26,13 +32,20 @@ export function PrintComposer({
   documentId,
   documentTitle,
   notes,
+  annotations,
   glossaryEntries,
   initialLayout,
   onClose,
 }: PrintComposerProps) {
   const sourceFingerprint = useMemo(
-    () => createPrintSourceFingerprint(documentTitle, notes, glossaryEntries),
-    [documentTitle, glossaryEntries, notes],
+    () =>
+      createPrintSourceFingerprint(
+        documentTitle,
+        notes,
+        glossaryEntries,
+        annotations,
+      ),
+    [annotations, documentTitle, glossaryEntries, notes],
   );
   const [draft, setDraft] = useState<PrintDraftRecord | null>(null);
   const [isLoading, setIsLoading] = useState(true);
@@ -101,17 +114,17 @@ export function PrintComposer({
     [persistDraft],
   );
 
-  const regenerate = () => {
+  const regenerate = (layout = draft?.layout ?? initialLayout) => {
     const fresh = createFreshDraft(
       documentId,
       sourceFingerprint,
-      draft?.layout ?? initialLayout,
+      layout,
     );
     setDraft(fresh);
     setDecision('ready');
     setEditorKey((key) => key + 1);
     setLastSavedAt(null);
-    setStatusMessage('Regenerated from current Notes and Glossary.');
+    setStatusMessage('Regenerated from the current print sources.');
     persistDraft(fresh);
   };
 
@@ -119,12 +132,31 @@ export function PrintComposer({
     if (
       draft?.editorStateJson &&
       !window.confirm(
-        'Reset this print draft to the current Notes and Glossary? Your print-only edits will be lost.',
+        'Reset this print draft to the current Notes, annotations, and Glossary? Your print-only edits will be lost.',
       )
     ) {
       return;
     }
     regenerate();
+  };
+
+  const selectLayout = (layout: NotesPrintLayout) => {
+    if (!draft || layout === draft.layout) return;
+    const changesPrintedSources =
+      layout === 'all-annotations' || draft.layout === 'all-annotations';
+    if (!changesPrintedSources) {
+      updateDraft({ layout });
+      return;
+    }
+    if (
+      draft.editorStateJson &&
+      !window.confirm(
+        'Changing to or from All Annotations regenerates the source blocks. Continue and discard print-only edits?',
+      )
+    ) {
+      return;
+    }
+    regenerate(layout);
   };
 
   const print = () => {
@@ -175,12 +207,12 @@ export function PrintComposer({
         <section className="print-draft-decision">
           <h2 id="print-draft-found-title">Saved print draft found</h2>
           <p>
-            Reopen your print-only edits, or regenerate from the current Notes and
-            Glossary.
+            Reopen your print-only edits, or regenerate from the current print
+            sources.
           </p>
           {sourceChanged ? (
             <p className="print-source-change-notice" role="status">
-              Source Notes have changed since this print draft was created.
+              Print sources have changed since this draft was created.
             </p>
           ) : null}
           <div>
@@ -190,8 +222,8 @@ export function PrintComposer({
             <button type="button" onClick={() => setDecision('ready')}>
               Keep draft
             </button>
-            <button type="button" onClick={regenerate}>
-              Regenerate from Notes
+            <button type="button" onClick={() => regenerate(initialLayout)}>
+              Regenerate from sources
             </button>
           </div>
         </section>
@@ -213,18 +245,14 @@ export function PrintComposer({
             <p>{documentTitle}</p>
           </div>
           <div className="print-composer-layouts" aria-label="Print layout">
-            {(['standard', 'space-saving', 'extra-large'] as const).map((layout) => (
+            {notesPrintLayouts.map((layout) => (
               <button
                 aria-pressed={draft.layout === layout}
                 key={layout}
                 type="button"
-                onClick={() => updateDraft({ layout })}
+                onClick={() => selectLayout(layout)}
               >
-                {layout === 'space-saving'
-                  ? 'Space-saving'
-                  : layout === 'extra-large'
-                    ? 'Extra Large'
-                    : 'Standard'}
+                {getPrintLayoutLabel(layout)}
               </button>
             ))}
           </div>
@@ -235,7 +263,7 @@ export function PrintComposer({
                 : 'Not saved yet'}
             </span>
             <button type="button" onClick={resetDraft}>
-              Reset to original Notes
+              Reset to current sources
             </button>
             <button
               type="button"
@@ -262,9 +290,9 @@ export function PrintComposer({
         </header>
         {sourceChanged ? (
           <div className="print-source-change-banner" role="status">
-            <span>Source Notes have changed since this print draft was created.</span>
-            <button type="button" onClick={regenerate}>
-              Regenerate from Notes
+            <span>Print sources have changed since this draft was created.</span>
+            <button type="button" onClick={() => regenerate()}>
+              Regenerate from sources
             </button>
           </div>
         ) : null}
@@ -277,7 +305,9 @@ export function PrintComposer({
           key={editorKey}
           documentTitle={documentTitle}
           notes={notes}
+          annotations={annotations}
           glossaryEntries={glossaryEntries}
+          layout={draft.layout}
           initialEditorStateJson={draft.editorStateJson}
           pendingAdditions={draft.pendingAdditions}
           onPendingAdditionsConsumed={() => updateDraft({ pendingAdditions: [] })}
@@ -289,6 +319,13 @@ export function PrintComposer({
       </section>
     </div>
   );
+}
+
+function getPrintLayoutLabel(layout: NotesPrintLayout): string {
+  if (layout === 'space-saving') return 'Space-saving';
+  if (layout === 'extra-large') return 'Extra Large';
+  if (layout === 'all-annotations') return 'All Annotations';
+  return 'Standard';
 }
 
 function createFreshDraft(

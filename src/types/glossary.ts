@@ -87,6 +87,11 @@ export interface DefinitionBubble {
   addedConfirmationToken?: number;
 }
 
-export const notesPrintLayouts = ['standard', 'space-saving', 'extra-large'] as const;
+export const notesPrintLayouts = [
+  'standard',
+  'space-saving',
+  'extra-large',
+  'all-annotations',
+] as const;
 
 export type NotesPrintLayout = (typeof notesPrintLayouts)[number];

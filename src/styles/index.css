@@ -2469,6 +2469,10 @@ button:focus-visible {
   color: var(--theme-text);
 }
 
+.definition-bubble.is-active {
+  z-index: 5;
+}
+
 .definition-bubble header {
   display: grid;
   grid-template-columns: 28px minmax(0, 1fr) 28px;
@@ -2476,6 +2480,29 @@ button:focus-visible {
   gap: 6px;
   padding: 8px;
   border-bottom: 1px solid var(--theme-divider);
+}
+
+.definition-bubble .definition-bubble-drag-handle {
+  display: grid;
+  min-width: 0;
+  height: 28px;
+  padding: 0 5px;
+  grid-template-columns: 14px minmax(0, 1fr);
+  align-items: center;
+  gap: 3px;
+  cursor: grab;
+  touch-action: none;
+  user-select: none;
+}
+
+.definition-bubble .definition-bubble-drag-handle.is-dragging {
+  cursor: grabbing;
+}
+
+.definition-bubble-grip {
+  color: var(--theme-faint-text);
+  font-size: 0.78rem;
+  line-height: 1;
 }
 
 .definition-bubble header strong {
@@ -3689,6 +3716,7 @@ button:focus-visible {
 
 .print-layout-space-saving .print-editor-content { padding: 48px 54px; font-size: 10pt; line-height: 1.3; }
 .print-layout-extra-large .print-editor-content { padding: 72px 70px; font-size: 16pt; line-height: 1.55; }
+.print-layout-all-annotations .print-editor-content { padding: 54px 60px; font-size: 11pt; line-height: 1.45; }
 .print-editor-content p { margin: 0 0 10pt; }
 .print-editor-h1 { margin: 0 0 22pt; font-size: 26pt; line-height: 1.2; }
 .print-editor-h2 { margin: 18pt 0 9pt; font-size: 18pt; line-height: 1.25; }
@@ -3700,6 +3728,8 @@ button:focus-visible {
 .print-editor-table-header { background: color-mix(in srgb, currentColor 10%, transparent); }
 .print-editor-link { color: var(--theme-link); text-decoration: underline; }
 .print-composer-block { margin-bottom: 18pt; }
+.print-block-glossary { margin-bottom: 7pt; }
+.print-block-glossary p { margin-bottom: 0; }
 .print-page-break {
   display: grid;
   height: 34px;

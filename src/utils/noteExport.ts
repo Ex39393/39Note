@@ -1,9 +1,15 @@
 import type { Note } from '../types/note';
-import { underlineColors, type PdfAnnotation } from '../types/highlight';
+import {
+  highlightColors,
+  underlineColors,
+  type PdfAnnotation,
+} from '../types/highlight';
 import type { GlossaryEntry, NotesPrintLayout } from '../types/glossary';
 import { getPrintContentItems, getPrintLayoutClass } from './glossary';
 import { createIdempotentCleanup, getPrintLayoutCss } from './printSession';
 import { getDictionaryAttributionText } from './dictionary';
+import { getPrintModeContent } from './annotationPrint';
+import { formatGlossaryEntryForPrint } from './glossaryPrint';
 
 export function exportNotesAsMarkdown(notes: Note[], documentTitle: string): boolean {
   if (notes.length === 0) {
@@ -31,7 +37,11 @@ export function exportNotesAsPdf(
   layout: NotesPrintLayout,
   onComplete: () => void,
 ): (() => void) | null {
-  if (notes.length === 0 && glossaryEntries.length === 0) {
+  if (
+    notes.length === 0 &&
+    glossaryEntries.length === 0 &&
+    (layout !== 'all-annotations' || annotations.length === 0)
+  ) {
     return null;
   }
 
@@ -145,7 +155,30 @@ export function createNotesPrintDocument(
   }).format(new Date()));
   const annotationsById = new Map(annotations.map((annotation) => [annotation.id, annotation]));
   const printContent = getPrintContentItems(notes, glossaryEntries);
-  const noteEntries = printContent.notes.map((note) => formatNoteForPrint(note, annotationsById.get(note.annotationId))).join('\n');
+  const printModeContent = getPrintModeContent(layout, annotations, printContent.notes);
+  const standardNoteEntries = printModeContent.standaloneNotes
+    .map((note) => formatNoteForPrint(note, annotationsById.get(note.annotationId)))
+    .join('\n');
+  const annotationSection =
+    layout === 'all-annotations' && printModeContent.annotationItems.length > 0
+      ? `<section class="annotations-print-section">
+      <h2>All Annotations</h2>
+      ${printModeContent.annotationItems.map(formatAnnotationForPrint).join('\n')}
+    </section>`
+      : '';
+  const standaloneNotesSection =
+    layout === 'all-annotations' && printModeContent.standaloneNotes.length > 0
+      ? `<section class="standalone-notes-print-section">
+      <h2>Notes</h2>
+      ${printModeContent.standaloneNotes
+        .map((note) => formatNoteForPrint(note, undefined))
+        .join('\n')}
+    </section>`
+      : '';
+  const noteEntries =
+    layout === 'all-annotations'
+      ? `${annotationSection}\n${standaloneNotesSection}`
+      : standardNoteEntries;
   const glossary = printContent.glossaryEntries;
   const dictionaryAttribution = getDictionaryAttributionText(
     glossary.map((entry) => entry.source),
@@ -153,7 +186,7 @@ export function createNotesPrintDocument(
   const glossarySection = glossary.length > 0
     ? `<section class="glossary-print-section">
       <h2>Glossary</h2>
-      ${glossary.map(formatGlossaryForPrint).join('\n')}
+      ${glossary.map(formatGlossaryEntryForPrint).join('\n')}
       <p class="dictionary-attribution">${escapeHtml(dictionaryAttribution)}</p>
     </section>`
     : '';
@@ -182,11 +215,19 @@ export function createNotesPrintDocument(
     .note-empty { color: #777; font-style: italic; }
     .glossary-print-section { margin-top: 30pt; }
     .glossary-print-section h2 { margin: 0 0 14pt; font-size: 16pt; line-height: 1.3; break-after: avoid-page; }
-    .glossary-entry { margin-bottom: 18pt; padding-bottom: 12pt; border-bottom: 0.5pt solid #ccc; break-inside: avoid-page; }
-    .glossary-entry h3 { margin: 0 0 5pt; font-size: 12.5pt; line-height: 1.3; }
-    .glossary-entry p { margin: 0 0 5pt; font-size: 11pt; line-height: 1.5; }
-    .glossary-page { color: #777; font-size: 9.5pt; }
+    .glossary-entry { margin: 0 0 7pt; font-size: 11pt; line-height: 1.45; break-inside: avoid-page; white-space: pre-wrap; }
+    .glossary-entry strong { color: #171717; font-weight: 700; }
     .dictionary-attribution { margin: 16pt 0 0; color: #777; font-size: 8.5pt; line-height: 1.4; }
+    .annotations-print-section h2,
+    .standalone-notes-print-section h2 { margin: 0 0 14pt; font-size: 16pt; line-height: 1.3; break-after: avoid-page; }
+    .annotation-entry { margin: 0 0 18pt; padding: 0 0 13pt 10pt; border-bottom: 0.5pt solid #ccc; border-left: 3pt solid var(--annotation-colour, #777); break-inside: avoid-page; }
+    .annotation-heading { display: flex; gap: 8pt; align-items: baseline; justify-content: space-between; margin: 0 0 5pt; }
+    .annotation-heading strong { font-size: 11.5pt; }
+    .annotation-meta { color: #666; font-size: 9pt; }
+    .annotation-source { margin: 0; color: #333; font-size: 10.5pt; font-style: italic; line-height: 1.5; white-space: pre-wrap; }
+    .annotation-linked-note { margin: 8pt 0 0; padding: 7pt 9pt; background: #f5f5f3; }
+    .annotation-linked-note .note-body { font-size: 11pt; line-height: 1.5; }
+    .standalone-notes-print-section { margin-top: 24pt; }
     ${layoutCss}
     @media screen { body { background: #f5f5f3; } main { max-width: 820px; margin: 30px auto; padding: 44px; background: #fff; box-shadow: 0 3px 18px rgba(0, 0, 0, 0.12); } }
   </style>
@@ -202,12 +243,26 @@ export function createNotesPrintDocument(
 </html>`;
 }
 
-function formatGlossaryForPrint(entry: GlossaryEntry): string {
-  return `      <article class="glossary-entry">
-        <h3>${escapeHtml(entry.displayedWord)}</h3>
-        <p>${escapeHtml(entry.definition)}</p>
-        <span class="glossary-page">Page ${entry.pageNumber}</span>
+function formatAnnotationForPrint({
+  annotation,
+  notes,
+}: ReturnType<typeof getPrintModeContent>['annotationItems'][number]): string {
+  const palette =
+    annotation.type === 'highlight'
+      ? highlightColors[annotation.color]
+      : underlineColors[annotation.color];
+  const annotationLabel = annotation.type === 'highlight' ? 'Highlight' : 'Underline';
+  const sourceText = annotation.text.trim() || 'Source text unavailable.';
+  const linkedNotes = notes.map(formatLinkedNoteForPrint).join('\n');
+  return `      <article class="annotation-entry" data-annotation-id="${escapeHtml(annotation.id)}" style="--annotation-colour: ${palette.cssValue};">
+        <p class="annotation-heading"><strong>${annotationLabel}</strong><span class="annotation-meta">Page ${annotation.pageNumber} · ${escapeHtml(palette.label)}</span></p>
+        <blockquote class="annotation-source">${escapeHtml(sourceText)}</blockquote>
+        ${linkedNotes}
       </article>`;
+}
+
+function formatLinkedNoteForPrint(note: Note): string {
+  return `<div class="annotation-linked-note"><p class="note-body"><span class="note-label">${escapeHtml(formatNoteLabel(note.displayNumber))}</span><br>${formatNoteContentForHtml(note.content)}</p></div>`;
 }
 
 function formatNoteForPrint(note: Note, annotation: PdfAnnotation | undefined): string {

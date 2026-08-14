@@ -58,8 +58,11 @@ import {
   type LexicalNode,
 } from 'lexical';
 import type { Note } from '../types/note';
-import type { GlossaryEntry } from '../types/glossary';
+import type { GlossaryEntry, NotesPrintLayout } from '../types/glossary';
+import type { PdfAnnotation } from '../types/highlight';
 import type { PrintDraftAddition } from '../types/productivity';
+import { getAllAnnotationsPrintContent } from '../utils/annotationPrint';
+import { getDictionaryAttributionText } from '../utils/dictionary';
 import {
   $createPageBreakNode,
   $createPrintBlockNode,
@@ -72,7 +75,9 @@ import {
 interface PrintComposerEditorProps {
   documentTitle: string;
   notes: readonly Note[];
+  annotations: readonly PdfAnnotation[];
   glossaryEntries: readonly GlossaryEntry[];
+  layout: NotesPrintLayout;
   initialEditorStateJson: string;
   pendingAdditions: readonly PrintDraftAddition[];
   onPendingAdditionsConsumed: () => void;
@@ -83,7 +88,9 @@ interface PrintComposerEditorProps {
 export function PrintComposerEditor({
   documentTitle,
   notes,
+  annotations,
   glossaryEntries,
+  layout,
   initialEditorStateJson,
   pendingAdditions,
   onPendingAdditionsConsumed,
@@ -137,7 +144,9 @@ export function PrintComposerEditor({
       <InitialContentPlugin
         documentTitle={documentTitle}
         notes={notes}
+        annotations={annotations}
         glossaryEntries={glossaryEntries}
+        layout={layout}
         pendingAdditions={pendingAdditions}
         onPendingAdditionsConsumed={onPendingAdditionsConsumed}
       />
@@ -179,13 +188,17 @@ function EditorBridge({ onReady }: { onReady: (editor: LexicalEditor) => void })
 function InitialContentPlugin({
   documentTitle,
   notes,
+  annotations,
   glossaryEntries,
+  layout,
   pendingAdditions,
   onPendingAdditionsConsumed,
 }: {
   documentTitle: string;
   notes: readonly Note[];
+  annotations: readonly PdfAnnotation[];
   glossaryEntries: readonly GlossaryEntry[];
+  layout: NotesPrintLayout;
   pendingAdditions: readonly PrintDraftAddition[];
   onPendingAdditionsConsumed: () => void;
 }) {
@@ -202,8 +215,21 @@ function InitialContentPlugin({
       if (root.isEmpty() || hasOnlyEmptyDefaultContent) {
         root.clear();
         root.append(createTitleBlock(documentTitle));
-        for (const note of notes) root.append(createNoteBlock(note));
+        if (layout === 'all-annotations') {
+          const content = getAllAnnotationsPrintContent(annotations, notes);
+          for (const item of content.annotationItems) {
+            root.append(createAnnotationBlock(item.annotation, item.notes));
+          }
+          for (const note of content.standaloneNotes) {
+            root.append(createNoteBlock(note));
+          }
+        } else {
+          for (const note of notes) root.append(createNoteBlock(note));
+        }
         for (const entry of glossaryEntries) root.append(createGlossaryBlock(entry));
+        if (glossaryEntries.length > 0) {
+          root.append(createGlossaryAttributionBlock(glossaryEntries));
+        }
       }
       for (const addition of pendingAdditions) {
         root.append(createAdditionBlock(addition));
@@ -211,9 +237,11 @@ function InitialContentPlugin({
     });
     if (pendingAdditions.length) onPendingAdditionsConsumed();
   }, [
+    annotations,
     documentTitle,
     editor,
     glossaryEntries,
+    layout,
     notes,
     onPendingAdditionsConsumed,
     pendingAdditions,
@@ -769,23 +797,63 @@ function createNoteBlock(note: Note): PrintBlockNode {
   return block;
 }
 
+function createAnnotationBlock(
+  annotation: PdfAnnotation,
+  notes: readonly Note[],
+): PrintBlockNode {
+  const typeLabel = annotation.type === 'highlight' ? 'Highlight' : 'Underline';
+  const label = `${typeLabel} · Page ${annotation.pageNumber}`;
+  const block = $createPrintBlockNode(
+    `annotation:${annotation.id}`,
+    label,
+    'annotation',
+  );
+  const heading = $createHeadingNode('h2');
+  heading.append($createTextNode(label));
+  const source = $createQuoteNode();
+  source.append($createTextNode(annotation.text || 'Source text unavailable'));
+  block.append(heading, source);
+  for (const note of notes) {
+    const paragraph = $createParagraphNode();
+    const noteLabel = $createTextNode(
+      `${note.displayNumber.trim() || 'Note'}. `,
+    );
+    noteLabel.toggleFormat('bold');
+    paragraph.append(noteLabel, $createTextNode(note.content));
+    block.append(paragraph);
+  }
+  return block;
+}
+
 function createGlossaryBlock(entry: GlossaryEntry): PrintBlockNode {
   const block = $createPrintBlockNode(
     `glossary:${entry.glossaryEntryId}`,
     entry.displayedWord,
     'glossary',
   );
-  const heading = $createHeadingNode('h3');
-  heading.append($createTextNode(entry.displayedWord));
   const definition = $createParagraphNode();
-  definition.append($createTextNode(entry.definition));
-  const source = $createParagraphNode();
-  source.append(
+  const term = $createTextNode(entry.displayedWord);
+  term.toggleFormat('bold');
+  definition.append(term, $createTextNode(`: ${entry.definition}`));
+  block.append(definition);
+  return block;
+}
+
+function createGlossaryAttributionBlock(
+  entries: readonly GlossaryEntry[],
+): PrintBlockNode {
+  const block = $createPrintBlockNode(
+    'glossary-attribution',
+    'Dictionary attribution',
+    'glossary',
+  );
+  const paragraph = $createParagraphNode();
+  paragraph.append(
     $createTextNode(
-      `Page ${entry.pageNumber} · ${entry.source.dataset} ${entry.source.version} · ${entry.source.license}`,
+      getDictionaryAttributionText(entries.map((entry) => entry.source)),
     ),
   );
-  block.append(heading, definition, source);
+  block.append(paragraph);
   return block;
 }
 

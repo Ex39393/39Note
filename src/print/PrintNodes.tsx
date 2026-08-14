@@ -13,7 +13,13 @@ import {
   type Spread,
 } from 'lexical';
 
-export type PrintBlockKind = 'title' | 'note' | 'glossary' | 'custom' | 'ai-result';
+export type PrintBlockKind =
+  | 'title'
+  | 'annotation'
+  | 'note'
+  | 'glossary'
+  | 'custom'
+  | 'ai-result';
 
 export type SerializedPrintBlockNode = Spread<
   {

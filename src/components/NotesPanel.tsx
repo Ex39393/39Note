@@ -13,6 +13,7 @@ import { DrawerEdgeHandle } from './DrawerEdgeHandle';
 interface NotesPanelProps {
   notes: Note[];
   glossaryEntries: GlossaryEntry[];
+  annotationCount: number;
   isOpen: boolean;
   draggedNoteId: string | null;
   isExporting: boolean;
@@ -35,6 +36,7 @@ interface NotesPanelProps {
 export function NotesPanel({
   notes,
   glossaryEntries,
+  annotationCount,
   isOpen,
   draggedNoteId,
   isExporting,
@@ -97,10 +99,17 @@ export function NotesPanel({
             className="notes-export-button"
             type="button"
             disabled={
-              (notes.length === 0 && glossaryEntries.length === 0) || isExporting
+              (notes.length === 0 &&
+                glossaryEntries.length === 0 &&
+                annotationCount === 0) ||
+              isExporting
             }
             onClick={() => {
-              setPrintLayout(getDefaultPrintLayout());
+              setPrintLayout(
+                notes.length === 0 && glossaryEntries.length === 0
+                  ? 'all-annotations'
+                  : getDefaultPrintLayout(),
+              );
               setIsPrintDialogOpen(true);
             }}
           >
@@ -289,6 +298,7 @@ export function NotesPanel({
                 type="radio"
                 name="notes-print-layout"
                 value="standard"
+                disabled={notes.length === 0 && glossaryEntries.length === 0}
                 checked={printLayout === 'standard'}
                 onChange={() => setPrintLayout('standard')}
               />{' '}
@@ -299,6 +309,7 @@ export function NotesPanel({
                 type="radio"
                 name="notes-print-layout"
                 value="space-saving"
+                disabled={notes.length === 0 && glossaryEntries.length === 0}
                 checked={printLayout === 'space-saving'}
                 onChange={() => setPrintLayout('space-saving')}
               />{' '}
@@ -309,10 +320,21 @@ export function NotesPanel({
                 type="radio"
                 name="notes-print-layout"
                 value="extra-large"
+                disabled={notes.length === 0 && glossaryEntries.length === 0}
                 checked={printLayout === 'extra-large'}
                 onChange={() => setPrintLayout('extra-large')}
               />{' '}
               Extra Large
+            </label>
+            <label>
+              <input
+                type="radio"
+                name="notes-print-layout"
+                value="all-annotations"
+                checked={printLayout === 'all-annotations'}
+                onChange={() => setPrintLayout('all-annotations')}
+              />{' '}
+              All Annotations
             </label>
           </fieldset>
           <div>

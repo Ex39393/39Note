@@ -11,7 +11,7 @@ import { BUILT_IN_PROMPTS } from '../src/ai/configuration.ts';
 
 const source = (path: string) => readFileSync(new URL(path, import.meta.url), 'utf8');
 
-test('Print Composer source fingerprint is deterministic and reacts to source Notes', () => {
+test('Print Composer source fingerprint reacts to Notes and annotations', () => {
   const note = {
     id: 'note-1',
     annotationId: 'anchor-1',
@@ -31,6 +31,19 @@ test('Print Composer source fingerprint is deterministic and reacts to source No
   );
   assert.equal(first, second);
   assert.notEqual(first, changed);
+  const withAnnotation = createPrintSourceFingerprint('Document', [note], [], [
+    {
+      id: 'annotation-1',
+      type: 'highlight',
+      pageNumber: 3,
+      text: 'Evidence',
+      rects: [{ x: 0.1, y: 0.2, width: 0.3, height: 0.03 }],
+      color: 'yellow',
+      createdAt: 1,
+      updatedAt: 1,
+    },
+  ]);
+  assert.notEqual(first, withAnnotation);
   assert.equal(note.content, 'Interpretation');
 });
 
@@ -101,4 +114,11 @@ test('direct printing remains available beside edit-before-printing', () => {
   assert.match(notesPanel, />\s*Edit before printing\s*</);
   assert.match(notesPanel, /onExportNotes\(printLayout\)/);
   assert.match(notesPanel, /useState<NotesPrintLayout>\(getDefaultPrintLayout\)/);
+  assert.match(notesPanel, /All Annotations/);
+  const composer = source('../src/print/PrintComposer.tsx');
+  const editor = source('../src/print/PrintComposerEditor.tsx');
+  assert.match(composer, /notesPrintLayouts\.map/);
+  assert.match(composer, /annotations=\{annotations\}/);
+  assert.match(editor, /layout === 'all-annotations'/);
+  assert.match(editor, /createAnnotationBlock/);
 });

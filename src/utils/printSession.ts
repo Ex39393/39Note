@@ -23,10 +23,7 @@ export function getPrintLayoutCss(layout: NotesPrintLayout): string {
     body.print-layout-space-saving .note-page { font-size: 8.5pt; }
     body.print-layout-space-saving .glossary-print-section { margin-top: 17pt; }
     body.print-layout-space-saving .glossary-print-section h2 { margin-bottom: 8pt; font-size: 14pt; }
-    body.print-layout-space-saving .glossary-entry { margin-bottom: 9pt; padding-bottom: 7pt; border-bottom-width: 0.4pt; }
-    body.print-layout-space-saving .glossary-entry h3 { font-size: 10.5pt; }
-    body.print-layout-space-saving .glossary-entry p { font-size: 9.5pt; line-height: 1.35; }
-    body.print-layout-space-saving .glossary-page,
+    body.print-layout-space-saving .glossary-entry { margin-bottom: 5pt; font-size: 9.5pt; line-height: 1.35; }
     body.print-layout-space-saving .dictionary-attribution { font-size: 8.25pt; }
     `;
   }
@@ -45,11 +42,19 @@ export function getPrintLayoutCss(layout: NotesPrintLayout): string {
     body.print-layout-extra-large .note-page { font-size: 12pt; }
     body.print-layout-extra-large .glossary-print-section { margin-top: 36pt; }
     body.print-layout-extra-large .glossary-print-section h2 { margin-bottom: 18pt; font-size: 20pt; line-height: 1.3; }
-    body.print-layout-extra-large .glossary-entry { margin-bottom: 26pt; padding-bottom: 18pt; border-bottom-width: 0.8pt; }
-    body.print-layout-extra-large .glossary-entry h3 { font-size: 18pt; line-height: 1.4; overflow-wrap: anywhere; }
-    body.print-layout-extra-large .glossary-entry p { font-size: 16pt; line-height: 1.5; overflow-wrap: anywhere; }
-    body.print-layout-extra-large .glossary-page { font-size: 12pt; }
+    body.print-layout-extra-large .glossary-entry { margin-bottom: 12pt; font-size: 16pt; line-height: 1.5; overflow-wrap: anywhere; }
     body.print-layout-extra-large .dictionary-attribution { font-size: 11pt; line-height: 1.45; }
+    `;
+  }
+
+  if (layout === 'all-annotations') {
+    return `
+    @page { size: A4; margin: 14mm 16mm; }
+    body.print-layout-all-annotations { font-size: 11pt; line-height: 1.45; }
+    body.print-layout-all-annotations main { max-width: 178mm; }
+    body.print-layout-all-annotations .export-date { margin-bottom: 18pt; }
+    body.print-layout-all-annotations .annotation-entry { margin-bottom: 14pt; padding-bottom: 10pt; }
+    body.print-layout-all-annotations .note-entry { margin-bottom: 18pt; padding-bottom: 12pt; }
     `;
   }
 

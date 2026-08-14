@@ -101,6 +101,9 @@ export function PdfPage({
   const [isNearViewport, setIsNearViewport] = useState(pageNumber === 1);
   const [links, setLinks] = useState<LinkTarget[]>([]);
   const [renderWarning, setRenderWarning] = useState<string | null>(null);
+  const [activeDefinitionBubbleId, setActiveDefinitionBubbleId] = useState<
+    string | null
+  >(null);
 
   useEffect(() => {
     let isDisposed = false;
@@ -488,10 +491,12 @@ export function PdfPage({
           ? definitionBubbles.map((bubble) => (
               <DefinitionBubble
                 bubble={bubble}
+                isActive={activeDefinitionBubbleId === bubble.id}
                 key={bubble.id}
                 pageHeight={dimensions.height}
                 pageWidth={dimensions.width}
                 onAddToGlossary={onAddBubbleToGlossary}
+                onActivate={setActiveDefinitionBubbleId}
                 onClose={onCloseDefinitionBubble}
                 onMoveDefinitionUp={onMoveDefinitionUp}
                 onToggleExpanded={onToggleDefinitionsExpanded}

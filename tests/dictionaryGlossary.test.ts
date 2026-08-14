@@ -36,6 +36,13 @@ import {
 } from '../src/types/glossary.ts';
 import type { DocumentOpenRequest } from '../src/types/documentOpen.ts';
 import type { PdfAnnotation } from '../src/types/highlight.ts';
+import {
+  clampDefinitionBubblePosition,
+  getAnchoredDefinitionBubblePosition,
+  normalizeDefinitionBubblePosition,
+  resolveManualDefinitionBubblePosition,
+} from '../src/utils/definitionBubblePosition.ts';
+import { formatGlossaryEntryForPrint } from '../src/utils/glossaryPrint.ts';
 
 const source = {
   dataset: 'Princeton WordNet' as const,
@@ -71,6 +78,14 @@ const themeProviderSource = readFileSync(
 );
 const themeCssSource = readFileSync(
   new URL('../src/styles/index.css', import.meta.url),
+  'utf8',
+);
+const notesPanelSource = readFileSync(
+  new URL('../src/components/NotesPanel.tsx', import.meta.url),
+  'utf8',
+);
+const printComposerEditorSource = readFileSync(
+  new URL('../src/print/PrintComposerEditor.tsx', import.meta.url),
   'utf8',
 );
 
@@ -196,6 +211,59 @@ test('successful Glossary addition marks the bubble for passive confirmation', (
   assert.equal(bubble.glossaryEntryId, undefined);
   assert.match(definitionBubbleSource, /Added to Glossary/);
   assert.match(definitionBubbleSource, /aria-live="polite"/);
+});
+
+test('definition bubbles retain anchored placement until independently dragged', () => {
+  const page = { width: 600, height: 800 };
+  const bubble = { width: 286, height: 208 };
+  const anchored = getAnchoredDefinitionBubblePosition(
+    { x: 0.2, y: 0.3, width: 0.2, height: 0.03 },
+    page,
+    bubble,
+  );
+  assert.equal(anchored.left, 120);
+  assert.ok(Math.abs(anchored.top - 274) < 0.001);
+
+  const first = normalizeDefinitionBubblePosition({ left: 180, top: 300 }, page);
+  const second = normalizeDefinitionBubblePosition({ left: 30, top: 60 }, page);
+  assert.deepEqual(resolveManualDefinitionBubblePosition(first, page, bubble), {
+    left: 180,
+    top: 300,
+  });
+  assert.deepEqual(resolveManualDefinitionBubblePosition(second, page, bubble), {
+    left: 30,
+    top: 60,
+  });
+});
+
+test('definition bubble movement and viewport resizing clamp every edge', () => {
+  const page = { width: 600, height: 800 };
+  const bubble = { width: 286, height: 208 };
+  assert.deepEqual(
+    clampDefinitionBubblePosition({ left: -500, top: -400 }, page, bubble),
+    { left: 10, top: 10 },
+  );
+  assert.deepEqual(
+    clampDefinitionBubblePosition({ left: 900, top: 900 }, page, bubble),
+    { left: 304, top: 582 },
+  );
+  const manual = normalizeDefinitionBubblePosition({ left: 300, top: 580 }, page);
+  const resized = resolveManualDefinitionBubblePosition(
+    manual,
+    { width: 380, height: 440 },
+    bubble,
+  );
+  assert.deepEqual(resized, { left: 84, top: 222 });
+});
+
+test('definition bubbles use a dedicated pointer-captured handle without persisting drag state', () => {
+  assert.match(definitionBubbleSource, /definition-bubble-drag-handle/);
+  assert.match(definitionBubbleSource, /setPointerCapture/);
+  assert.match(definitionBubbleSource, /releasePointerCapture/);
+  assert.match(definitionBubbleSource, /onPointerCancel/);
+  assert.match(definitionBubbleSource, /onLostPointerCapture/);
+  assert.match(definitionBubbleSource, /definition-bubble-content/);
+  assert.doesNotMatch(definitionBubbleSource, /localStorage|indexedDB|saveDefinitionBubble/);
 });
 
 test('Glossary ordering is page, y, x, creation time, then id without mutation', () => {
@@ -341,11 +409,20 @@ test('Mint reading and control colour pairs retain practical text contrast', () 
 });
 
 test('print layouts are explicit and Standard remains the default', () => {
-  assert.deepEqual(notesPrintLayouts, ['standard', 'space-saving', 'extra-large']);
+  assert.deepEqual(notesPrintLayouts, [
+    'standard',
+    'space-saving',
+    'extra-large',
+    'all-annotations',
+  ]);
   assert.equal(getDefaultPrintLayout(), 'standard');
   assert.equal(getPrintLayoutClass('standard'), 'print-layout-standard');
   assert.equal(getPrintLayoutClass('space-saving'), 'print-layout-space-saving');
   assert.equal(getPrintLayoutClass('extra-large'), 'print-layout-extra-large');
+  assert.equal(
+    getPrintLayoutClass('all-annotations'),
+    'print-layout-all-annotations',
+  );
 });
 
 test('Standard and Space-saving print styles remain unchanged', () => {
@@ -354,7 +431,7 @@ test('Standard and Space-saving print styles remain unchanged', () => {
   assert.match(compactCss, /margin: 12mm/);
   assert.match(compactCss, /font-size: 10pt/);
   assert.match(compactCss, /line-height: 1\.3/);
-  assert.match(compactCss, /border-bottom-width: 0\.4pt/);
+  assert.match(compactCss, /glossary-entry[^}]*font-size: 9\.5pt/);
   assert.doesNotMatch(compactCss, /print-layout-extra-large/);
 });
 
@@ -365,12 +442,11 @@ test('Extra Large uses materially larger isolated typography', () => {
   assert.match(largeCss, /font-size: 16pt; line-height: 1\.5/);
   assert.match(largeCss, /document-title[^}]*font-size: 24pt/);
   assert.match(largeCss, /glossary-print-section h2[^}]*font-size: 20pt/);
-  assert.match(largeCss, /glossary-entry h3[^}]*font-size: 18pt/);
-  assert.match(largeCss, /border-bottom-width: 0\.8pt/);
+  assert.match(largeCss, /glossary-entry[^}]*font-size: 16pt/);
   assert.doesNotMatch(largeCss, /print-layout-space-saving/);
 });
 
-test('all print layouts contain identical Note and Glossary content', () => {
+test('the three existing print layouts retain identical Note and Glossary content', () => {
   const note = {
     id: 'note-1',
     annotationId: 'annotation-1',
@@ -382,7 +458,7 @@ test('all print layouts contain identical Note and Glossary content', () => {
     updatedAt: 1,
   };
   const entry = glossary('print-entry', 3, 0.1, 0.1, 1);
-  const contentByLayout = notesPrintLayouts.map(() =>
+  const contentByLayout = notesPrintLayouts.slice(0, 3).map(() =>
     getPrintContentItems([note], [entry]),
   );
   assert.deepEqual(contentByLayout[0], contentByLayout[1]);
@@ -392,6 +468,31 @@ test('all print layouts contain identical Note and Glossary content', () => {
     contentByLayout[2].glossaryEntries[0].definition,
     'Definition print-entry',
   );
+});
+
+test('printed Glossary entries are compact and keep one consolidated attribution', () => {
+  const entry = {
+    ...glossary('print-format', 37, 0.1, 0.1, 1),
+    displayedWord: 'Reinforcement',
+    definition:
+      'A deliberately long definition that remains complete instead of being shortened for printing.',
+  };
+  const entryHtml = formatGlossaryEntryForPrint(entry);
+  assert.equal(
+    entryHtml,
+    '<p class="glossary-entry"><strong>Reinforcement</strong>: A deliberately long definition that remains complete instead of being shortened for printing.</p>',
+  );
+  assert.doesNotMatch(entryHtml, /Page 37|Princeton|WordNet|License/);
+  assert.doesNotMatch(entryHtml, /<h3>/);
+  assert.match(noteExportSource, /getDictionaryAttributionText/);
+  assert.match(noteExportSource, /dictionary-attribution/);
+  assert.match(notesPanelSource, /Page \{entry\.pageNumber\}/);
+  assert.doesNotMatch(
+    printComposerEditorSource,
+    /Page \$\{entry\.pageNumber\}.*entry\.source/,
+  );
+  assert.match(printComposerEditorSource, /term\.toggleFormat\('bold'\)/);
+  assert.match(printComposerEditorSource, /glossary-attribution/);
 });
 
 test('print cleanup remains idempotent', () => {

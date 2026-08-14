@@ -1,10 +1,12 @@
 import type { Note } from '../types/note';
 import type { GlossaryEntry } from '../types/glossary';
+import type { PdfAnnotation } from '../types/highlight';
 
 export function createPrintSourceFingerprint(
   documentTitle: string,
   notes: readonly Note[],
   glossaryEntries: readonly GlossaryEntry[],
+  annotations: readonly PdfAnnotation[] = [],
 ): string {
   const source = JSON.stringify({
     documentTitle,
@@ -23,6 +25,15 @@ export function createPrintSourceFingerprint(
       entry.pageNumber,
       entry.source.dataset,
       entry.source.version,
+    ]),
+    annotations: annotations.map((annotation) => [
+      annotation.id,
+      annotation.type,
+      annotation.pageNumber,
+      annotation.text,
+      annotation.rects,
+      annotation.color,
+      annotation.updatedAt,
     ]),
   });
   let hash = 2166136261;

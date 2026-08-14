@@ -121,12 +121,15 @@ export function printComposerHtml(
   tr { break-inside: avoid; }
   img, svg { max-width: 100%; }
   .print-composer-block { break-inside: auto; margin-bottom: 18pt; }
+  .print-block-glossary { margin-bottom: 7pt; }
+  .print-block-glossary p { margin-bottom: 0; }
   .print-page-break { display: block; break-before: page; page-break-before: always; height: 0; }
   ${getPrintLayoutCss(layout)}
   body.print-layout-space-saving { font-size: 10pt; line-height: 1.3; }
   body.print-layout-space-saving .print-composer-block { margin-bottom: 10pt; }
   body.print-layout-extra-large { font-size: 16pt; line-height: 1.55; }
   body.print-layout-extra-large .print-composer-block { margin-bottom: 28pt; }
+  body.print-layout-all-annotations .print-composer-block { margin-bottom: 14pt; }
   @media print { a { color: inherit; } }
 </style></head><body class="print-layout-${layout}" data-print-layout="${layout}"><main>${safeContent}</main></body></html>`);
   printWindow.document.close();

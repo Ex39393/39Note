@@ -8,6 +8,10 @@ import {
   findOverlappingAnnotations,
 } from '../src/utils/annotationOverlap.ts';
 import { buildAnnotationExportReferences } from '../src/utils/annotatedPdfExportModel.ts';
+import {
+  getAllAnnotationsPrintContent,
+  getPrintModeContent,
+} from '../src/utils/annotationPrint.ts';
 import type { PdfAnnotation } from '../src/types/highlight.ts';
 import type { Note } from '../src/types/note.ts';
 import type { PdfTextSelection } from '../src/types/textSelection.ts';
@@ -18,6 +22,7 @@ const selectionActionSource = source('../src/components/pdf/SelectionAction.tsx'
 const appLayoutSource = source('../src/components/AppLayout.tsx');
 const persistenceSource = source('../src/services/annotationPersistence.ts');
 const exportServiceSource = source('../src/services/annotatedPdfExport.ts');
+const noteExportSource = source('../src/utils/noteExport.ts');
 
 test('selection overlap resolves exact, partial, multiline, and tiny underline geometry', () => {
   const exact = annotation('exact', 'highlight', 0.1, 0.1, 0.2, 0.03);
@@ -128,6 +133,72 @@ test('annotated-PDF references include direct Notes without exporting anchors as
   assert.equal(references.length, 1);
   assert.equal(references[0].annotation.type, 'note-anchor');
   assert.equal(references[0].note.content, 'Direct content');
+});
+
+test('All Annotations orders logical highlight and underline records once', () => {
+  const laterPage = { ...annotation('later-page', 'highlight', 0.1, 0.1, 0.2, 0.03), pageNumber: 3 };
+  const laterLine = { ...annotation('later-line', 'underline', 0.1, 0.6, 0.2, 0.03), pageNumber: 1 };
+  const multiline = {
+    ...annotation('multiline-print', 'highlight', 0.3, 0.2, 0.2, 0.03),
+    pageNumber: 1,
+    text: 'First line\nSecond line',
+    rects: [
+      { x: 0.3, y: 0.2, width: 0.2, height: 0.03 },
+      { x: 0.1, y: 0.24, width: 0.3, height: 0.03 },
+    ],
+  } satisfies PdfAnnotation;
+  const content = getAllAnnotationsPrintContent(
+    [laterPage, laterLine, multiline],
+    [],
+  );
+  assert.deepEqual(
+    content.annotationItems.map(({ annotation: item }) => item.id),
+    ['multiline-print', 'later-line', 'later-page'],
+  );
+  assert.equal(content.annotationItems.filter(({ annotation: item }) => item.id === 'multiline-print').length, 1);
+  assert.equal(content.annotationItems[0].annotation.text, 'First line\nSecond line');
+  assert.match(noteExportSource, /data-annotation-id/);
+  assert.match(noteExportSource, /<strong>\$\{annotationLabel\}<\/strong>/);
+});
+
+test('All Annotations keeps linked Notes once and direct-anchor Notes separate', () => {
+  const highlight = annotation('linked-highlight', 'highlight', 0.1, 0.1, 0.2, 0.03);
+  const underline = annotation('unnoted-underline', 'underline', 0.1, 0.3, 0.2, 0.03);
+  const linked = {
+    ...note('linked-note', highlight.id, highlight.text),
+    content: 'Linked interpretation',
+  };
+  const direct = {
+    ...note('direct-note-print', 'direct-anchor-only', 'Direct selection'),
+    content: 'Direct interpretation',
+  };
+  const duplicateLinkedInput = { ...linked };
+  const content = getAllAnnotationsPrintContent(
+    [highlight, underline],
+    [linked, direct, duplicateLinkedInput],
+  );
+  assert.equal(content.annotationItems[0].notes.length, 1);
+  assert.deepEqual(content.standaloneNotes.map((item) => item.id), [direct.id]);
+
+  assert.equal(
+    content.annotationItems.flatMap((item) => item.notes).filter((item) => item.id === linked.id).length,
+    1,
+  );
+  assert.equal(content.standaloneNotes.filter((item) => item.id === direct.id).length, 1);
+  assert.match(noteExportSource, /annotation-linked-note/);
+  assert.match(noteExportSource, /standalone-notes-print-section/);
+});
+
+test('existing print modes still print Notes rather than every annotation', () => {
+  const visible = annotation('visible-without-note', 'highlight', 0.1, 0.1, 0.2, 0.03);
+  const direct = {
+    ...note('standard-note', 'anchor-only', 'Direct source'),
+    content: 'Existing mode content',
+  };
+  const content = getPrintModeContent('standard', [visible], [direct]);
+  assert.deepEqual(content.annotationItems, []);
+  assert.deepEqual(content.standaloneNotes, [direct]);
+  assert.equal(content.standaloneNotes[0].content, 'Existing mode content');
 });
 
 function annotation(

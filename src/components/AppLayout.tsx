@@ -1800,6 +1800,7 @@ export function AppLayout() {
         <NotesPanel
           notes={notes}
           glossaryEntries={glossaryEntries}
+          annotationCount={annotations.length}
           isOpen={isNotesDrawerOpen}
           draggedNoteId={noteDragPreview?.noteId ?? null}
           isExporting={isPdfExporting}
@@ -1897,6 +1898,7 @@ export function AppLayout() {
             documentId={documentIdentity.documentId}
             documentTitle={documentDisplayTitle ?? file?.name ?? '39Note'}
             notes={notes}
+            annotations={annotations}
             glossaryEntries={glossaryEntries}
             initialLayout={printComposerLayout}
             onClose={() => setIsPrintComposerOpen(false)}
