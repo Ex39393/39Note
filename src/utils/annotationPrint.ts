@@ -1,79 +1,173 @@
-import type { PdfAnnotation } from '../types/highlight';
+import type { NormalizedHighlightRectangle, PdfAnnotation } from '../types/highlight';
 import type { Note } from '../types/note';
+import type { NoteAnchor } from '../types/noteAnchor';
 import type { NotesPrintLayout } from '../types/glossary';
+import {
+  comparePdfSourcePosition,
+  isSameLogicalPdfSource,
+  type PdfSourceGeometry,
+} from './pdfSourceGeometry.ts';
+import { formatPdfSourceTextForDisplay } from './pdfSourceText.ts';
 
-export interface AnnotationPrintItem {
-  annotation: PdfAnnotation;
+export interface PrintSourceGroup {
+  id: string;
+  pageNumber: number;
+  rects: NormalizedHighlightRectangle[];
+  sourceText: string;
+  sourceOffset?: number;
+  createdAt: number;
+  annotations: PdfAnnotation[];
   notes: Note[];
 }
 
-export interface AllAnnotationsPrintContent {
-  annotationItems: AnnotationPrintItem[];
-  standaloneNotes: Note[];
+interface WorkingPrintSourceGroup extends PrintSourceGroup {
+  sources: PdfSourceGeometry[];
+}
+
+export function createPrintSourceGroups(
+  annotations: readonly PdfAnnotation[],
+  notes: readonly Note[],
+  noteAnchors: readonly NoteAnchor[] = [],
+): PrintSourceGroup[] {
+  const sourcesById = new Map<string, PdfSourceGeometry>(
+    [...annotations, ...noteAnchors].map((source) => [source.id, source]),
+  );
+  const groups: WorkingPrintSourceGroup[] = [];
+
+  for (const annotation of [...annotations].sort(comparePdfSourcePosition)) {
+    const group = findOrCreateGroup(groups, annotation);
+    if (!group.annotations.some((candidate) => candidate.id === annotation.id)) {
+      group.annotations.push(annotation);
+    }
+  }
+
+  const seenNoteIds = new Set<string>();
+  for (const note of notes) {
+    if (seenNoteIds.has(note.id)) continue;
+    seenNoteIds.add(note.id);
+    const resolvedSource = sourcesById.get(note.annotationId);
+    const source: PdfSourceGeometry = resolvedSource ?? {
+      id: `unresolved:${note.id}`,
+      pageNumber: note.pageNumber,
+      text: note.selectedText,
+      rects: [],
+      createdAt: note.createdAt,
+    };
+    const group = findOrCreateGroup(groups, source);
+    group.notes.push(note);
+  }
+
+  return groups
+    .map((group): PrintSourceGroup => ({
+      id: group.id,
+      pageNumber: group.pageNumber,
+      rects: group.rects.map((rectangle) => ({ ...rectangle })),
+      sourceText: group.sourceText,
+      sourceOffset: group.sourceOffset,
+      createdAt: group.createdAt,
+      annotations: [...group.annotations].sort(
+        (first, second) =>
+          annotationTypeOrder(first) - annotationTypeOrder(second) ||
+          first.createdAt - second.createdAt ||
+          first.id.localeCompare(second.id),
+      ),
+      notes: [...group.notes].sort(
+        (first, second) => first.createdAt - second.createdAt || first.id.localeCompare(second.id),
+      ),
+    }))
+    .sort(comparePrintSourceGroups);
 }
 
 export function getAllAnnotationsPrintContent(
   annotations: readonly PdfAnnotation[],
   notes: readonly Note[],
-): AllAnnotationsPrintContent {
-  const sortedAnnotations = [...annotations].sort((first, second) => {
-    const firstPosition = getAnnotationPosition(first);
-    const secondPosition = getAnnotationPosition(second);
-    return (
-      first.pageNumber - second.pageNumber ||
-      firstPosition.y - secondPosition.y ||
-      firstPosition.x - secondPosition.x ||
-      first.id.localeCompare(second.id)
-    );
-  });
-  const annotationIds = new Set(sortedAnnotations.map((annotation) => annotation.id));
-  const seenNoteIds = new Set<string>();
-  const notesByAnnotation = new Map<string, Note[]>();
-  const standaloneNotes: Note[] = [];
-
-  for (const note of notes) {
-    if (seenNoteIds.has(note.id)) continue;
-    seenNoteIds.add(note.id);
-    if (!annotationIds.has(note.annotationId)) {
-      standaloneNotes.push(note);
-      continue;
-    }
-    const linkedNotes = notesByAnnotation.get(note.annotationId) ?? [];
-    linkedNotes.push(note);
-    notesByAnnotation.set(note.annotationId, linkedNotes);
-  }
-
-  return {
-    annotationItems: sortedAnnotations.map((annotation) => ({
-      annotation,
-      notes: notesByAnnotation.get(annotation.id) ?? [],
-    })),
-    standaloneNotes: [...standaloneNotes].sort(
-      (first, second) =>
-        first.pageNumber - second.pageNumber || first.id.localeCompare(second.id),
-    ),
-  };
+  noteAnchors: readonly NoteAnchor[] = [],
+): PrintSourceGroup[] {
+  return createPrintSourceGroups(annotations, notes, noteAnchors);
 }
 
 export function getPrintModeContent(
   layout: NotesPrintLayout,
   annotations: readonly PdfAnnotation[],
   notes: readonly Note[],
-): AllAnnotationsPrintContent {
-  if (layout === 'all-annotations') {
-    return getAllAnnotationsPrintContent(annotations, notes);
-  }
-  return { annotationItems: [], standaloneNotes: [...notes] };
+  noteAnchors: readonly NoteAnchor[] = [],
+): PrintSourceGroup[] {
+  const groups = createPrintSourceGroups(annotations, notes, noteAnchors);
+  return layout === 'all-annotations'
+    ? groups
+    : groups.filter((group) => group.notes.length > 0);
 }
 
-function getAnnotationPosition(
-  annotation: Pick<PdfAnnotation, 'rects'>,
-): { x: number; y: number } {
-  return annotation.rects.reduce(
-    (position, rectangle) => ({
-      x: Math.min(position.x, rectangle.x),
-      y: Math.min(position.y, rectangle.y),
-    }),
-    { x: Number.POSITIVE_INFINITY, y: Number.POSITIVE_INFINITY },
+export function getNotesInPrintOrder(
+  annotations: readonly PdfAnnotation[],
+  notes: readonly Note[],
+  noteAnchors: readonly NoteAnchor[] = [],
+): Note[] {
+  return createPrintSourceGroups(annotations, notes, noteAnchors)
+    .flatMap((group) => group.notes);
+}
+
+function findOrCreateGroup(
+  groups: WorkingPrintSourceGroup[],
+  source: PdfSourceGeometry,
+): WorkingPrintSourceGroup {
+  const existing = groups.find((group) =>
+    group.sources.some((candidate) => isSameLogicalPdfSource(candidate, source)),
   );
+  if (existing) {
+    existing.sources.push(source);
+    existing.rects.push(...source.rects.map((rectangle) => ({ ...rectangle })));
+    existing.sourceText = chooseSourceText(existing.sourceText, source.text);
+    existing.sourceOffset = minimumOptional(existing.sourceOffset, source.startOffset);
+    existing.createdAt = Math.min(existing.createdAt, source.createdAt);
+    return existing;
+  }
+  const group: WorkingPrintSourceGroup = {
+    id: `source:${source.id}`,
+    pageNumber: source.pageNumber,
+    rects: source.rects.map((rectangle) => ({ ...rectangle })),
+    sourceText: source.text,
+    sourceOffset: source.startOffset,
+    createdAt: source.createdAt,
+    annotations: [],
+    notes: [],
+    sources: [source],
+  };
+  groups.push(group);
+  return group;
+}
+
+function comparePrintSourceGroups(first: PrintSourceGroup, second: PrintSourceGroup): number {
+  return comparePdfSourcePosition(
+    {
+      id: first.id,
+      pageNumber: first.pageNumber,
+      rects: first.rects,
+      createdAt: first.createdAt,
+      startOffset: first.sourceOffset,
+    },
+    {
+      id: second.id,
+      pageNumber: second.pageNumber,
+      rects: second.rects,
+      createdAt: second.createdAt,
+      startOffset: second.sourceOffset,
+    },
+  );
+}
+
+function annotationTypeOrder(annotation: PdfAnnotation): number {
+  return annotation.type === 'highlight' ? 0 : 1;
+}
+
+function chooseSourceText(first: string, second: string): string {
+  const firstDisplay = formatPdfSourceTextForDisplay(first);
+  const secondDisplay = formatPdfSourceTextForDisplay(second);
+  return secondDisplay.length > firstDisplay.length ? second : first;
+}
+
+function minimumOptional(first: number | undefined, second: number | undefined): number | undefined {
+  if (first === undefined) return second;
+  if (second === undefined) return first;
+  return Math.min(first, second);
 }

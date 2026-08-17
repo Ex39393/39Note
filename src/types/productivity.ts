@@ -11,6 +11,7 @@ export interface PrintDraftAddition {
 export interface PrintDraftRecord {
   documentId: string;
   sourceFingerprint: string;
+  sourceModelVersion: number;
   editorStateJson: string;
   layout: NotesPrintLayout;
   createdAt: number;

@@ -294,6 +294,12 @@ function sanitizePrintDraft(
   return {
     documentId: expectedDocumentId,
     sourceFingerprint: value.sourceFingerprint.slice(0, 256),
+    sourceModelVersion:
+      typeof value.sourceModelVersion === 'number' &&
+      Number.isInteger(value.sourceModelVersion) &&
+      value.sourceModelVersion > 0
+        ? value.sourceModelVersion
+        : 1,
     editorStateJson: value.editorStateJson,
     layout: value.layout as PrintDraftRecord['layout'],
     createdAt: value.createdAt,

@@ -16,7 +16,12 @@ import { LargeNoteEditor } from './LargeNoteEditor';
 import { WebLocalDataNotice } from './WebLocalDataNotice';
 import { AnnotatedPdfExportDialog } from './AnnotatedPdfExportDialog';
 import type { AnnotationFilterState } from './pdf/AnnotationFilterControl';
-import type { HighlightColor, PdfAnnotation, UnderlineColor } from '../types/highlight';
+import type {
+  AnnotationType,
+  HighlightColor,
+  PdfAnnotation,
+  UnderlineColor,
+} from '../types/highlight';
 import type { Note } from '../types/note';
 import type { NoteAnchor } from '../types/noteAnchor';
 import type {
@@ -43,6 +48,7 @@ import {
   createNoteAnchorFromAnnotation,
   createNoteAnchorFromSelection,
   findMatchingNote,
+  findMatchingNoteForSources,
 } from '../utils/annotationOverlap';
 import {
   deleteDocumentState,
@@ -59,6 +65,8 @@ import {
 import {
   createHighlightsFromSelections,
   createUnderlinesFromSelections,
+  createAnnotationFromSource,
+  addAnnotationFromSourceIfMissing,
   upsertAnnotations,
 } from '../utils/highlights';
 import { exportNotesAsPdf } from '../utils/noteExport';
@@ -575,6 +583,61 @@ export function AppLayout() {
     [annotations, isDocumentHydrated, nextNoteNumber, noteAnchors, notes],
   );
 
+  const addNoteFromMarkedSource = useCallback(
+    (sourceAnnotations: PdfAnnotation[]) => {
+      if (!isDocumentHydrated || sourceAnnotations.length === 0) return;
+      const existingNote = findMatchingNoteForSources(
+        sourceAnnotations,
+        notes,
+        annotations,
+        noteAnchors,
+      );
+      if (existingNote) {
+        setFocusedNoteId(existingNote.id);
+        setIsNotesDrawerOpen(true);
+        viewerRef.current?.navigateToAnnotation(existingNote.annotationId);
+        return;
+      }
+      const source = sourceAnnotations[0];
+      const anchor = createNoteAnchorFromAnnotation(source);
+      const timestamp = Date.now();
+      const note: Note = {
+        id: crypto.randomUUID(),
+        annotationId: anchor.id,
+        pageNumber: anchor.pageNumber,
+        displayNumber: String(nextNoteNumber),
+        selectedText: anchor.text,
+        content: '',
+        createdAt: timestamp,
+        updatedAt: timestamp,
+      };
+      setNoteAnchors((currentAnchors) => [...currentAnchors, anchor]);
+      setNotes((currentNotes) => [note, ...currentNotes]);
+      setNextNoteNumber((currentNumber) => currentNumber + 1);
+      setFocusedNoteId(note.id);
+      setIsNotesDrawerOpen(true);
+    },
+    [annotations, isDocumentHydrated, nextNoteNumber, noteAnchors, notes],
+  );
+
+  const createAnnotationFromNoteSource = useCallback(
+    (
+      source: PdfAnnotation | NoteAnchor,
+      type: AnnotationType,
+      color: HighlightColor | UnderlineColor,
+    ) => {
+      if (!isDocumentHydrated) return;
+      const nextAnnotation = type === 'highlight'
+        ? createAnnotationFromSource(source, type, color as HighlightColor)
+        : createAnnotationFromSource(source, type, color as UnderlineColor);
+      if (!nextAnnotation) return;
+      setAnnotations((currentAnnotations) =>
+        addAnnotationFromSourceIfMissing(currentAnnotations, nextAnnotation),
+      );
+    },
+    [isDocumentHydrated],
+  );
+
   const updateNote = useCallback((noteId: string, content: string) => {
     setNotes((currentNotes) =>
       currentNotes.map((note) =>
@@ -725,6 +788,7 @@ export function AppLayout() {
       notes,
       documentDisplayTitle ?? file?.name ?? '39Note',
       annotations,
+      noteAnchors,
       glossaryEntries,
       layout,
       completeExport,
@@ -739,7 +803,7 @@ export function AppLayout() {
 
     pdfExportCleanupRef.current = cleanup;
     setExportWarning(null);
-  }, [annotations, documentDisplayTitle, file, glossaryEntries, isPdfExporting, notes]);
+  }, [annotations, documentDisplayTitle, file, glossaryEntries, isPdfExporting, noteAnchors, notes]);
 
   const exportAnnotatedPdf = useCallback(
     async (options: AnnotatedPdfExportOptions) => {
@@ -1547,7 +1611,9 @@ export function AppLayout() {
       },
       navigationEpoch: expectedNavigationEpoch,
     });
-    viewerRef.current?.navigateToAnnotation(targetAnnotation.id);
+    viewerRef.current?.navigateToAnnotation(targetAnnotation.id, {
+      showSourceActions: Boolean(targetNote),
+    });
   }, [
     annotations,
     commitDocumentOpenRequest,
@@ -1573,7 +1639,9 @@ export function AppLayout() {
 
     // Focusing the editor can happen before the target page has completed layout.
     // Retrying is safe, but only Viewer may report that annotation navigation applied.
-    viewerRef.current?.navigateToAnnotation(pendingNavigation.annotationId);
+    viewerRef.current?.navigateToAnnotation(pendingNavigation.annotationId, {
+      showSourceActions: true,
+    });
   }, []);
 
   const navigateToNote = useCallback(
@@ -1771,6 +1839,8 @@ export function AppLayout() {
           onRemoveAnnotation={removeAnnotation}
           notedAnnotationIds={notes.map((note) => note.annotationId)}
           onAddNote={addNoteFromSelection}
+          onAnnotationTap={addNoteFromMarkedSource}
+          onCreateAnnotationFromSource={createAnnotationFromNoteSource}
           zoomOperationId={zoomOperationId}
           annotationFilter={annotationFilter}
           onPdfDocumentChange={setPdfDocument}
@@ -1899,6 +1969,7 @@ export function AppLayout() {
             documentTitle={documentDisplayTitle ?? file?.name ?? '39Note'}
             notes={notes}
             annotations={annotations}
+            noteAnchors={noteAnchors}
             glossaryEntries={glossaryEntries}
             initialLayout={printComposerLayout}
             onClose={() => setIsPrintComposerOpen(false)}

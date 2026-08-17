@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { $generateHtmlFromNodes } from '@lexical/html';
 import type { LexicalEditor } from 'lexical';
 import type { Note } from '../types/note';
+import type { NoteAnchor } from '../types/noteAnchor';
 import {
   notesPrintLayouts,
   type GlossaryEntry,
@@ -15,7 +16,10 @@ import {
   savePrintDraft,
 } from '../services/productivityPersistence';
 import { PrintComposerEditor } from './PrintComposerEditor';
-import { createPrintSourceFingerprint } from './printDraftModel';
+import {
+  createPrintSourceFingerprint,
+  PRINT_SOURCE_MODEL_VERSION,
+} from './printDraftModel';
 import { printComposerHtml } from './printComposerOutput';
 
 interface PrintComposerProps {
@@ -23,6 +27,7 @@ interface PrintComposerProps {
   documentTitle: string;
   notes: readonly Note[];
   annotations: readonly PdfAnnotation[];
+  noteAnchors: readonly NoteAnchor[];
   glossaryEntries: readonly GlossaryEntry[];
   initialLayout: NotesPrintLayout;
   onClose: () => void;
@@ -33,6 +38,7 @@ export function PrintComposer({
   documentTitle,
   notes,
   annotations,
+  noteAnchors,
   glossaryEntries,
   initialLayout,
   onClose,
@@ -44,8 +50,9 @@ export function PrintComposer({
         notes,
         glossaryEntries,
         annotations,
+        noteAnchors,
       ),
-    [annotations, documentTitle, glossaryEntries, notes],
+    [annotations, documentTitle, glossaryEntries, noteAnchors, notes],
   );
   const [draft, setDraft] = useState<PrintDraftRecord | null>(null);
   const [isLoading, setIsLoading] = useState(true);
@@ -195,7 +202,8 @@ export function PrintComposer({
     );
   }
 
-  const sourceChanged = draft.sourceFingerprint !== sourceFingerprint;
+  const sourceFormatChanged = draft.sourceModelVersion < PRINT_SOURCE_MODEL_VERSION;
+  const sourceChanged = sourceFormatChanged || draft.sourceFingerprint !== sourceFingerprint;
   if (decision === 'existing') {
     return (
       <div
@@ -212,7 +220,9 @@ export function PrintComposer({
           </p>
           {sourceChanged ? (
             <p className="print-source-change-notice" role="status">
-              Print sources have changed since this draft was created.
+              {sourceFormatChanged
+                ? 'Print-source formatting/order has changed since this draft was created.'
+                : 'Print sources have changed since this draft was created.'}
             </p>
           ) : null}
           <div>
@@ -290,7 +300,9 @@ export function PrintComposer({
         </header>
         {sourceChanged ? (
           <div className="print-source-change-banner" role="status">
-            <span>Print sources have changed since this draft was created.</span>
+            <span>{sourceFormatChanged
+              ? 'Print-source formatting/order has changed since this draft was created.'
+              : 'Print sources have changed since this draft was created.'}</span>
             <button type="button" onClick={() => regenerate()}>
               Regenerate from sources
             </button>
@@ -306,6 +318,7 @@ export function PrintComposer({
           documentTitle={documentTitle}
           notes={notes}
           annotations={annotations}
+          noteAnchors={noteAnchors}
           glossaryEntries={glossaryEntries}
           layout={draft.layout}
           initialEditorStateJson={draft.editorStateJson}
@@ -337,6 +350,7 @@ function createFreshDraft(
   return {
     documentId,
     sourceFingerprint,
+    sourceModelVersion: PRINT_SOURCE_MODEL_VERSION,
     editorStateJson: '',
     layout,
     createdAt: timestamp,

@@ -7,6 +7,8 @@ import type {
   UnderlineColor,
 } from '../types/highlight';
 import type { PdfTextSelection, PdfTextSelectionRectangle } from '../types/textSelection';
+import type { NoteAnchor } from '../types/noteAnchor';
+import { isSameLogicalPdfSource } from './pdfSourceGeometry.ts';
 
 interface HighlightRenderGroup {
   color: HighlightColor;
@@ -27,6 +29,38 @@ export function createUnderlinesFromSelections(
   color: UnderlineColor,
 ): UnderlineAnnotation[] {
   return createAnnotationsFromSelections(selections, 'underline', color);
+}
+
+export function createAnnotationFromSource<TType extends PdfAnnotation['type']>(
+  source: PdfAnnotation | NoteAnchor,
+  type: TType,
+  color: Extract<PdfAnnotation, { type: TType }>['color'],
+  id = crypto.randomUUID(),
+  timestamp = Date.now(),
+): Extract<PdfAnnotation, { type: TType }> | null {
+  if (!source.text.trim() || source.rects.length === 0) return null;
+  return {
+    id,
+    type,
+    pageNumber: source.pageNumber,
+    text: source.text,
+    rects: source.rects.map((rectangle) => ({ ...rectangle })),
+    color,
+    createdAt: timestamp,
+    updatedAt: timestamp,
+  } as Extract<PdfAnnotation, { type: TType }>;
+}
+
+export function addAnnotationFromSourceIfMissing(
+  annotations: readonly PdfAnnotation[],
+  nextAnnotation: PdfAnnotation,
+): PdfAnnotation[] {
+  return annotations.some((annotation) =>
+    annotation.type === nextAnnotation.type &&
+    isSameLogicalPdfSource(annotation, nextAnnotation),
+  )
+    ? [...annotations]
+    : [...annotations, nextAnnotation];
 }
 
 function createAnnotationsFromSelections<TType extends PdfAnnotation['type']>(

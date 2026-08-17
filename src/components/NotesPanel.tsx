@@ -8,6 +8,7 @@ import {
 import type { Note } from '../types/note';
 import type { GlossaryEntry, NotesPrintLayout } from '../types/glossary';
 import { getDefaultPrintLayout } from '../utils/glossary';
+import { formatPdfSourceTextForDisplay } from '../utils/pdfSourceText';
 import { DrawerEdgeHandle } from './DrawerEdgeHandle';
 
 interface NotesPanelProps {
@@ -414,7 +415,7 @@ function NoteCard({
       className={`note-card ${isDragging ? 'is-dragging' : ''}`}
       onClick={() => onNavigate(note)}
     >
-      <blockquote>{note.selectedText}</blockquote>
+      <blockquote>{formatPdfSourceTextForDisplay(note.selectedText)}</blockquote>
       <div className="note-card-meta">
         <div className="note-card-location">
           <button

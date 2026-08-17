@@ -45,6 +45,7 @@ import {
   findMatchingNote,
   findOverlappingAnnotations,
 } from '../utils/annotationOverlap';
+import { isSameLogicalPdfSource } from '../utils/pdfSourceGeometry';
 import { markDefinitionBubbleAdded } from '../utils/glossary';
 
 GlobalWorkerOptions.workerSrc = pdfWorker;
@@ -75,6 +76,12 @@ interface ViewerProps {
   onRemoveAnnotation: (annotationId: string) => void;
   notedAnnotationIds: string[];
   onAddNote: (selections: PdfTextSelection[]) => void;
+  onAnnotationTap: (annotations: PdfAnnotation[]) => void;
+  onCreateAnnotationFromSource: (
+    source: PdfAnnotation | NoteAnchor,
+    type: AnnotationType,
+    color: HighlightColor | UnderlineColor,
+  ) => void;
   zoomOperationId: number;
   onSearchStateChange?: (state: PdfSearchToolbarState) => void;
   annotationFilter: AnnotationFilterState;
@@ -94,7 +101,10 @@ export interface PdfSearchToolbarState {
 
 export interface ViewerHandle {
   captureZoomAnchor: (operationId: number) => void;
-  navigateToAnnotation: (annotationId: string) => boolean;
+  navigateToAnnotation: (
+    annotationId: string,
+    options?: { showSourceActions?: boolean },
+  ) => boolean;
   navigateToGlossaryEntry: (glossaryEntryId: string) => boolean;
   goToPage: (pageNumber: number) => void;
   openSearch: () => void;
@@ -140,6 +150,8 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(function Viewer({
   onRemoveAnnotation,
   notedAnnotationIds,
   onAddNote,
+  onAnnotationTap,
+  onCreateAnnotationFromSource,
   zoomOperationId,
   onSearchStateChange,
   annotationFilter,
@@ -160,6 +172,11 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(function Viewer({
   const restoreFrameRef = useRef<number | null>(null);
   const highlightIndicatorTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pendingAnnotationNavigationRef = useRef<string | null>(null);
+  const pendingSourceActionRef = useRef<{
+    annotationId: string;
+    documentId: string;
+  } | null>(null);
+  const sourceActionFrameRef = useRef<number | null>(null);
   const pendingReadingRestoreRef = useRef<PendingReadingRestore | null>(null);
   const lastSearchNavigationIdRef = useRef<string | null>(null);
   const pendingSearchNavigationRef = useRef<{
@@ -174,6 +191,9 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(function Viewer({
     left: number;
     top: number;
   } | null>(null);
+  const [sourceActionTarget, setSourceActionTarget] = useState<
+    PdfAnnotation | NoteAnchor | null
+  >(null);
   const [annotationType, setAnnotationType] = useState<AnnotationType | null>(null);
   const [highlightColor, setHighlightColor] = useState<HighlightColor>('yellow');
   const [underlineColor, setUnderlineColor] = useState<UnderlineColor>('blue');
@@ -262,6 +282,7 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(function Viewer({
     const preferredViewportY = scrollerRectangle.top + scroller.clientHeight * 0.4;
     const maximumScrollTop = Math.max(0, scroller.scrollHeight - scroller.clientHeight);
     navigationEpochRef.current += 1;
+    const appliedNavigationEpoch = navigationEpochRef.current;
     scroller.scrollTop = clamp(
       scroller.scrollTop + annotationAnchorY - preferredViewportY,
       0,
@@ -279,13 +300,53 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(function Viewer({
     }, 1200);
     pendingAnnotationNavigationRef.current = null;
     onAnnotationNavigationApplied?.(annotationId);
+    const pendingSourceAction = pendingSourceActionRef.current;
+    if (
+      pendingSourceAction?.annotationId === annotationId &&
+      pendingSourceAction.documentId === documentId
+    ) {
+      if (sourceActionFrameRef.current !== null) {
+        cancelAnimationFrame(sourceActionFrameRef.current);
+      }
+      sourceActionFrameRef.current = requestAnimationFrame(() => {
+        sourceActionFrameRef.current = null;
+        if (
+          pendingSourceActionRef.current !== pendingSourceAction ||
+          navigationEpochRef.current !== appliedNavigationEpoch ||
+          pendingSourceAction.documentId !== documentId
+        ) {
+          return;
+        }
+        const currentPage = scrollRef.current?.querySelector<HTMLElement>(
+          `#page-${annotation.pageNumber}`,
+        );
+        const position = currentPage
+          ? getSourceActionPosition(currentPage, annotation)
+          : null;
+        if (!position) return;
+        pendingSourceActionRef.current = null;
+        textSelectionRef.current = [];
+        setSourceActionTarget(annotation);
+        setSelectionActionPosition(position);
+        setAnnotationType(null);
+      });
+    }
     return true;
-  }, [annotations, noteAnchors, onAnnotationNavigationApplied, onExplicitNavigation]);
+  }, [annotations, documentId, noteAnchors, onAnnotationNavigationApplied, onExplicitNavigation]);
 
-  const navigateToAnnotation = useCallback((annotationId: string) => {
+  const navigateToAnnotation = useCallback((
+    annotationId: string,
+    options?: { showSourceActions?: boolean },
+  ) => {
     pendingAnnotationNavigationRef.current = annotationId;
+    if (options?.showSourceActions && documentId) {
+      pendingSourceActionRef.current = { annotationId, documentId };
+    } else {
+      pendingSourceActionRef.current = null;
+      setSourceActionTarget(null);
+    }
     return applyAnnotationNavigation(annotationId);
-  }, [applyAnnotationNavigation]);
+  }, [applyAnnotationNavigation, documentId]);
 
   const navigateToGlossaryEntry = useCallback((glossaryEntryId: string) => {
     const entry = glossaryEntries.find(
@@ -692,10 +753,16 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(function Viewer({
     (selection: PdfTextSelection[]) => {
       textSelectionRef.current = selection;
       onTextSelectionChange?.(selection);
-      setSelectionActionPosition(getSelectionActionPosition(selection));
+      if (selection.length > 0) {
+        pendingSourceActionRef.current = null;
+        setSourceActionTarget(null);
+        setSelectionActionPosition(getSelectionActionPosition(selection));
+      } else if (!sourceActionTarget) {
+        setSelectionActionPosition(null);
+      }
       setAnnotationType(null);
     },
-    [onTextSelectionChange],
+    [onTextSelectionChange, sourceActionTarget],
   );
 
   usePdfTextSelection(scrollElement, handleTextSelectionChange);
@@ -762,6 +829,9 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(function Viewer({
       if (highlightIndicatorTimeoutRef.current !== null) {
         clearTimeout(highlightIndicatorTimeoutRef.current);
       }
+      if (sourceActionFrameRef.current !== null) {
+        cancelAnimationFrame(sourceActionFrameRef.current);
+      }
     },
     [],
   );
@@ -780,6 +850,8 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(function Viewer({
       if (selectionActionPosition) {
         window.getSelection()?.removeAllRanges();
         setSelectionActionPosition(null);
+        setSourceActionTarget(null);
+        pendingSourceActionRef.current = null;
       } else if (search.isOpen) {
         search.close();
       }
@@ -793,6 +865,9 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(function Viewer({
     if (!file) {
       setDocument(null);
       pendingAnnotationNavigationRef.current = null;
+      pendingSourceActionRef.current = null;
+      setSourceActionTarget(null);
+      setSelectionActionPosition(null);
       pendingReadingRestoreRef.current = null;
       onPdfDocumentChange?.(null);
       setError(null);
@@ -838,6 +913,9 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(function Viewer({
 
   useEffect(() => {
     setSearchPanelPosition(null);
+    pendingSourceActionRef.current = null;
+    setSourceActionTarget(null);
+    setSelectionActionPosition(null);
     dictionaryGenerationRef.current += 1;
     dictionaryLookupsRef.current.forEach((controller) => controller.abort());
     dictionaryLookupsRef.current.clear();
@@ -919,6 +997,15 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(function Viewer({
   };
 
   const createAnnotation = () => {
+    if (sourceActionTarget && annotationType) {
+      onCreateAnnotationFromSource(
+        sourceActionTarget,
+        annotationType,
+        annotationType === 'highlight' ? highlightColor : underlineColor,
+      );
+      setAnnotationType(null);
+      return;
+    }
     if (annotationType === 'highlight') {
       onCreateHighlights(textSelectionRef.current, highlightColor);
     } else if (annotationType === 'underline') {
@@ -1029,6 +1116,7 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(function Viewer({
                   onToggleDefinitionsExpanded={toggleDefinitionsExpanded}
                   onPageLayoutChange={handlePageLayoutChange}
                   onTextLayerReady={handleTextLayerReady}
+                  onAnnotationTap={onAnnotationTap}
                   searchResults={search.results.filter((result) => result.pageNumber === index + 1)}
                   activeSearchResultId={search.activeResult?.id ?? null}
                   pageNumber={index + 1}
@@ -1048,31 +1136,40 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(function Viewer({
           annotationType={annotationType}
           onAnnotationTypeChange={setAnnotationType}
           onApply={createAnnotation}
-          noteLabel={
-            findMatchingNote(
-              textSelectionRef.current,
-              notes,
-              annotations,
-              noteAnchors,
-            )
-              ? 'Open Note'
-              : 'Add Note'
-          }
-          onNote={() => {
-            onAddNote(textSelectionRef.current);
-            window.getSelection()?.removeAllRanges();
-            setSelectionActionPosition(null);
-          }}
-          deleteActions={createSelectionDeleteActions(
-            findOverlappingAnnotations(textSelectionRef.current, annotations),
-            (annotationId) => {
-              onRemoveAnnotation(annotationId);
-              window.getSelection()?.removeAllRanges();
-              setSelectionActionPosition(null);
-            },
-          )}
+          existingAnnotationTypes={sourceActionTarget
+            ? annotations
+                .filter((annotation) => isSameLogicalPdfSource(sourceActionTarget, annotation))
+                .map((annotation) => annotation.type)
+            : []}
+          noteLabel={sourceActionTarget
+            ? undefined
+            : findMatchingNote(
+                textSelectionRef.current,
+                notes,
+                annotations,
+                noteAnchors,
+              )
+                ? 'Open Note'
+                : 'Add Note'}
+          onNote={sourceActionTarget
+            ? undefined
+            : () => {
+                onAddNote(textSelectionRef.current);
+                window.getSelection()?.removeAllRanges();
+                setSelectionActionPosition(null);
+              }}
+          deleteActions={sourceActionTarget
+            ? []
+            : createSelectionDeleteActions(
+                findOverlappingAnnotations(textSelectionRef.current, annotations),
+                (annotationId) => {
+                  onRemoveAnnotation(annotationId);
+                  window.getSelection()?.removeAllRanges();
+                  setSelectionActionPosition(null);
+                },
+              )}
           onLookupWord={
-            getDictionaryLookupSelection(textSelectionRef.current)
+            !sourceActionTarget && getDictionaryLookupSelection(textSelectionRef.current)
               ? activateDictionaryLookup
               : undefined
           }
@@ -1141,6 +1238,24 @@ function getSelectionActionPosition(
   return {
     left: Math.min(Math.max(anchor.left, 8), Math.max(8, window.innerWidth - 390)),
     top: Math.max(anchor.top - 42, 8),
+  };
+}
+
+function getSourceActionPosition(
+  page: HTMLElement,
+  source: PdfAnnotation | NoteAnchor,
+): { left: number; top: number } | null {
+  const firstRectangle = [...source.rects]
+    .filter((rectangle) => rectangle.width > 0 && rectangle.height > 0)
+    .sort((first, second) => first.y - second.y || first.x - second.x)[0];
+  if (!firstRectangle) return null;
+  const pageRectangle = page.getBoundingClientRect();
+  if (pageRectangle.width <= 0 || pageRectangle.height <= 0) return null;
+  const sourceLeft = pageRectangle.left + firstRectangle.x * pageRectangle.width;
+  const sourceTop = pageRectangle.top + firstRectangle.y * pageRectangle.height;
+  return {
+    left: Math.min(Math.max(sourceLeft, 8), Math.max(8, window.innerWidth - 390)),
+    top: Math.max(sourceTop - 42, 8),
   };
 }
 

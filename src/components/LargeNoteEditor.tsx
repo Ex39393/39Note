@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import type { Note } from '../types/note';
+import { formatPdfSourceTextForDisplay } from '../utils/pdfSourceText';
 
 interface LargeNoteEditorProps {
   note: Note;
@@ -76,7 +77,7 @@ export function LargeNoteEditor({
         </div>
         <section className="large-note-source" aria-label="Selected source text">
           <h3>Selected source text</h3>
-          <blockquote>{note.selectedText.trim() || 'Source text unavailable'}</blockquote>
+          <blockquote>{formatPdfSourceTextForDisplay(note.selectedText) || 'Source text unavailable'}</blockquote>
         </section>
         <label className="large-note-content">
           <span>Your note</span>

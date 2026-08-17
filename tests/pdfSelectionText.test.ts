@@ -6,6 +6,7 @@ import {
   type PdfSelectionTextFragment,
   type PdfSelectionTextFragmentRectangle,
 } from '../src/utils/textSelection.ts';
+import { formatPdfSourceTextForDisplay } from '../src/utils/pdfSourceText.ts';
 
 test('preserves an existing literal whitespace boundary', () => {
   assert.equal(
@@ -24,6 +25,16 @@ test('infers missing whitespace from a meaningful same-line visual gap', () => {
       fragment('no difference', rectangle(62, 0, 82, 14), 1),
     ]),
     'There was no difference',
+  );
+});
+
+test('infers the second reported factual/questions word boundary', () => {
+  assert.equal(
+    reconstructPdfSelectionText([
+      fragment('factual', rectangle(0, 0, 42, 14), 0),
+      fragment('questions', rectangle(46, 0, 58, 14), 1),
+    ]),
+    'factual questions',
   );
 });
 
@@ -86,6 +97,28 @@ test('keeps hyphenated token fragments attached', () => {
       fragment('being', rectangle(28.6, 0, 31, 14), 2),
     ]),
     'well-being',
+  );
+});
+
+test('preserves legitimate compounds and COVID-19 exactly', () => {
+  assert.equal(
+    reconstructPdfSelectionText([
+      fragment('well-being COVID-19', rectangle(0, 0, 132, 14), 0),
+    ]),
+    'well-being COVID-19',
+  );
+});
+
+test('removes only genuine U+00AD soft hyphens from source presentation', () => {
+  const source = 'signifi\u00adcant - ‐ ‑ – — evidence-based';
+  const displayed = formatPdfSourceTextForDisplay(source);
+  assert.equal(displayed, 'significant - ‐ ‑ – — evidence-based');
+  assert.equal([...displayed].some((character) => character.codePointAt(0) === 0x00ad), false);
+  assert.equal(
+    reconstructPdfSelectionText([
+      fragment('signifi\u00adcant', rectangle(0, 0, 70, 14), 0),
+    ]),
+    'significant',
   );
 });
 

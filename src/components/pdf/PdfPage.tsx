@@ -5,6 +5,7 @@ import {
   useRef,
   useState,
   type CSSProperties,
+  type PointerEvent as ReactPointerEvent,
 } from 'react';
 import {
   TextLayer,
@@ -22,6 +23,12 @@ import {
 } from '../../types/highlight';
 import { correctTextLayerReadingOrder } from '../../utils/textLayerReadingOrder';
 import { getHighlightRenderGroups, normalizeAnnotationVisualGeometry } from '../../utils/highlights';
+import { findAnnotationsAtNormalizedPoint } from '../../utils/annotationOverlap';
+import {
+  isAnnotationTapInteractiveTarget,
+  isSimpleAnnotationTap,
+  type AnnotationPointerStart,
+} from '../../utils/annotationInteraction';
 import { DefinitionBubble } from './DefinitionBubble';
 
 type FitMode = 'width' | 'page' | null;
@@ -64,6 +71,7 @@ interface PdfPageProps {
   onToggleDefinitionsExpanded: (bubbleId: string) => void;
   onPageLayoutChange: (pageNumber: number) => void;
   onTextLayerReady: (pageNumber: number) => void;
+  onAnnotationTap: (annotations: PdfAnnotation[]) => void;
   searchResults: PdfSearchResult[];
   activeSearchResultId: string | null;
 }
@@ -90,12 +98,14 @@ export function PdfPage({
   onToggleDefinitionsExpanded,
   onPageLayoutChange,
   onTextLayerReady,
+  onAnnotationTap,
   searchResults,
   activeSearchResultId,
 }: PdfPageProps) {
   const shellRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const textLayerRef = useRef<HTMLDivElement>(null);
+  const annotationPointerStartRef = useRef<AnnotationPointerStart | null>(null);
   const [page, setPage] = useState<PDFPageProxy | null>(null);
   const [baseDimensions, setBaseDimensions] = useState<PageDimensions | null>(null);
   const [isNearViewport, setIsNearViewport] = useState(pageNumber === 1);
@@ -367,6 +377,34 @@ export function PdfPage({
   const activeAnnotation = [...annotations, ...noteAnchors].find(
     (annotation) => annotation.id === activeAnnotationId,
   );
+  const beginAnnotationTap = (event: ReactPointerEvent<HTMLDivElement>) => {
+    annotationPointerStartRef.current =
+      event.button === 0 && !isAnnotationTapInteractiveTarget(event.target)
+        ? {
+            pointerId: event.pointerId,
+            clientX: event.clientX,
+            clientY: event.clientY,
+          }
+        : null;
+  };
+  const completeAnnotationTap = (event: ReactPointerEvent<HTMLDivElement>) => {
+    const start = annotationPointerStartRef.current;
+    annotationPointerStartRef.current = null;
+    if (isAnnotationTapInteractiveTarget(event.target)) return;
+    const hasMeaningfulSelection = Boolean(window.getSelection()?.toString().trim());
+    if (!isSimpleAnnotationTap(start, event, hasMeaningfulSelection)) return;
+    const pageRectangle = event.currentTarget.getBoundingClientRect();
+    if (pageRectangle.width <= 0 || pageRectangle.height <= 0) return;
+    const hits = findAnnotationsAtNormalizedPoint(
+      pageNumber,
+      {
+        x: (event.clientX - pageRectangle.left) / pageRectangle.width,
+        y: (event.clientY - pageRectangle.top) / pageRectangle.height,
+      },
+      annotations,
+    );
+    if (hits.length > 0) onAnnotationTap(hits);
+  };
 
   return (
     <article
@@ -376,7 +414,14 @@ export function PdfPage({
       style={shellStyle}
       aria-label={`Page ${pageNumber}`}
     >
-      <div className="pdf-page-canvas">
+      <div
+        className="pdf-page-canvas"
+        onPointerCancel={() => {
+          annotationPointerStartRef.current = null;
+        }}
+        onPointerDown={beginAnnotationTap}
+        onPointerUp={completeAnnotationTap}
+      >
         <canvas ref={canvasRef} />
         {renderWarning ? (
           <p className="pdf-page-render-warning" role="status">

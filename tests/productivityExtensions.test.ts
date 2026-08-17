@@ -138,5 +138,9 @@ test('direct printing remains available beside edit-before-printing', () => {
   assert.match(composer, /notesPrintLayouts\.map/);
   assert.match(composer, /annotations=\{annotations\}/);
   assert.match(editor, /layout === 'all-annotations'/);
-  assert.match(editor, /createAnnotationBlock/);
+  assert.match(editor, /createSourceGroupBlock/);
+  assert.match(composer, /PRINT_SOURCE_MODEL_VERSION/);
+  assert.match(composer, /Keep draft/);
+  assert.match(composer, /Regenerate from sources/);
+  assert.match(composer, /Print-source formatting\/order has changed/);
 });

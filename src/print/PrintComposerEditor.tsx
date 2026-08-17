@@ -62,11 +62,16 @@ import {
   type LexicalNode,
 } from 'lexical';
 import type { Note } from '../types/note';
+import type { NoteAnchor } from '../types/noteAnchor';
 import type { GlossaryEntry, NotesPrintLayout } from '../types/glossary';
 import type { PdfAnnotation } from '../types/highlight';
 import type { PrintDraftAddition } from '../types/productivity';
-import { getAllAnnotationsPrintContent } from '../utils/annotationPrint';
+import {
+  getPrintModeContent,
+  type PrintSourceGroup,
+} from '../utils/annotationPrint';
 import { getDictionaryAttributionText } from '../utils/dictionary';
+import { formatPdfSourceTextForDisplay } from '../utils/pdfSourceText';
 import {
   $createPageBreakNode,
   $createPrintBlockNode,
@@ -80,6 +85,7 @@ interface PrintComposerEditorProps {
   documentTitle: string;
   notes: readonly Note[];
   annotations: readonly PdfAnnotation[];
+  noteAnchors: readonly NoteAnchor[];
   glossaryEntries: readonly GlossaryEntry[];
   layout: NotesPrintLayout;
   initialEditorStateJson: string;
@@ -93,6 +99,7 @@ export function PrintComposerEditor({
   documentTitle,
   notes,
   annotations,
+  noteAnchors,
   glossaryEntries,
   layout,
   initialEditorStateJson,
@@ -149,6 +156,7 @@ export function PrintComposerEditor({
         documentTitle={documentTitle}
         notes={notes}
         annotations={annotations}
+        noteAnchors={noteAnchors}
         glossaryEntries={glossaryEntries}
         layout={layout}
         pendingAdditions={pendingAdditions}
@@ -193,6 +201,7 @@ function InitialContentPlugin({
   documentTitle,
   notes,
   annotations,
+  noteAnchors,
   glossaryEntries,
   layout,
   pendingAdditions,
@@ -201,6 +210,7 @@ function InitialContentPlugin({
   documentTitle: string;
   notes: readonly Note[];
   annotations: readonly PdfAnnotation[];
+  noteAnchors: readonly NoteAnchor[];
   glossaryEntries: readonly GlossaryEntry[];
   layout: NotesPrintLayout;
   pendingAdditions: readonly PrintDraftAddition[];
@@ -219,16 +229,18 @@ function InitialContentPlugin({
       if (root.isEmpty() || hasOnlyEmptyDefaultContent) {
         root.clear();
         root.append(createTitleBlock(documentTitle));
+        const content = getPrintModeContent(
+          layout,
+          annotations,
+          notes,
+          noteAnchors,
+        );
         if (layout === 'all-annotations') {
-          const content = getAllAnnotationsPrintContent(annotations, notes);
-          for (const item of content.annotationItems) {
-            root.append(createAnnotationBlock(item.annotation, item.notes));
-          }
-          for (const note of content.standaloneNotes) {
-            root.append(createNoteBlock(note));
-          }
+          for (const group of content) root.append(createSourceGroupBlock(group));
         } else {
-          for (const note of notes) root.append(createNoteBlock(note));
+          for (const group of content) {
+            for (const note of group.notes) root.append(createNoteBlock(note));
+          }
         }
         for (const entry of glossaryEntries) root.append(createGlossaryBlock(entry));
         if (glossaryEntries.length > 0) {
@@ -246,6 +258,7 @@ function InitialContentPlugin({
     editor,
     glossaryEntries,
     layout,
+    noteAnchors,
     notes,
     onPendingAdditionsConsumed,
     pendingAdditions,
@@ -863,7 +876,9 @@ function createNoteBlock(note: Note): PrintBlockNode {
   const heading = $createHeadingNode('h2');
   heading.append($createTextNode(label));
   const source = $createQuoteNode();
-  source.append($createTextNode(note.selectedText || 'Source text unavailable'));
+  source.append($createTextNode(
+    formatPdfSourceTextForDisplay(note.selectedText) || 'Source text unavailable',
+  ));
   const body = $createParagraphNode();
   body.append($createTextNode(note.content || ''));
   const page = $createParagraphNode();
@@ -872,23 +887,26 @@ function createNoteBlock(note: Note): PrintBlockNode {
   return block;
 }
 
-function createAnnotationBlock(
-  annotation: PdfAnnotation,
-  notes: readonly Note[],
-): PrintBlockNode {
-  const typeLabel = annotation.type === 'highlight' ? 'Highlight' : 'Underline';
-  const label = `${typeLabel} · Page ${annotation.pageNumber}`;
+function createSourceGroupBlock(group: PrintSourceGroup): PrintBlockNode {
+  const typeLabel = group.annotations.length > 0
+    ? [...new Set(group.annotations.map((annotation) =>
+        annotation.type === 'highlight' ? 'Highlight' : 'Underline'
+      ))].join(' · ')
+    : 'Note';
+  const label = `${typeLabel} · Page ${group.pageNumber}`;
   const block = $createPrintBlockNode(
-    `annotation:${annotation.id}`,
+    group.id,
     label,
-    'annotation',
+    group.annotations.length > 0 ? 'annotation' : 'note',
   );
   const heading = $createHeadingNode('h2');
   heading.append($createTextNode(label));
   const source = $createQuoteNode();
-  source.append($createTextNode(annotation.text || 'Source text unavailable'));
+  source.append($createTextNode(
+    formatPdfSourceTextForDisplay(group.sourceText) || 'Source text unavailable',
+  ));
   block.append(heading, source);
-  for (const note of notes) {
+  for (const note of group.notes) {
     const paragraph = $createParagraphNode();
     const noteLabel = $createTextNode(
       `${note.displayNumber.trim() || 'Note'}. `,

@@ -1,4 +1,5 @@
 import type { Note } from '../types/note';
+import type { NoteAnchor } from '../types/noteAnchor';
 import {
   highlightColors,
   underlineColors,
@@ -8,8 +9,9 @@ import type { GlossaryEntry, NotesPrintLayout } from '../types/glossary';
 import { getPrintContentItems, getPrintLayoutClass } from './glossary';
 import { createIdempotentCleanup, getPrintLayoutCss } from './printSession';
 import { getDictionaryAttributionText } from './dictionary';
-import { getPrintModeContent } from './annotationPrint';
+import { getPrintModeContent, type PrintSourceGroup } from './annotationPrint';
 import { formatGlossaryEntryForPrint } from './glossaryPrint';
+import { formatPdfSourceTextForDisplay } from './pdfSourceText';
 
 export function exportNotesAsMarkdown(notes: Note[], documentTitle: string): boolean {
   if (notes.length === 0) {
@@ -33,6 +35,7 @@ export function exportNotesAsPdf(
   notes: Note[],
   documentTitle: string,
   annotations: PdfAnnotation[],
+  noteAnchors: NoteAnchor[],
   glossaryEntries: GlossaryEntry[],
   layout: NotesPrintLayout,
   onComplete: () => void,
@@ -97,7 +100,14 @@ export function exportNotesAsPdf(
   window.addEventListener('pagehide', cleanup, { once: true });
   printWindow.document.open();
   printWindow.document.write(
-    createNotesPrintDocument(notes, documentTitle, annotations, glossaryEntries, layout),
+    createNotesPrintDocument(
+      notes,
+      documentTitle,
+      annotations,
+      noteAnchors,
+      glossaryEntries,
+      layout,
+    ),
   );
   printWindow.document.close();
   printWindow.addEventListener('load', printWhenReady, { once: true });
@@ -106,15 +116,11 @@ export function exportNotesAsPdf(
 }
 
 function formatNoteForMarkdown(note: Note): string {
-  const sourceText = normalizeWhitespace(note.selectedText) || 'Source text unavailable.';
+  const sourceText = formatPdfSourceTextForDisplay(note.selectedText) || 'Source text unavailable.';
   const noteContent = note.content.replaceAll('\r\n', '\n').trimEnd();
   const noteHeading = formatNoteLabel(note.displayNumber);
 
   return `*${escapeItalicMarkdown(sourceText)}*\n\n${noteContent.length > 0 ? `${noteHeading} ${noteContent}` : noteHeading}`;
-}
-
-function normalizeWhitespace(value: string): string {
-  return value.replaceAll(/\s+/g, ' ').trim();
 }
 
 function escapeItalicMarkdown(value: string): string {
@@ -146,6 +152,7 @@ export function createNotesPrintDocument(
   notes: Note[],
   documentTitle: string,
   annotations: PdfAnnotation[],
+  noteAnchors: NoteAnchor[],
   glossaryEntries: GlossaryEntry[],
   layout: NotesPrintLayout,
 ): string {
@@ -153,31 +160,28 @@ export function createNotesPrintDocument(
   const exportDate = escapeHtml(new Intl.DateTimeFormat(undefined, {
     dateStyle: 'medium',
   }).format(new Date()));
-  const annotationsById = new Map(annotations.map((annotation) => [annotation.id, annotation]));
   const printContent = getPrintContentItems(notes, glossaryEntries);
-  const printModeContent = getPrintModeContent(layout, annotations, printContent.notes);
-  const standardNoteEntries = printModeContent.standaloneNotes
-    .map((note) => formatNoteForPrint(note, annotationsById.get(note.annotationId)))
+  const printModeContent = getPrintModeContent(
+    layout,
+    annotations,
+    printContent.notes,
+    noteAnchors,
+  );
+  const standardNoteEntries = printModeContent
+    .flatMap((group) =>
+      group.notes.map((note) => formatNoteForPrint(note, group.annotations[0])),
+    )
     .join('\n');
   const annotationSection =
-    layout === 'all-annotations' && printModeContent.annotationItems.length > 0
+    layout === 'all-annotations' && printModeContent.length > 0
       ? `<section class="annotations-print-section">
       <h2>All Annotations</h2>
-      ${printModeContent.annotationItems.map(formatAnnotationForPrint).join('\n')}
-    </section>`
-      : '';
-  const standaloneNotesSection =
-    layout === 'all-annotations' && printModeContent.standaloneNotes.length > 0
-      ? `<section class="standalone-notes-print-section">
-      <h2>Notes</h2>
-      ${printModeContent.standaloneNotes
-        .map((note) => formatNoteForPrint(note, undefined))
-        .join('\n')}
+      ${printModeContent.map(formatSourceGroupForPrint).join('\n')}
     </section>`
       : '';
   const noteEntries =
     layout === 'all-annotations'
-      ? `${annotationSection}\n${standaloneNotesSection}`
+      ? annotationSection
       : standardNoteEntries;
   const glossary = printContent.glossaryEntries;
   const dictionaryAttribution = getDictionaryAttributionText(
@@ -243,19 +247,24 @@ export function createNotesPrintDocument(
 </html>`;
 }
 
-function formatAnnotationForPrint({
-  annotation,
-  notes,
-}: ReturnType<typeof getPrintModeContent>['annotationItems'][number]): string {
-  const palette =
+function formatSourceGroupForPrint(group: PrintSourceGroup): string {
+  const annotationLabel = group.annotations.length > 0
+    ? [...new Set(group.annotations.map((annotation) =>
+        annotation.type === 'highlight' ? 'Highlight' : 'Underline'
+      ))].join(' · ')
+    : 'Note';
+  const palettes = group.annotations.map((annotation) =>
     annotation.type === 'highlight'
       ? highlightColors[annotation.color]
-      : underlineColors[annotation.color];
-  const annotationLabel = annotation.type === 'highlight' ? 'Highlight' : 'Underline';
-  const sourceText = annotation.text.trim() || 'Source text unavailable.';
-  const linkedNotes = notes.map(formatLinkedNoteForPrint).join('\n');
-  return `      <article class="annotation-entry" data-annotation-id="${escapeHtml(annotation.id)}" style="--annotation-colour: ${palette.cssValue};">
-        <p class="annotation-heading"><strong>${annotationLabel}</strong><span class="annotation-meta">Page ${annotation.pageNumber} · ${escapeHtml(palette.label)}</span></p>
+      : underlineColors[annotation.color]
+  );
+  const colourMetadata = palettes.map((palette) => palette.label).join(' · ');
+  const sourceText = formatPdfSourceTextForDisplay(group.sourceText)
+    || 'Source text unavailable.';
+  const linkedNotes = group.notes.map(formatLinkedNoteForPrint).join('\n');
+  const accent = palettes[0]?.cssValue ?? '#777';
+  return `      <article class="annotation-entry" data-source-group-id="${escapeHtml(group.id)}" style="--annotation-colour: ${accent};">
+        <p class="annotation-heading"><strong>${annotationLabel}</strong><span class="annotation-meta">Page ${group.pageNumber}${colourMetadata ? ` · ${escapeHtml(colourMetadata)}` : ''}</span></p>
         <blockquote class="annotation-source">${escapeHtml(sourceText)}</blockquote>
         ${linkedNotes}
       </article>`;
@@ -266,7 +275,7 @@ function formatLinkedNoteForPrint(note: Note): string {
 }
 
 function formatNoteForPrint(note: Note, annotation: PdfAnnotation | undefined): string {
-  const sourceText = normalizeWhitespace(note.selectedText) || 'Source text unavailable.';
+  const sourceText = formatPdfSourceTextForDisplay(note.selectedText) || 'Source text unavailable.';
   const noteHeading = formatNoteLabel(note.displayNumber);
   const content = formatNoteContentForHtml(note.content);
 

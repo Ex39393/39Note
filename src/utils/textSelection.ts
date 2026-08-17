@@ -2,6 +2,7 @@ import type {
   PdfTextSelection,
   PdfTextSelectionRectangle,
 } from '../types/textSelection';
+import { formatPdfSourceTextForDisplay } from './pdfSourceText.ts';
 
 export interface PdfSelectionTextFragmentRectangle {
   left: number;
@@ -102,7 +103,7 @@ export function reconstructPdfSelectionText(
     return `${text}${separator}${fragment.text}`;
   }, '');
 
-  return reconstructed.replaceAll(/\s+/gu, ' ').trim();
+  return formatPdfSourceTextForDisplay(reconstructed);
 }
 
 export function slicePdfTextFragment(

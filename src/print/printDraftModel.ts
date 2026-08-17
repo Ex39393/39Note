@@ -1,14 +1,19 @@
 import type { Note } from '../types/note';
 import type { GlossaryEntry } from '../types/glossary';
 import type { PdfAnnotation } from '../types/highlight';
+import type { NoteAnchor } from '../types/noteAnchor';
+
+export const PRINT_SOURCE_MODEL_VERSION = 2;
 
 export function createPrintSourceFingerprint(
   documentTitle: string,
   notes: readonly Note[],
   glossaryEntries: readonly GlossaryEntry[],
   annotations: readonly PdfAnnotation[] = [],
+  noteAnchors: readonly NoteAnchor[] = [],
 ): string {
   const source = JSON.stringify({
+    sourceModelVersion: PRINT_SOURCE_MODEL_VERSION,
     documentTitle,
     notes: notes.map((note) => [
       note.id,
@@ -34,6 +39,15 @@ export function createPrintSourceFingerprint(
       annotation.rects,
       annotation.color,
       annotation.updatedAt,
+    ]),
+    noteAnchors: noteAnchors.map((anchor) => [
+      anchor.id,
+      anchor.pageNumber,
+      anchor.text,
+      anchor.rects,
+      anchor.startOffset,
+      anchor.endOffset,
+      anchor.updatedAt,
     ]),
   });
   let hash = 2166136261;

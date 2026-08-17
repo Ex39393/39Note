@@ -28,8 +28,9 @@ interface SelectionActionProps {
   selectedColor: AnnotationColor;
   onColorChange: (color: AnnotationColor) => void;
   onApply: () => void;
-  noteLabel: 'Add Note' | 'Open Note';
-  onNote: () => void;
+  noteLabel?: 'Add Note' | 'Open Note';
+  onNote?: () => void;
+  existingAnnotationTypes?: readonly AnnotationType[];
   deleteActions: SelectionDeleteAction[];
   onLookupWord?: () => void;
 }
@@ -43,6 +44,7 @@ export function SelectionAction({
   onApply,
   noteLabel,
   onNote,
+  existingAnnotationTypes = [],
   deleteActions,
   onLookupWord,
 }: SelectionActionProps) {
@@ -58,26 +60,36 @@ export function SelectionAction({
       <div className="selection-primary-actions">
         {(['highlight', 'underline'] as const).map((type) => (
           <button
+            aria-label={existingAnnotationTypes.includes(type)
+              ? `${type === 'highlight' ? 'Highlight' : 'Underline'} already present`
+              : undefined}
             aria-pressed={annotationType === type}
             className={annotationType === type ? 'is-selected' : ''}
+            disabled={existingAnnotationTypes.includes(type)}
             key={type}
             type="button"
             onMouseDown={(event) => event.preventDefault()}
             onClick={() => {
               setIsDeleteExpanded(false);
-              onAnnotationTypeChange(type);
+              if (!existingAnnotationTypes.includes(type)) {
+                onAnnotationTypeChange(type);
+              }
             }}
           >
-            {type === 'highlight' ? 'Highlight' : 'Underline'}
+            {existingAnnotationTypes.includes(type)
+              ? `${type === 'highlight' ? 'Highlight' : 'Underline'} added`
+              : type === 'highlight' ? 'Highlight' : 'Underline'}
           </button>
         ))}
-        <button
-          type="button"
-          onMouseDown={(event) => event.preventDefault()}
-          onClick={onNote}
-        >
-          {noteLabel}
-        </button>
+        {noteLabel && onNote ? (
+          <button
+            type="button"
+            onMouseDown={(event) => event.preventDefault()}
+            onClick={onNote}
+          >
+            {noteLabel}
+          </button>
+        ) : null}
         {deleteActions.length > 0 ? (
           <button
             type="button"

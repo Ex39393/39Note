@@ -5,6 +5,12 @@ import type {
 import type { Note } from '../types/note';
 import type { NoteAnchor } from '../types/noteAnchor';
 import type { PdfTextSelection } from '../types/textSelection';
+import {
+  getRectangleSetOverlap,
+  isSameLogicalPdfSource,
+  normalizePdfSourceText,
+  type PdfSourceGeometry,
+} from './pdfSourceGeometry.ts';
 
 const MIN_SELECTION_COVERAGE = 0.45;
 const MIN_ANNOTATION_COVERAGE = 0.35;
@@ -28,14 +34,14 @@ export function findOverlappingAnnotations(
       if (selection.pageNumber !== annotation.pageNumber) return false;
       const overlap = getRectangleSetOverlap(rects, annotation.rects);
       if (
-        overlap.selectionCoverage >= MIN_SELECTION_COVERAGE ||
-        overlap.annotationCoverage >= MIN_ANNOTATION_COVERAGE
+        overlap.firstCoverage >= MIN_SELECTION_COVERAGE ||
+        overlap.secondCoverage >= MIN_ANNOTATION_COVERAGE
       ) {
         return true;
       }
       return (
-        overlap.selectionCoverage >= TEXT_MATCH_MIN_COVERAGE &&
-        normalizeText(selection.text) === normalizeText(annotation.text)
+        overlap.firstCoverage >= TEXT_MATCH_MIN_COVERAGE &&
+        normalizePdfSourceText(selection.text) === normalizePdfSourceText(annotation.text)
       );
     }),
   );
@@ -65,16 +71,50 @@ export function findMatchingNote(
     );
     const overlap = getRectangleSetOverlap(selectionRects, source.rects);
     const textMatches =
-      normalizeText(matchingSelection.text) === normalizeText(source.text);
+      normalizePdfSourceText(matchingSelection.text) === normalizePdfSourceText(source.text);
     if (
-      overlap.selectionCoverage >= 0.72 &&
-      overlap.annotationCoverage >= 0.72 &&
-      (textMatches || overlap.selectionCoverage >= 0.9)
+      overlap.firstCoverage >= 0.72 &&
+      overlap.secondCoverage >= 0.72 &&
+      (textMatches || overlap.firstCoverage >= 0.9)
     ) {
       return note;
     }
   }
   return null;
+}
+
+export function findMatchingNoteForSources(
+  targetSources: readonly PdfSourceGeometry[],
+  notes: readonly Note[],
+  annotations: readonly PdfAnnotation[],
+  noteAnchors: readonly NoteAnchor[],
+): Note | null {
+  const sourcesById = new Map<string, PdfSourceGeometry>(
+    [...annotations, ...noteAnchors].map((source) => [source.id, source]),
+  );
+  return notes.find((note) => {
+    const noteSource = sourcesById.get(note.annotationId);
+    return Boolean(
+      noteSource && targetSources.some((target) => isSameLogicalPdfSource(target, noteSource)),
+    );
+  }) ?? null;
+}
+
+export function findAnnotationsAtNormalizedPoint(
+  pageNumber: number,
+  point: { x: number; y: number },
+  annotations: readonly PdfAnnotation[],
+): PdfAnnotation[] {
+  const hits = annotations.filter((annotation) =>
+    annotation.pageNumber === pageNumber && annotation.rects.some((rectangle) =>
+      point.x >= rectangle.x &&
+      point.x <= rectangle.x + rectangle.width &&
+      point.y >= rectangle.y &&
+      point.y <= rectangle.y + rectangle.height,
+    ),
+  );
+  const first = hits[0];
+  return first ? hits.filter((annotation) => isSameLogicalPdfSource(first, annotation)) : [];
 }
 
 export function createNoteAnchorFromSelection(
@@ -117,60 +157,6 @@ export function createNoteAnchorFromAnnotation(
     createdAt: timestamp,
     updatedAt: timestamp,
   };
-}
-
-interface RectangleSetOverlap {
-  selectionCoverage: number;
-  annotationCoverage: number;
-}
-
-function getRectangleSetOverlap(
-  selectionRects: readonly NormalizedHighlightRectangle[],
-  annotationRects: readonly NormalizedHighlightRectangle[],
-): RectangleSetOverlap {
-  const selectionArea = totalArea(selectionRects);
-  const annotationArea = totalArea(annotationRects);
-  if (selectionArea === 0 || annotationArea === 0) {
-    return { selectionCoverage: 0, annotationCoverage: 0 };
-  }
-  const intersection = selectionRects.reduce(
-    (total, selection) =>
-      total +
-      annotationRects.reduce(
-        (subtotal, annotation) => subtotal + intersectionArea(selection, annotation),
-        0,
-      ),
-    0,
-  );
-  return {
-    selectionCoverage: Math.min(1, intersection / selectionArea),
-    annotationCoverage: Math.min(1, intersection / annotationArea),
-  };
-}
-
-function totalArea(rects: readonly NormalizedHighlightRectangle[]): number {
-  return rects.reduce((sum, rect) => sum + rect.width * rect.height, 0);
-}
-
-function intersectionArea(
-  first: NormalizedHighlightRectangle,
-  second: NormalizedHighlightRectangle,
-): number {
-  const width = Math.max(
-    0,
-    Math.min(first.x + first.width, second.x + second.width) -
-      Math.max(first.x, second.x),
-  );
-  const height = Math.max(
-    0,
-    Math.min(first.y + first.height, second.y + second.height) -
-      Math.max(first.y, second.y),
-  );
-  return width * height;
-}
-
-function normalizeText(text: string): string {
-  return text.replaceAll(/\s+/g, ' ').trim().toLocaleLowerCase('en-US');
 }
 
 function normalizeRectangles(
