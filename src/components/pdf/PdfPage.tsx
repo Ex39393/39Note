@@ -22,6 +22,11 @@ import {
   type PdfAnnotation,
 } from '../../types/highlight';
 import { correctTextLayerReadingOrder } from '../../utils/textLayerReadingOrder';
+import { preloadPdfSourceLexicon } from '../../utils/pdfSourceLexicon';
+import {
+  attachPdfTextSourceMap,
+  detachPdfTextSourceMap,
+} from '../../utils/pdfTextSourceMap';
 import { getHighlightRenderGroups, normalizeAnnotationVisualGeometry } from '../../utils/highlights';
 import { findAnnotationsAtNormalizedPoint } from '../../utils/annotationOverlap';
 import {
@@ -273,8 +278,19 @@ export function PdfPage({
     });
 
     let isDisposed = false;
+    void preloadPdfSourceLexicon();
+    const textContentPromise = page.getTextContent({
+      includeMarkedContent: true,
+      disableNormalization: true,
+    });
+    const textLayerRenderPromise = textLayer.render();
+    void Promise.all([textLayerRenderPromise, textContentPromise]).then(([, textContent]) => {
+      if (!isDisposed) {
+        attachPdfTextSourceMap(container, pageNumber, textContent);
+      }
+    }).catch(() => undefined);
 
-    void textLayer.render()
+    void textLayerRenderPromise
       .then(() => {
         if (!isDisposed) {
           correctTextLayerReadingOrder(container);
@@ -290,6 +306,7 @@ export function PdfPage({
     return () => {
       isDisposed = true;
       textLayer.cancel();
+      detachPdfTextSourceMap(container);
       container.replaceChildren();
     };
   }, [isNearViewport, onTextLayerReady, page, pageNumber, viewport]);

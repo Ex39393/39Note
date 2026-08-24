@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict';
-import test from 'node:test';
+import { readFile } from 'node:fs/promises';
+import { gzipSync } from 'node:zlib';
+import test, { before } from 'node:test';
 import {
   reconstructPdfSelectionText,
   slicePdfTextFragment,
@@ -7,6 +9,32 @@ import {
   type PdfSelectionTextFragmentRectangle,
 } from '../src/utils/textSelection.ts';
 import { formatPdfSourceTextForDisplay } from '../src/utils/pdfSourceText.ts';
+import {
+  getPdfSourceLexiconEntryCount,
+  installPdfSourceLexicon,
+  isPdfSourceLexiconReady,
+} from '../src/utils/pdfSourceLexicon.ts';
+import { createSelectedTextContext } from '../src/ai/selectedTextContext.ts';
+import type { PdfTextSelection } from '../src/types/textSelection.ts';
+
+before(async () => {
+  const bytes = await readFile(new URL(
+    '../public/dictionary/pdf-source-lexicon.bin',
+    import.meta.url,
+  ));
+  installPdfSourceLexicon(bytes);
+});
+
+test('loads a compact local WordNet membership asset', async () => {
+  const bytes = await readFile(new URL(
+    '../public/dictionary/pdf-source-lexicon.bin',
+    import.meta.url,
+  ));
+  assert.equal(isPdfSourceLexiconReady(), true);
+  assert.equal(getPdfSourceLexiconEntryCount(), 82_537);
+  assert.ok(bytes.byteLength <= 300 * 1024);
+  assert.ok(gzipSync(bytes).byteLength <= 300 * 1024);
+});
 
 test('preserves an existing literal whitespace boundary', () => {
   assert.equal(
@@ -36,6 +64,36 @@ test('infers the second reported factual/questions word boundary', () => {
     ]),
     'factual questions',
   );
+});
+
+test('repairs the reported missing boundaries inside one fragment', () => {
+  assert.equal(
+    reconstructPdfSelectionText([
+      fragment('There wasno significant difference', rectangle(0, 0, 210, 14), 0),
+    ]),
+    'There was no significant difference',
+  );
+  assert.equal(
+    reconstructPdfSelectionText([
+      fragment(
+        'performance on factualquestions across lectures',
+        rectangle(0, 0, 280, 14),
+        0,
+      ),
+    ]),
+    'performance on factual questions across lectures',
+  );
+});
+
+test('preserves recognized unsplit English words', () => {
+  for (const word of ['notebook', 'background', 'cannot', 'something', 'psychology']) {
+    assert.equal(
+      reconstructPdfSelectionText([
+        fragment(word, rectangle(0, 0, word.length * 7, 14), 0),
+      ]),
+      word,
+    );
+  }
 });
 
 test('does not split alphabetic fragments when geometry shows token adjacency', () => {
@@ -132,6 +190,64 @@ test('turns an ordinary visual line wrap into one space', () => {
   );
 });
 
+test('dehyphenates only a strong lexical line-break candidate', () => {
+  assert.equal(
+    reconstructPdfSelectionText([
+      fragment('cond-', rectangle(0, 0, 32, 14), 0, true),
+      fragment('ition', rectangle(0, 18, 28, 14), 1),
+    ]),
+    'condition',
+  );
+  assert.equal(
+    reconstructPdfSelectionText([
+      fragment('evidence-', rectangle(0, 0, 58, 14), 0, true),
+      fragment('based', rectangle(0, 18, 32, 14), 1),
+    ]),
+    'evidence-based',
+  );
+  assert.equal(
+    reconstructPdfSelectionText([
+      fragment('well-', rectangle(0, 0, 30, 14), 0, true),
+      fragment('being', rectangle(0, 18, 30, 14), 1),
+    ]),
+    'well-being',
+  );
+  assert.equal(
+    reconstructPdfSelectionText([
+      fragment('COVID-', rectangle(0, 0, 42, 14), 0, true),
+      fragment('19', rectangle(0, 18, 14, 14), 1),
+    ]),
+    'COVID-19',
+  );
+});
+
+test('uses lexical evidence only inside the narrow borderline-gap band', () => {
+  const textHeight = 14;
+  const borderlineGap = textHeight * 0.078;
+  assert.equal(
+    reconstructPdfSelectionText([
+      fragment('was', rectangle(0, 0, 21, textHeight), 0),
+      fragment('no', rectangle(21 + borderlineGap, 0, 14, textHeight), 1),
+    ]),
+    'was no',
+  );
+  assert.equal(
+    reconstructPdfSelectionText([
+      fragment('p', rectangle(0, 0, 7, textHeight), 0),
+      fragment('value', rectangle(7 + borderlineGap, 0, 35, textHeight), 1),
+    ]),
+    'pvalue',
+  );
+});
+
+test('repairs historical source display without rewriting ambiguous compounds', () => {
+  assert.equal(formatPdfSourceTextForDisplay('There wasno'), 'There was no');
+  assert.equal(formatPdfSourceTextForDisplay('cond-ition'), 'condition');
+  assert.equal(formatPdfSourceTextForDisplay('evidence-based'), 'evidence-based');
+  assert.equal(formatPdfSourceTextForDisplay('well-being'), 'well-being');
+  assert.equal(formatPdfSourceTextForDisplay('long-term'), 'long-term');
+});
+
 test('partial first and final fragment slicing does not leak unselected text', () => {
   const sourceFragments = ['There was', 'no difference', 'today.'];
   const selectionStart = 6;
@@ -168,6 +284,27 @@ test('reconstructs the reported multi-span and multi-line sentence', () => {
   );
 });
 
+test('passes canonical reconstructed selections into AI Selected text context', () => {
+  const selectedText = [
+    pdfSelection('There was no significant difference', 2),
+    pdfSelection('condition', 6),
+  ];
+  const context = createSelectedTextContext(selectedText, 1_000);
+
+  assert.equal(
+    context.excerpts,
+    '--- DOCUMENT EXCERPT | selected text | pages 2, 6 ---\n' +
+      'There was no significant difference\ncondition',
+  );
+  assert.deepEqual(context.preview, {
+    scope: 'selected-text',
+    pages: [2, 6],
+    characters: 45,
+    excerptCount: 1,
+  });
+  assert.doesNotMatch(context.excerpts, /wasno|cond-ition/);
+});
+
 test('protects scientific, lexical, and punctuation-heavy tokens', () => {
   const cases: Array<[PdfSelectionTextFragment[], string]> = [
     [adjacentFragments(['can', "'", 't']), "can't"],
@@ -187,6 +324,31 @@ test('protects scientific, lexical, and punctuation-heavy tokens', () => {
   }
 });
 
+test('preserves exact academic and statistical source strings', () => {
+  const cases = [
+    'There was no significant difference, F(4, 4) = 1.57, p = .33.',
+    '\u03b7\u00b2 = .95',
+    'R\u00b2',
+    '95% confidence interval',
+    'COVID-19',
+    'evidence-based',
+    '2\u00d72 ANOVA',
+    'GLMM CS+ CS- N=4 A/B',
+    'https://example.org/wasno',
+    'person@example.org',
+    'variable_names camelCase v1.2.3',
+  ];
+
+  for (const value of cases) {
+    assert.equal(
+      reconstructPdfSelectionText([
+        fragment(value, rectangle(0, 0, value.length * 7, 14), 0),
+      ]),
+      value,
+    );
+  }
+});
+
 function adjacentFragments(texts: string[]): PdfSelectionTextFragment[] {
   let left = 0;
   return texts.map((text, order) => {
@@ -195,6 +357,18 @@ function adjacentFragments(texts: string[]): PdfSelectionTextFragment[] {
     left += width + 0.25;
     return result;
   });
+}
+
+function pdfSelection(text: string, pageNumber: number): PdfTextSelection {
+  return {
+    text,
+    pageNumber,
+    pageWidth: 612,
+    pageHeight: 792,
+    boundingRectangles: [{ left: 10, top: 10, width: 100, height: 14 }],
+    startOffset: 0,
+    endOffset: text.length,
+  };
 }
 
 function spacedFragments(texts: string[]): PdfSelectionTextFragment[] {
@@ -211,8 +385,18 @@ function fragment(
   text: string,
   value: PdfSelectionTextFragmentRectangle,
   order: number,
+  hasEOL = false,
 ): PdfSelectionTextFragment {
-  return { text, rectangle: value, order };
+  return {
+    text,
+    rectangle: value,
+    order,
+    ...(hasEOL ? {
+      sourceItem: { hasEOL: true },
+      startsSourceItem: true,
+      endsSourceItem: true,
+    } : {}),
+  };
 }
 
 function rectangle(

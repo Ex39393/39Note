@@ -34,6 +34,10 @@ import {
 import { isValidPageCitation } from './citations';
 import { resolveProviderAdapter } from './provider';
 import {
+  createSelectedTextContext,
+  type PreparedAiContext,
+} from './selectedTextContext';
+import {
   PROVIDER_DEFINITIONS,
   createProviderPreset,
   getProviderDefinition,
@@ -69,11 +73,6 @@ interface AssistantPanelProps {
   onAddToNote: (content: string) => void;
   onSendToPrintDraft: (addition: PrintDraftAddition) => Promise<boolean>;
   onStatusChange: (status: 'disconnected' | 'connected' | 'generating') => void;
-}
-
-interface PreparedContext {
-  excerpts: string;
-  preview: AiRequestContextPreview;
 }
 
 export function AssistantPanel({
@@ -252,27 +251,12 @@ export function AssistantPanel({
   );
 
   const prepareContext = useCallback(
-    async (question: string, signal: AbortSignal): Promise<PreparedContext> => {
+    async (question: string, signal: AbortSignal): Promise<PreparedAiContext> => {
       if (scope === 'selected-text') {
-        const text = selectedText
-          .map((selection) => selection.text)
-          .join('\n')
-          .trim();
-        if (!text)
-          throw new Error('Select text in the PDF before using Selected text scope.');
-        const pages = [
-          ...new Set(selectedText.map((selection) => selection.pageNumber)),
-        ];
-        const bounded = text.slice(0, config.contextCharacterBudget);
-        return {
-          excerpts: `--- DOCUMENT EXCERPT | selected text | pages ${pages.join(', ')} ---\n${bounded}`,
-          preview: {
-            scope,
-            pages,
-            characters: bounded.length,
-            excerptCount: 1,
-          },
-        };
+        return createSelectedTextContext(
+          selectedText,
+          config.contextCharacterBudget,
+        );
       }
       const index = await ensureDocumentText(signal);
       if (scope === 'current-page') {
