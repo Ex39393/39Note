@@ -1,4 +1,3 @@
-import { useState } from 'react';
 import {
   highlightColors,
   underlineColors,
@@ -14,13 +13,6 @@ interface FloatingActionPosition {
 
 type AnnotationColor = HighlightColor | UnderlineColor;
 
-export interface SelectionDeleteAction {
-  id: string;
-  label: string;
-  detail: string;
-  onActivate: () => void;
-}
-
 interface SelectionActionProps {
   position: FloatingActionPosition;
   annotationType: AnnotationType | null;
@@ -28,10 +20,7 @@ interface SelectionActionProps {
   selectedColor: AnnotationColor;
   onColorChange: (color: AnnotationColor) => void;
   onApply: () => void;
-  noteLabel?: 'Add Note' | 'Open Note';
-  onNote?: () => void;
   existingAnnotationTypes?: readonly AnnotationType[];
-  deleteActions: SelectionDeleteAction[];
   onLookupWord?: () => void;
 }
 
@@ -42,13 +31,9 @@ export function SelectionAction({
   selectedColor,
   onColorChange,
   onApply,
-  noteLabel,
-  onNote,
   existingAnnotationTypes = [],
-  deleteActions,
   onLookupWord,
 }: SelectionActionProps) {
-  const [isDeleteExpanded, setIsDeleteExpanded] = useState(false);
   const colors = annotationType === 'underline' ? underlineColors : highlightColors;
 
   return (
@@ -60,9 +45,11 @@ export function SelectionAction({
       <div className="selection-primary-actions">
         {(['highlight', 'underline'] as const).map((type) => (
           <button
-            aria-label={existingAnnotationTypes.includes(type)
-              ? `${type === 'highlight' ? 'Highlight' : 'Underline'} already present`
-              : undefined}
+            aria-label={
+              existingAnnotationTypes.includes(type)
+                ? `${type === 'highlight' ? 'Highlight' : 'Underline'} already present`
+                : undefined
+            }
             aria-pressed={annotationType === type}
             className={annotationType === type ? 'is-selected' : ''}
             disabled={existingAnnotationTypes.includes(type)}
@@ -70,7 +57,6 @@ export function SelectionAction({
             type="button"
             onMouseDown={(event) => event.preventDefault()}
             onClick={() => {
-              setIsDeleteExpanded(false);
               if (!existingAnnotationTypes.includes(type)) {
                 onAnnotationTypeChange(type);
               }
@@ -78,33 +64,11 @@ export function SelectionAction({
           >
             {existingAnnotationTypes.includes(type)
               ? `${type === 'highlight' ? 'Highlight' : 'Underline'} added`
-              : type === 'highlight' ? 'Highlight' : 'Underline'}
+              : type === 'highlight'
+                ? 'Highlight'
+                : 'Underline'}
           </button>
         ))}
-        {noteLabel && onNote ? (
-          <button
-            type="button"
-            onMouseDown={(event) => event.preventDefault()}
-            onClick={onNote}
-          >
-            {noteLabel}
-          </button>
-        ) : null}
-        {deleteActions.length > 0 ? (
-          <button
-            type="button"
-            aria-expanded={deleteActions.length > 1 ? isDeleteExpanded : undefined}
-            onMouseDown={(event) => event.preventDefault()}
-            onClick={() => {
-              if (deleteActions.length === 1) deleteActions[0].onActivate();
-              else {
-                setIsDeleteExpanded((expanded) => !expanded);
-              }
-            }}
-          >
-            Delete
-          </button>
-        ) : null}
         {onLookupWord ? (
           <button
             className="dictionary-lookup-button"
@@ -149,22 +113,6 @@ export function SelectionAction({
           >
             Apply
           </button>
-        </div>
-      ) : null}
-      {deleteActions.length > 1 && isDeleteExpanded ? (
-        <div className="selection-delete-actions" aria-label="Choose annotation to delete">
-          {deleteActions.map((action) => (
-            <button
-              key={action.id}
-              type="button"
-              title={action.detail}
-              onMouseDown={(event) => event.preventDefault()}
-              onClick={action.onActivate}
-            >
-              {action.label}
-              <span>{action.detail}</span>
-            </button>
-          ))}
         </div>
       ) : null}
     </div>

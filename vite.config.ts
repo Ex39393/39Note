@@ -14,6 +14,18 @@ function normalizeBasePath(value: string | undefined): string {
 export default defineConfig({
   base: normalizeBasePath(process.env.VITE_BASE_PATH),
   plugins: [react(), tailwindcss()],
+  // Keep the PDF.js API and worker on the same live module graph in dev. A
+  // long-running Vite optimizer can otherwise retain an older pre-bundled API
+  // while the worker URL resolves from a newly installed pdfjs-dist package.
+  optimizeDeps: {
+    exclude: ['pdfjs-dist'],
+  },
+  resolve: {
+    dedupe: ['pdfjs-dist'],
+  },
+  worker: {
+    format: 'es',
+  },
   build: {
     rollupOptions: {
       output: {

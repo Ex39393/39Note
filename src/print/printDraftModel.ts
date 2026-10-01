@@ -1,7 +1,12 @@
 import type { Note } from '../types/note';
-import type { GlossaryEntry } from '../types/glossary';
+import { isPdfGlossaryEntry, type GlossaryEntry } from '../types/glossary.ts';
 import type { PdfAnnotation } from '../types/highlight';
 import type { NoteAnchor } from '../types/noteAnchor';
+import type {
+  PrintDraftRecord,
+  RenderedPrintPdfDescriptor,
+} from '../types/productivity.ts';
+import { sha256Hex, stableStringify } from '../sync/hash.ts';
 
 export const PRINT_SOURCE_MODEL_VERSION = 2;
 
@@ -27,7 +32,9 @@ export function createPrintSourceFingerprint(
       entry.glossaryEntryId,
       entry.displayedWord,
       entry.definition,
-      entry.pageNumber,
+      isPdfGlossaryEntry(entry)
+        ? ['pdf', entry.pageNumber, entry.startOffset, entry.endOffset]
+        : ['semantic', entry.anchor],
       entry.source.dataset,
       entry.source.version,
     ]),
@@ -56,4 +63,36 @@ export function createPrintSourceFingerprint(
     hash = Math.imul(hash, 16777619);
   }
   return `fnv1a-${(hash >>> 0).toString(16)}-${source.length}`;
+}
+
+/** Cryptographic identity of every input that can affect a future rendered PDF. */
+export function createPrintDraftHash(
+  draft: PrintDraftRecord,
+  currentSourceFingerprint = draft.sourceFingerprint,
+): Promise<string> {
+  return sha256Hex(
+    stableStringify({
+      documentId: draft.documentId,
+      printSourceModelVersion: PRINT_SOURCE_MODEL_VERSION,
+      currentSourceFingerprint,
+      draftSchemaVersion: draft.draftSchemaVersion,
+      editorStateJson: draft.editorStateJson,
+      contentMode: draft.contentMode,
+      baseTemplateId: draft.baseTemplateId,
+      templateVersion: draft.templateVersion,
+      overrides: draft.overrides,
+      pendingAdditions: draft.pendingAdditions,
+    }),
+  );
+}
+
+export async function isRenderedPrintPdfStale(
+  draft: PrintDraftRecord,
+  artifact: RenderedPrintPdfDescriptor,
+  currentSourceFingerprint = draft.sourceFingerprint,
+): Promise<boolean> {
+  return (
+    artifact.renderedFromDraftHash !==
+    (await createPrintDraftHash(draft, currentSourceFingerprint))
+  );
 }

@@ -1,7 +1,15 @@
 import { useEffect, useRef, useState } from 'react';
-import { useTheme } from '../theme/ThemeContext';
-import { readingThemes, themes } from '../themes';
+import {
+  DOCUMENT_FILE_EXTENSIONS,
+  DOCUMENT_MIME_TYPES,
+  type DocumentType,
+} from '../types/document';
 import { ProductivityTimer } from './ProductivityTimer';
+
+const SUPPORTED_DOCUMENT_ACCEPT = [
+  ...Object.values(DOCUMENT_MIME_TYPES),
+  ...Object.values(DOCUMENT_FILE_EXTENSIONS),
+].join(',');
 
 interface ToolbarProps {
   onOpenFile: (file: File) => void;
@@ -13,10 +21,10 @@ interface ToolbarProps {
   onGoToPage: (pageNumber: number) => void;
   onOpenSearch: () => void;
   openFileRequestId: number;
-  onOpenLibrary: () => void;
   onExportAnnotatedPdf: () => void;
   isAnnotatedPdfExporting: boolean;
   hasDocument: boolean;
+  documentType: DocumentType | null;
   pageCount: number;
   currentPage: number;
   effectiveZoom: number;
@@ -36,10 +44,10 @@ export function Toolbar({
   onGoToPage,
   onOpenSearch,
   openFileRequestId,
-  onOpenLibrary,
   onExportAnnotatedPdf,
   isAnnotatedPdfExporting,
   hasDocument,
+  documentType,
   pageCount,
   currentPage,
   effectiveZoom,
@@ -48,11 +56,9 @@ export function Toolbar({
   aiStatus,
   onToggleAi,
 }: ToolbarProps) {
-  const { themeId, setTheme } = useTheme();
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [zoomDraft, setZoomDraft] = useState(formatZoomPercentage(effectiveZoom));
   const [isZoomEditing, setIsZoomEditing] = useState(false);
-  const [isThemeMenuOpen, setIsThemeMenuOpen] = useState(false);
   const [pageDraft, setPageDraft] = useState('');
   const lastOpenFileRequestRef = useRef(openFileRequestId);
 
@@ -73,21 +79,6 @@ export function Toolbar({
     lastOpenFileRequestRef.current = openFileRequestId;
     fileInputRef.current?.click();
   }, [openFileRequestId]);
-
-  useEffect(() => {
-    if (!isThemeMenuOpen) {
-      return;
-    }
-
-    const closeOnEscape = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') {
-        setIsThemeMenuOpen(false);
-      }
-    };
-
-    window.addEventListener('keydown', closeOnEscape);
-    return () => window.removeEventListener('keydown', closeOnEscape);
-  }, [isThemeMenuOpen]);
 
   const applyZoomDraft = () => {
     const parsedZoom = parseZoomPercentage(zoomDraft);
@@ -124,26 +115,28 @@ export function Toolbar({
 
       <div className="toolbar-actions">
         <ProductivityTimer />
-        <button
-          aria-expanded={isAiOpen}
-          aria-label={`AI Assistant: ${aiStatus}`}
-          className={`toolbar-button ai-toolbar-trigger is-${aiStatus}`}
-          disabled={!hasDocument}
-          title="Open AI Assistant"
-          type="button"
-          onClick={onToggleAi}
-        >
-          <span aria-hidden="true">✦</span>
-          <span className="ai-toolbar-label">AI</span>
-          <span className="ai-status-dot" aria-hidden="true" />
-        </button>
+        {documentType ? (
+          <button
+            aria-expanded={isAiOpen}
+            aria-label={`AI Assistant: ${aiStatus}`}
+            className={`toolbar-button ai-toolbar-trigger is-${aiStatus}`}
+            disabled={!hasDocument}
+            title="Open AI Assistant"
+            type="button"
+            onClick={onToggleAi}
+          >
+            <span aria-hidden="true">✦</span>
+            <span className="ai-toolbar-label">AI</span>
+            <span className="ai-status-dot" aria-hidden="true" />
+          </button>
+        ) : null}
         <input
           ref={fileInputRef}
           aria-hidden="true"
           className="visually-hidden"
           tabIndex={-1}
           type="file"
-          accept="application/pdf,.pdf"
+          accept={SUPPORTED_DOCUMENT_ACCEPT}
           onChange={(event) => {
             const file = event.target.files?.[0];
             if (file) {
@@ -157,16 +150,18 @@ export function Toolbar({
           type="button"
           onClick={() => fileInputRef.current?.click()}
         >
-          Open PDF
+          Open PDF / Convert Office
         </button>
         <div className="viewer-controls" aria-label="PDF viewer controls">
           <button
+            aria-label="Zoom out"
             className="toolbar-button"
+            title="Zoom out"
             type="button"
             disabled={!hasDocument}
             onClick={onZoomOut}
           >
-            Zoom -
+            −
           </button>
           <input
             aria-label="Zoom percentage"
@@ -189,12 +184,14 @@ export function Toolbar({
             }}
           />
           <button
+            aria-label="Zoom in"
             className="toolbar-button"
+            title="Zoom in"
             type="button"
             disabled={!hasDocument}
             onClick={onZoomIn}
           >
-            Zoom +
+            +
           </button>
           <button
             className="toolbar-button"
@@ -213,10 +210,10 @@ export function Toolbar({
             Fit Page
           </button>
           <button
-            aria-label="Search PDF"
+            aria-label="Search document"
             className="toolbar-button toolbar-search-trigger"
             disabled={!hasDocument}
-            title="Search PDF (Ctrl+F)"
+            title="Search document (Ctrl+F)"
             type="button"
             onClick={onOpenSearch}
           >
@@ -242,55 +239,18 @@ export function Toolbar({
               }}
             />
             <span className="page-total">/ {pageCount || '—'}</span>
-            {currentPage || '—'} / {pageCount || '—'}
           </label>
         </div>
-        <div className="theme-menu-wrapper">
+        {documentType === 'pdf' ? (
           <button
-            aria-expanded={isThemeMenuOpen}
-            aria-haspopup="menu"
             className="toolbar-button"
+            disabled={!hasDocument || isAnnotatedPdfExporting}
             type="button"
-            onClick={() => setIsThemeMenuOpen((isOpen) => !isOpen)}
+            onClick={onExportAnnotatedPdf}
           >
-            Theme: {themes[themeId].label}
+            {isAnnotatedPdfExporting ? 'Exporting PDF...' : 'Export Annotated PDF'}
           </button>
-          {isThemeMenuOpen ? (
-            <div className="theme-menu" role="menu" aria-label="Reading theme">
-              {readingThemes.map((theme) => (
-                <button
-                  aria-checked={themeId === theme}
-                  key={theme}
-                  role="menuitemradio"
-                  type="button"
-                  onClick={() => {
-                    setTheme(theme);
-                    setIsThemeMenuOpen(false);
-                  }}
-                >
-                  <span>{themes[theme].label}</span>
-                  {themeId === theme ? <span aria-hidden="true">✓</span> : null}
-                </button>
-              ))}
-            </div>
-          ) : null}
-        </div>
-        <button
-          aria-label="Open Library"
-          className="toolbar-button"
-          type="button"
-          onClick={onOpenLibrary}
-        >
-          Library
-        </button>
-        <button
-          className="toolbar-button"
-          disabled={!hasDocument || isAnnotatedPdfExporting}
-          type="button"
-          onClick={onExportAnnotatedPdf}
-        >
-          {isAnnotatedPdfExporting ? 'Exporting PDF...' : 'Export Annotated PDF'}
-        </button>
+        ) : null}
         <button className="toolbar-button" type="button" disabled>
           Export Notes
         </button>

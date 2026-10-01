@@ -28,6 +28,7 @@ interface DefinitionBubbleProps {
   isActive: boolean;
   onActivate: (bubbleId: string) => void;
   onAddToGlossary: (bubbleId: string) => void;
+  onRemoveFromGlossary: (glossaryEntryId: string) => void;
   onClose: (bubbleId: string) => void;
   onMoveDefinitionUp: (bubbleId: string, definitionId: string) => void;
   onToggleExpanded: (bubbleId: string) => void;
@@ -40,6 +41,7 @@ export function DefinitionBubble({
   isActive,
   onActivate,
   onAddToGlossary,
+  onRemoveFromGlossary,
   onClose,
   onMoveDefinitionUp,
   onToggleExpanded,
@@ -69,6 +71,8 @@ export function DefinitionBubble({
     bubble.isExpanded,
   );
   const hiddenDefinitionCount = bubble.definitions.length - 3;
+  const canToggleDefinitions = hiddenDefinitionCount > 0 && bubble.status === 'ready';
+  const persistedGlossaryEntryId = bubble.glossaryEntryId;
   const sourceLabels = [
     ...new Set(
       bubble.definitions.map((definition) =>
@@ -91,11 +95,7 @@ export function DefinitionBubble({
   }, [bubble.id, bubbleElement, onClose]);
 
   const moveTo = (nextPosition: DefinitionBubblePosition) => {
-    const clamped = clampDefinitionBubblePosition(
-      nextPosition,
-      pageSize,
-      measuredSize,
-    );
+    const clamped = clampDefinitionBubblePosition(nextPosition, pageSize, measuredSize);
     setManualPosition(normalizeDefinitionBubblePosition(clamped, pageSize));
   };
 
@@ -183,7 +183,9 @@ export function DefinitionBubble({
           onPointerMove={handleDragMove}
           onPointerUp={handleDragEnd}
         >
-          <span aria-hidden="true" className="definition-bubble-grip">⠿</span>
+          <span aria-hidden="true" className="definition-bubble-grip">
+            ⠿
+          </span>
           <strong>{bubble.displayedWord}</strong>
         </button>
         <button
@@ -228,18 +230,33 @@ export function DefinitionBubble({
             ))}
           </ol>
         ) : null}
-        {hiddenDefinitionCount > 0 && bubble.status === 'ready' ? (
-          <button
-            className="definition-more-button"
-            aria-expanded={bubble.isExpanded}
-            type="button"
-            onClick={() => onToggleExpanded(bubble.id)}
-          >
-            {bubble.isExpanded ? 'Show fewer' : `Show ${hiddenDefinitionCount} more`}
-          </button>
-        ) : null}
         {bubble.status === 'ready' && bubble.isEnriching ? (
           <p className="dictionary-enrichment-status">Checking online sources…</p>
+        ) : null}
+        {canToggleDefinitions || persistedGlossaryEntryId ? (
+          <div className="definition-bubble-actions">
+            {canToggleDefinitions ? (
+              <button
+                className="definition-more-button"
+                aria-expanded={bubble.isExpanded}
+                type="button"
+                onClick={() => onToggleExpanded(bubble.id)}
+              >
+                {bubble.isExpanded
+                  ? 'Show fewer'
+                  : `Show ${hiddenDefinitionCount} more`}
+              </button>
+            ) : null}
+            {persistedGlossaryEntryId ? (
+              <button
+                className="definition-remove-glossary"
+                type="button"
+                onClick={() => onRemoveFromGlossary(persistedGlossaryEntryId)}
+              >
+                Remove from Glossary
+              </button>
+            ) : null}
+          </div>
         ) : null}
       </div>
       <footer>{sourceLabels.join(' · ') || 'Local dictionary first'}</footer>

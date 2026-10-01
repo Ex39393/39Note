@@ -1,16 +1,20 @@
 import type {
   DictionarySourceAttribution,
   GlossaryEntry,
+  PdfGlossaryEntry,
 } from '../types/glossary';
+import { sanitizeDocumentSemanticAnchor } from '../documents/anchors.ts';
+import type { DocumentType } from '../types/document';
 
 export function sanitizePersistedGlossaryEntries(
   value: unknown,
   documentId: string,
+  documentType?: DocumentType,
 ): GlossaryEntry[] {
   if (!Array.isArray(value)) return [];
   const entryIds = new Set<string>();
   const markerIds = new Set<string>();
-  return value.flatMap((candidate) => {
+  return value.flatMap((candidate): GlossaryEntry[] => {
     if (
       !isRecord(candidate) ||
       !isNonEmptyString(candidate.glossaryEntryId) ||
@@ -19,20 +23,58 @@ export function sanitizePersistedGlossaryEntries(
       !isNonEmptyString(candidate.displayedWord) ||
       !isNonEmptyString(candidate.normalizedLookupWord) ||
       !isNonEmptyString(candidate.definition) ||
-      !isPositiveInteger(candidate.pageNumber) ||
-      !isPositiveIntegerOrZero(candidate.startOffset) ||
-      !isPositiveIntegerOrZero(candidate.endOffset) ||
-      candidate.endOffset < candidate.startOffset ||
       !isTimestamp(candidate.createdAt) ||
-      !isNonEmptyString(candidate.markerAnnotationId) ||
-      markerIds.has(candidate.markerAnnotationId) ||
       !sanitizeDictionarySource(candidate.source)
     )
       return [];
 
-    const sourceRects = sanitizeRectangles(candidate.sourceRects);
     const source = sanitizeDictionarySource(candidate.source);
-    if (sourceRects.length === 0 || !source) return [];
+    if (!source) return [];
+
+    if (candidate.locationKind === 'semantic') {
+      const anchor = sanitizeDocumentSemanticAnchor(candidate.anchor);
+      if (
+        !anchor ||
+        anchor.kind === 'pdf-text' ||
+        anchor.documentId !== documentId ||
+        !isLocationLabel(candidate.locationLabel) ||
+        documentType === 'pdf' ||
+        (documentType === 'pptx' && anchor.kind !== 'pptx-text') ||
+        (documentType === 'docx' && anchor.kind !== 'docx-text')
+      ) {
+        return [];
+      }
+      entryIds.add(candidate.glossaryEntryId);
+      return [
+        {
+          glossaryEntryId: candidate.glossaryEntryId,
+          documentId,
+          displayedWord: candidate.displayedWord,
+          normalizedLookupWord: candidate.normalizedLookupWord,
+          definition: candidate.definition,
+          locationKind: 'semantic',
+          anchor,
+          locationLabel: candidate.locationLabel.trim(),
+          createdAt: candidate.createdAt,
+          source,
+        },
+      ];
+    }
+
+    if (
+      documentType === 'pptx' ||
+      documentType === 'docx' ||
+      !isPositiveInteger(candidate.pageNumber) ||
+      !isPositiveIntegerOrZero(candidate.startOffset) ||
+      !isPositiveIntegerOrZero(candidate.endOffset) ||
+      candidate.endOffset < candidate.startOffset ||
+      !isNonEmptyString(candidate.markerAnnotationId) ||
+      markerIds.has(candidate.markerAnnotationId)
+    ) {
+      return [];
+    }
+    const sourceRects = sanitizeRectangles(candidate.sourceRects);
+    if (sourceRects.length === 0) return [];
     entryIds.add(candidate.glossaryEntryId);
     markerIds.add(candidate.markerAnnotationId);
     return [
@@ -49,7 +91,7 @@ export function sanitizePersistedGlossaryEntries(
         createdAt: candidate.createdAt,
         source,
         markerAnnotationId: candidate.markerAnnotationId,
-      } as GlossaryEntry,
+      } as PdfGlossaryEntry,
     ];
   });
 }
@@ -119,7 +161,7 @@ export function sanitizeDictionarySource(
   return null;
 }
 
-function sanitizeRectangles(value: unknown): GlossaryEntry['sourceRects'] {
+function sanitizeRectangles(value: unknown): PdfGlossaryEntry['sourceRects'] {
   if (!Array.isArray(value)) return [];
   return value.flatMap((rectangle) =>
     isRecord(rectangle) &&
@@ -138,6 +180,10 @@ function sanitizeRectangles(value: unknown): GlossaryEntry['sourceRects'] {
         ]
       : [],
   );
+}
+
+function isLocationLabel(value: unknown): value is string {
+  return isNonEmptyString(value) && value.trim().length <= 256;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

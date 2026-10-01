@@ -6,9 +6,14 @@
   "scripts": {
     "dev": "vite",
     "start:local": "vite --host 127.0.0.1 --port 5173 --strictPort",
-    "build": "tsc -b && vite build",
+    "build": "tsc -b && vite build && node scripts/verify-pdf-runtime-assets.mjs",
+    "office-worker:verify": "npm run build && npm run office-worker:verify-built",
+    "office-worker:verify-built": "node scripts/verify-office-worker-runtime.mjs",
     "lint": "eslint .",
-    "test": "node --test tests/initialNavigation.test.ts tests/annotatedPdfExport.test.ts tests/launcherIdentity.test.ts tests/dictionaryGlossary.test.ts tests/dictionaryProviders.test.ts tests/annotationWorkflow.test.ts tests/pdfSelectionText.test.ts tests/productivityExtensions.test.ts tests/pdfRuntimeIntegrity.test.ts tests/aiProviders.test.ts",
+    "test": "node --test tests/initialNavigation.test.ts tests/annotatedPdfExport.test.ts tests/launcherIdentity.test.ts tests/dictionaryGlossary.test.ts tests/dictionaryProviders.test.ts tests/annotationWorkflow.test.ts tests/annotationTags.test.ts tests/readerFitWidth.test.ts tests/pdfSelectionText.test.ts tests/productivityExtensions.test.ts tests/pdfRuntimeIntegrity.test.ts tests/pdfOpenError.test.ts tests/existingPdfLibraryOpen.test.ts tests/documentAdapters.test.ts tests/officePdfConversion.test.ts tests/aiProviders.test.ts tests/googleDriveSync.test.ts tests/syncUx.test.ts tests/syncUiBackupEdgeCases.test.ts tests/syncRootDiscoverySafety.test.ts tests/syncSoundProgressEdges.test.ts tests/syncErrorTransitions.test.ts tests/paperBackup.test.ts tests/legacyDriveHousekeeping.test.ts tests/paperPackageLayoutMigration.test.ts tests/paperSyncProtocol.test.ts tests/paperPresence.test.ts tests/paperV3Library.test.ts tests/paperPrintTemplates.test.ts tests/paperSyncExperience.test.ts tests/paperOperationLifecycle.test.ts tests/paperRetryRecovery.test.ts tests/localRemovalConvergence.test.ts tests/homeWorkspace.test.ts tests/temporaryWorkspace.test.ts",
+    "sync-worker:build": "npm --prefix sync-worker run build",
+    "sync-worker:test": "npm --prefix sync-worker test",
+    "sync-worker:typecheck": "npm --prefix sync-worker run typecheck",
     "dictionary:build": "node scripts/build-wordnet-shards.mjs",
     "pdf-source-lexicon:build": "node scripts/build-pdf-source-lexicon.mjs",
     "format": "prettier --write .",
@@ -16,6 +21,8 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@expo-google-fonts/arimo": "0.4.3",
+    "@expo-google-fonts/noto-sans-sc": "0.4.3",
     "@lexical/history": "^0.49.0",
     "@lexical/html": "^0.49.0",
     "@lexical/link": "^0.49.0",
@@ -26,13 +33,15 @@
     "@lexical/table": "^0.49.0",
     "@lexical/utils": "^0.49.0",
     "@tailwindcss/vite": "^4.1.13",
+    "fast-xml-parser": "5.7.0",
     "idb": "^8.0.3",
     "jszip": "^3.10.1",
     "lexical": "^0.49.0",
     "pdf-lib": "^1.17.1",
-    "pdfjs-dist": "5.7.284",
+    "pdfjs-dist": "6.3.289",
     "react": "^19.1.1",
     "react-dom": "^19.1.1",
+    "reamkit": "1.29.0",
     "tailwindcss": "^4.1.13"
   },
   "devDependencies": {

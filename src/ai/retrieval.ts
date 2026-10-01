@@ -135,11 +135,15 @@ export function retrieveRelevantChunks(
   };
 }
 
-export function formatDocumentExcerpts(chunks: readonly DocumentChunk[]): string {
+export function formatDocumentExcerpts(
+  chunks: readonly DocumentChunk[],
+  unitKind: 'page' | 'slide' | 'block' = 'page',
+): string {
+  const unitLabel = unitKind === 'page' ? 'pages' : `${unitKind}s`;
   return chunks
     .map(
       (chunk) =>
-        `--- DOCUMENT EXCERPT | pages ${chunk.pageNumbers.join(', ')} | chunk ${chunk.id} ---\n${chunk.text}`,
+        `--- DOCUMENT EXCERPT | ${unitLabel} ${chunk.pageNumbers.join(', ')} | chunk ${chunk.id} ---\n${chunk.text}`,
     )
     .join('\n\n');
 }

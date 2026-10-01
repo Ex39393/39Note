@@ -1,6 +1,14 @@
-import { useEffect, useState, type CSSProperties, type PointerEvent as ReactPointerEvent } from 'react';
+import {
+  useEffect,
+  useState,
+  type CSSProperties,
+  type PointerEvent as ReactPointerEvent,
+} from 'react';
 import type { PDFDocumentProxy } from 'pdfjs-dist';
-import { AnnotationFilterControl, type AnnotationFilterState } from './pdf/AnnotationFilterControl';
+import {
+  AnnotationFilterControl,
+  type AnnotationFilterState,
+} from './pdf/AnnotationFilterControl';
 import { PdfNavigationDrawer } from './pdf/PdfNavigationDrawer';
 import type { PdfAnnotation } from '../types/highlight';
 import { DrawerEdgeHandle } from './DrawerEdgeHandle';
@@ -29,7 +37,11 @@ function readBooleanPreference(key: string, fallback: boolean): boolean {
 
 function readSplitPreference(): number {
   const value = Number(sessionStorage.getItem('39note.reader-tools-split'));
-  return Number.isFinite(value) && value >= MIN_PANEL_PERCENT && value <= MAX_PANEL_PERCENT ? value : 50;
+  return Number.isFinite(value) &&
+    value >= MIN_PANEL_PERCENT &&
+    value <= MAX_PANEL_PERCENT
+    ? value
+    : 50;
 }
 
 export function Sidebar({
@@ -45,10 +57,16 @@ export function Sidebar({
   annotationFilter,
   onAnnotationFilterChange,
 }: SidebarProps) {
-  const [isNavigationOpen, setIsNavigationOpen] = useState(() => readBooleanPreference('39note.reader-navigation-open', true));
-  const [isAnnotationsOpen, setIsAnnotationsOpen] = useState(() => readBooleanPreference('39note.reader-annotations-open', true));
+  const [isNavigationOpen, setIsNavigationOpen] = useState(() =>
+    readBooleanPreference('39note.reader-navigation-open', true),
+  );
+  const [isAnnotationsOpen, setIsAnnotationsOpen] = useState(() =>
+    readBooleanPreference('39note.reader-annotations-open', true),
+  );
   const [splitPercent, setSplitPercent] = useState(readSplitPreference);
-  const [resizeStart, setResizeStart] = useState<{ x: number; width: number } | null>(null);
+  const [resizeStart, setResizeStart] = useState<{ x: number; width: number } | null>(
+    null,
+  );
 
   useEffect(() => {
     sessionStorage.setItem('39note.reader-navigation-open', String(isNavigationOpen));
@@ -64,7 +82,19 @@ export function Sidebar({
 
   useEffect(() => {
     if (!resizeStart) return undefined;
-    const resize = (event: PointerEvent) => onWidthChange(Math.min(520, Math.max(240, Math.min(window.innerWidth * 0.42, resizeStart.width + event.clientX - resizeStart.x))));
+    const resize = (event: PointerEvent) =>
+      onWidthChange(
+        Math.min(
+          520,
+          Math.max(
+            240,
+            Math.min(
+              window.innerWidth * 0.42,
+              resizeStart.width + event.clientX - resizeStart.x,
+            ),
+          ),
+        ),
+      );
     const stop = () => setResizeStart(null);
     window.document.body.classList.add('is-resizing-sidebar');
     window.addEventListener('pointermove', resize);
@@ -88,19 +118,42 @@ export function Sidebar({
       className="sidebar reader-tools-sidebar"
       aria-label="Reader Tools"
       aria-hidden={isCollapsed}
-      style={{ '--sidebar-width': `${width}px`, '--reader-tools-split': `${splitPercent}%` } as CSSProperties}
+      data-reader-occlusion-active={isCollapsed ? 'false' : 'true'}
+      data-reader-occlusion-edge="left"
+      style={
+        {
+          '--sidebar-width': `${width}px`,
+          '--reader-tools-split': `${splitPercent}%`,
+        } as CSSProperties
+      }
     >
       <div className="sidebar-inner reader-tools-inner">
-        <section className={`sidebar-section reader-tool-section navigation-tool ${isNavigationOpen ? 'is-open' : ''}`}>
+        <section
+          className={`sidebar-section reader-tool-section navigation-tool ${isNavigationOpen ? 'is-open' : ''}`}
+        >
           <header>
             <h2>Navigation</h2>
-            <button aria-controls="reader-navigation-content" aria-expanded={isNavigationOpen} type="button" onClick={() => setIsNavigationOpen((open) => !open)}>
+            <button
+              aria-controls="reader-navigation-content"
+              aria-expanded={isNavigationOpen}
+              type="button"
+              onClick={() => setIsNavigationOpen((open) => !open)}
+            >
               {isNavigationOpen ? 'Collapse' : 'Expand'}
             </button>
           </header>
           {isNavigationOpen ? (
             <div id="reader-navigation-content" className="reader-tool-content">
-              {pdfDocument ? <PdfNavigationDrawer document={pdfDocument} currentPage={currentPage} embedded onGoToPage={onGoToPage} /> : <p>Open a PDF to browse its outline and pages.</p>}
+              {pdfDocument ? (
+                <PdfNavigationDrawer
+                  document={pdfDocument}
+                  currentPage={currentPage}
+                  embedded
+                  onGoToPage={onGoToPage}
+                />
+              ) : (
+                <p>Open a PDF to browse its outline and pages.</p>
+              )}
             </div>
           ) : null}
         </section>
@@ -116,16 +169,28 @@ export function Sidebar({
             onDoubleClick={() => setSplitPercent(50)}
           />
         ) : null}
-        <section className={`sidebar-section reader-tool-section annotations-tool ${isAnnotationsOpen ? 'is-open' : ''}`}>
+        <section
+          className={`sidebar-section reader-tool-section annotations-tool ${isAnnotationsOpen ? 'is-open' : ''}`}
+        >
           <header>
             <h2>Annotations</h2>
-            <button aria-controls="reader-annotations-content" aria-expanded={isAnnotationsOpen} type="button" onClick={() => setIsAnnotationsOpen((open) => !open)}>
+            <button
+              aria-controls="reader-annotations-content"
+              aria-expanded={isAnnotationsOpen}
+              type="button"
+              onClick={() => setIsAnnotationsOpen((open) => !open)}
+            >
               {isAnnotationsOpen ? 'Collapse' : 'Expand'}
             </button>
           </header>
           {isAnnotationsOpen ? (
             <div id="reader-annotations-content" className="reader-tool-content">
-              <AnnotationFilterControl annotations={annotations} notedIds={notedAnnotationIds} filter={annotationFilter} onChange={onAnnotationFilterChange} />
+              <AnnotationFilterControl
+                annotations={annotations}
+                notedIds={notedAnnotationIds}
+                filter={annotationFilter}
+                onChange={onAnnotationFilterChange}
+              />
             </div>
           ) : null}
         </section>
@@ -136,7 +201,13 @@ export function Sidebar({
         side="left"
         onToggle={onToggle}
       />
-      <button aria-label="Resize Reader Tools panel" className="sidebar-resize-handle" tabIndex={-1} type="button" onPointerDown={beginResizing} />
+      <button
+        aria-label="Resize Reader Tools panel"
+        className="sidebar-resize-handle"
+        tabIndex={-1}
+        type="button"
+        onPointerDown={beginResizing}
+      />
     </aside>
   );
 }

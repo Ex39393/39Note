@@ -11,6 +11,7 @@ import {
 } from '../src/utils/dictionary.ts';
 import {
   createGlossaryEntryFromBubble,
+  createSemanticGlossaryEntry,
   getDefaultPrintLayout,
   getPrintContentItems,
   markDefinitionBubbleAdded,
@@ -18,11 +19,7 @@ import {
   sortGlossaryEntries,
   getPrintLayoutClass,
 } from '../src/utils/glossaryModel.ts';
-import {
-  getGlossaryUnderlineColor,
-  readingThemes,
-  themes,
-} from '../src/themes.ts';
+import { getGlossaryUnderlineColor, readingThemes, themes } from '../src/themes.ts';
 import {
   createIdempotentCleanup,
   getPrintLayoutCss,
@@ -82,6 +79,22 @@ const themeCssSource = readFileSync(
 );
 const notesPanelSource = readFileSync(
   new URL('../src/components/NotesPanel.tsx', import.meta.url),
+  'utf8',
+);
+const viewerSource = readFileSync(
+  new URL('../src/components/Viewer.tsx', import.meta.url),
+  'utf8',
+);
+const annotationTagSource = readFileSync(
+  new URL('../src/components/pdf/AnnotationTag.tsx', import.meta.url),
+  'utf8',
+);
+const pdfPageSource = readFileSync(
+  new URL('../src/components/pdf/PdfPage.tsx', import.meta.url),
+  'utf8',
+);
+const appLayoutSource = readFileSync(
+  new URL('../src/components/AppLayout.tsx', import.meta.url),
   'utf8',
 );
 const printComposerEditorSource = readFileSync(
@@ -263,7 +276,29 @@ test('definition bubbles use a dedicated pointer-captured handle without persist
   assert.match(definitionBubbleSource, /onPointerCancel/);
   assert.match(definitionBubbleSource, /onLostPointerCapture/);
   assert.match(definitionBubbleSource, /definition-bubble-content/);
-  assert.doesNotMatch(definitionBubbleSource, /localStorage|indexedDB|saveDefinitionBubble/);
+  assert.doesNotMatch(
+    definitionBubbleSource,
+    /localStorage|indexedDB|saveDefinitionBubble/,
+  );
+});
+
+test('Glossary bubble actions use one wrapping, evenly spaced semantic control group', () => {
+  assert.match(
+    definitionBubbleSource,
+    /className="definition-bubble-actions"[\s\S]*?className="definition-more-button"[\s\S]*?className="definition-remove-glossary"/,
+  );
+  assert.match(
+    themeCssSource,
+    /\.definition-bubble-actions\s*\{[^}]*display:\s*flex;[^}]*flex-wrap:\s*wrap;[^}]*gap:\s*var\(--gap-compact\);/s,
+  );
+  assert.match(
+    themeCssSource,
+    /\.definition-bubble-actions\s*>\s*button\s*\{[^}]*max-width:\s*100%;[^}]*min-height:\s*var\(--control-height-compact\);[^}]*padding:\s*4px 9px;[^}]*border-radius:\s*var\(--control-radius\);[^}]*font-size:\s*var\(--font-control\);[^}]*white-space:\s*normal;/s,
+  );
+  assert.match(
+    themeCssSource,
+    /\.definition-bubble \.definition-remove-glossary\s*\{[^}]*background:\s*var\(--destructive-bg\);[^}]*color:\s*var\(--destructive-text\);/s,
+  );
 });
 
 test('Glossary ordering is page, y, x, creation time, then id without mutation', () => {
@@ -305,6 +340,113 @@ test('Glossary deletion removes only the linked semantic marker', () => {
   assert.deepEqual(result.annotations, annotations);
 });
 
+test('exact Glossary deletion preserves marks, mark-owned Note, and duplicate spellings', () => {
+  const highlight: PdfAnnotation = {
+    id: 'ordinary-highlight',
+    type: 'highlight',
+    pageNumber: 1,
+    text: 'term',
+    rects: [{ x: 0.1, y: 0.1, width: 0.1, height: 0.02 }],
+    color: 'yellow',
+    createdAt: 1,
+    updatedAt: 1,
+  };
+  const underline: PdfAnnotation = {
+    ...highlight,
+    id: 'ordinary-underline',
+    type: 'underline',
+    color: 'blue',
+  };
+  const markOwnedNote = {
+    id: 'note-1',
+    annotationId: underline.id,
+    pageNumber: 1,
+    displayNumber: '1',
+    selectedText: 'term',
+    content: 'Independent Note',
+    createdAt: 1,
+    updatedAt: 1,
+  };
+  const target = glossary('target', 1, 0.1, 0.1, 1);
+  const sameDocument = glossary('same-document', 1, 0.1, 0.1, 2);
+  const otherDocument = {
+    ...glossary('other-document', 1, 0.1, 0.1, 3),
+    documentId: 'document-2',
+  };
+  const annotations = [highlight, underline];
+  const notes = [markOwnedNote];
+  const result = removeGlossaryEntry(
+    [target, sameDocument, otherDocument],
+    annotations,
+    target.glossaryEntryId,
+  );
+
+  assert.deepEqual(
+    result.entries.map(({ glossaryEntryId }) => glossaryEntryId),
+    ['same-document', 'other-document'],
+  );
+  assert.deepEqual(result.annotations, annotations);
+  assert.deepEqual(notes, [markOwnedNote]);
+});
+
+test('Glossary add/reload/remove/reload round-trip stays document scoped', () => {
+  const added = glossary('persisted-entry', 1, 0.1, 0.1, 1);
+  const firstReload = sanitizePersistedGlossaryEntries(
+    JSON.parse(JSON.stringify([added])),
+    'document-1',
+    'pdf',
+  );
+  assert.deepEqual(
+    firstReload.map(({ glossaryEntryId }) => glossaryEntryId),
+    ['persisted-entry'],
+  );
+
+  const removed = removeGlossaryEntry(firstReload, [], 'persisted-entry');
+  const secondReload = sanitizePersistedGlossaryEntries(
+    JSON.parse(JSON.stringify(removed.entries)),
+    'document-1',
+    'pdf',
+  );
+  assert.deepEqual(secondReload, []);
+
+  const otherDocumentEntry = {
+    ...added,
+    glossaryEntryId: 'other-document-entry',
+    documentId: 'document-2',
+    markerAnnotationId: 'other-document-marker',
+  };
+  assert.equal(
+    sanitizePersistedGlossaryEntries(
+      JSON.parse(JSON.stringify([otherDocumentEntry])),
+      'document-2',
+      'pdf',
+    )[0]?.glossaryEntryId,
+    'other-document-entry',
+  );
+});
+
+test('Reader removal UI uses exact identity and clears transient presentation state', () => {
+  assert.match(notesPanelSource, />\s*Remove from Glossary\s*</);
+  assert.match(annotationTagSource, /Remove from Glossary/);
+  assert.match(definitionBubbleSource, /Remove from Glossary/);
+  assert.match(
+    definitionBubbleSource,
+    /onRemoveFromGlossary\(persistedGlossaryEntryId\)/,
+  );
+  assert.match(
+    annotationTagSource,
+    /onRemoveGlossaryEntry\(glossaryEntry\.glossaryEntryId\)/,
+  );
+  assert.match(appLayoutSource, /candidate\.glossaryEntryId === glossaryEntryId/);
+  assert.match(
+    appLayoutSource,
+    /documentStateRef\.current = \{[\s\S]*?glossaryEntries: result\.entries/,
+  );
+  assert.match(viewerSource, /glossaryEntryId: undefined/);
+  assert.match(viewerSource, /addedConfirmationToken: undefined/);
+  assert.match(pdfPageSource, /glossaryEntries\.flatMap\(\(entry\) =>/);
+});
+
 test('all seven themes expose a visible semantic marker colour', () => {
   const colors = readingThemes.map(getGlossaryUnderlineColor);
   assert.deepEqual(readingThemes, [
@@ -321,60 +463,67 @@ test('all seven themes expose a visible semantic marker colour', () => {
   assert.ok(colors.every((color) => /^#[0-9a-f]{6}$/i.test(color)));
 });
 
-test('Mint exposes its complete built-in semantic palette', () => {
-  const mint = themes.mint;
-  assert.equal(mint.label, 'Mint');
-  assert.equal(mint.appBackground, '#EEF7F3');
-  assert.equal(mint.surfaceBackground, '#F7FCFA');
-  assert.equal(mint.elevatedBackground, '#FFFFFF');
-  assert.equal(mint.panelBackground, '#DDEFE8');
-  assert.equal(mint.textColor, '#223238');
-  assert.equal(mint.mutedTextColor, '#6E8488');
-  assert.equal(mint.borderColor, '#C8DDD5');
-  assert.equal(mint.accentColor, '#4FAF8F');
-  assert.equal(mint.glossaryUnderlineColor, '#2F6E5A');
-  assert.equal(mint.canvasFilter, 'none');
-  assert.deepEqual(mint.semanticPalette, {
-    mainBackground: '#F7FCFA',
-    cardBackground: '#FFFFFF',
-    drawerBackground: '#F1FAF6',
-    sectionBackground: '#F1FAF6',
-    toolbarBackground: '#E8F5F0',
-    dictionaryBackground: '#FFFFFF',
-    selectionToolbarBackground: '#FFFFFF',
-    selectionToolbarActive: '#CFEDE2',
-    noteFocusBackground: '#D8F1E7',
-    glossaryCardBackground: '#F1FAF6',
-    navigationFocusColor: '#BEE7D8',
-    secondaryAccentColor: '#67B7E8',
-    secondaryAccentHover: '#52A8DD',
-    secondaryAccentActive: '#3D97CF',
-    secondarySoftFill: '#DCEFFD',
-    secondaryTextColor: '#4C6469',
-    faintTextColor: '#8BA0A3',
-    strongerBorderColor: '#B7D0C8',
-    dividerColor: '#D6E8E1',
-    accentHover: '#3E9F80',
-    accentActive: '#2F8E70',
-    accentSoftFill: '#D9F0E7',
-    accentBorderColor: '#8FCBB8',
-    chipBackground: '#D9F0E7',
-    chipSelectedBackground: '#4FAF8F',
-    chipSelectedText: '#223238',
-    informationalTint: '#D9EEFA',
-    destructiveColor: '#9A5D55',
-  });
-  assert.deepEqual(
-    [
-      mint.scrollbarTrack,
-      mint.scrollbarThumb,
-      mint.scrollbarThumbHover,
-    ],
-    ['#EAF4F0', '#9BCDBB', '#7FBBA6'],
+test('Dawn, Twilight, and Mint expose complete differentiated semantic palettes', () => {
+  const expectedSemanticKeys = [
+    'accentActive',
+    'accentBorderColor',
+    'accentHover',
+    'accentSoftFill',
+    'cardBackground',
+    'chipBackground',
+    'chipSelectedBackground',
+    'chipSelectedText',
+    'destructiveColor',
+    'dictionaryBackground',
+    'dividerColor',
+    'drawerBackground',
+    'faintTextColor',
+    'glossaryCardBackground',
+    'informationalTint',
+    'mainBackground',
+    'navigationFocusColor',
+    'noteFocusBackground',
+    'secondaryAccentActive',
+    'secondaryAccentColor',
+    'secondaryAccentHover',
+    'secondarySoftFill',
+    'secondaryTextColor',
+    'sectionBackground',
+    'selectionToolbarActive',
+    'selectionToolbarBackground',
+    'strongerBorderColor',
+    'toolbarBackground',
+  ];
+
+  for (const id of ['dawn', 'twilight', 'mint'] as const) {
+    const theme = themes[id];
+    const semantic = theme.semanticPalette;
+    assert.ok(semantic, `${theme.label} should define its full semantic palette`);
+    assert.deepEqual(Object.keys(semantic).sort(), expectedSemanticKeys);
+    assert.ok(Object.values(semantic).every((color) => /^#[0-9a-f]{6}$/i.test(color)));
+    assert.ok(
+      new Set([
+        theme.appBackground,
+        semantic.mainBackground,
+        semantic.sectionBackground,
+        semantic.drawerBackground,
+        semantic.cardBackground,
+      ]).size >= 5,
+      `${theme.label} should keep adjacent application surfaces distinct`,
+    );
+  }
+
+  assert.equal(themes.mint.canvasFilter, 'none');
+  assert.ok(
+    relativeLuminance(themes.mint.appBackground) <
+      relativeLuminance(themes.mint.surfaceBackground),
+    'Mint should use a grounded surround and a lighter reading surface',
   );
+  assert.ok(relativeLuminance(themes.dawn.appBackground) > 0.035);
+  assert.ok(relativeLuminance(themes.twilight.appBackground) > 0.03);
 });
 
-test('Mint semantic tokens drive app-owned UI without recolouring PDF or print output', () => {
+test('semantic tokens drive app-owned UI without recolouring PDF or print output', () => {
   for (const token of [
     '--theme-card',
     '--theme-drawer',
@@ -387,25 +536,30 @@ test('Mint semantic tokens drive app-owned UI without recolouring PDF or print o
     assert.match(themeProviderSource, new RegExp(token));
     assert.match(themeCssSource, new RegExp(token));
   }
-  assert.match(themeCssSource, /data-reading-theme='mint'/);
   assert.doesNotMatch(noteExportSource, /data-reading-theme|--theme-/);
 });
 
-test('Mint reading and control colour pairs retain practical text contrast', () => {
-  const mint = themes.mint;
-  const semantic = mint.semanticPalette;
-  assert.ok(semantic);
+test('rebalanced themes retain practical reading and control contrast', () => {
+  for (const id of ['dawn', 'twilight', 'mint'] as const) {
+    const theme = themes[id];
+    const semantic = theme.semanticPalette;
+    assert.ok(semantic);
 
-  assert.ok(contrastRatio(mint.textColor, mint.surfaceBackground) >= 7);
-  assert.ok(
-    contrastRatio(semantic.secondaryTextColor, semantic.drawerBackground) >= 4.5,
-  );
-  assert.ok(
-    contrastRatio(semantic.chipSelectedText, mint.accentColor) >= 4.5,
-  );
-  assert.ok(
-    contrastRatio(mint.glossaryUnderlineColor, mint.pageBackground) >= 4.5,
-  );
+    assert.ok(contrastRatio(theme.textColor, theme.surfaceBackground) >= 6);
+    assert.ok(
+      contrastRatio(semantic.secondaryTextColor, semantic.drawerBackground) >= 4.5,
+    );
+    assert.ok(
+      contrastRatio(semantic.secondaryTextColor, theme.inputBackground) >= 4.5,
+      `${theme.label} secondary text should remain readable on controls`,
+    );
+    assert.ok(
+      contrastRatio(semantic.faintTextColor, semantic.cardBackground) >= 4.5,
+      `${theme.label} faint text should remain readable on cards`,
+    );
+    assert.ok(contrastRatio(semantic.chipSelectedText, theme.accentColor) >= 4.5);
+    assert.ok(contrastRatio(theme.glossaryUnderlineColor, theme.pageBackground) >= 4.5);
+  }
 });
 
 test('print layouts are explicit and Standard remains the default', () => {
@@ -419,10 +573,7 @@ test('print layouts are explicit and Standard remains the default', () => {
   assert.equal(getPrintLayoutClass('standard'), 'print-layout-standard');
   assert.equal(getPrintLayoutClass('space-saving'), 'print-layout-space-saving');
   assert.equal(getPrintLayoutClass('extra-large'), 'print-layout-extra-large');
-  assert.equal(
-    getPrintLayoutClass('all-annotations'),
-    'print-layout-all-annotations',
-  );
+  assert.equal(getPrintLayoutClass('all-annotations'), 'print-layout-all-annotations');
 });
 
 test('Standard and Space-saving print styles remain unchanged', () => {
@@ -458,9 +609,9 @@ test('the three existing print layouts retain identical Note and Glossary conten
     updatedAt: 1,
   };
   const entry = glossary('print-entry', 3, 0.1, 0.1, 1);
-  const contentByLayout = notesPrintLayouts.slice(0, 3).map(() =>
-    getPrintContentItems([note], [entry]),
-  );
+  const contentByLayout = notesPrintLayouts
+    .slice(0, 3)
+    .map(() => getPrintContentItems([note], [entry]));
   assert.deepEqual(contentByLayout[0], contentByLayout[1]);
   assert.deepEqual(contentByLayout[1], contentByLayout[2]);
   assert.equal(contentByLayout[2].notes[0].content, 'A long-form study note.');
@@ -486,7 +637,7 @@ test('printed Glossary entries are compact and keep one consolidated attribution
   assert.doesNotMatch(entryHtml, /<h3>/);
   assert.match(noteExportSource, /getDictionaryAttributionText/);
   assert.match(noteExportSource, /dictionary-attribution/);
-  assert.match(notesPanelSource, /Page \{entry\.pageNumber\}/);
+  assert.match(notesPanelSource, /Page \$\{entry\.pageNumber\}/);
   assert.doesNotMatch(
     printComposerEditorSource,
     /Page \$\{entry\.pageNumber\}.*entry\.source/,
@@ -561,6 +712,47 @@ test('backup validation preserves Glossary entries and marker links', () => {
   assert.equal(restored[0].markerAnnotationId, 'marker-entry');
 });
 
+test('Office Glossary entries persist semantic locations without PDF page fields', () => {
+  const entry = createSemanticGlossaryEntry(
+    'document-office',
+    'Term',
+    definitions[0],
+    {
+      version: 1,
+      kind: 'docx-text',
+      documentId: 'document-office',
+      blockId: 'paragraph-4',
+      blockIndex: 4,
+      structuralPath: [4],
+      quote: 'Term',
+      prefix: 'A ',
+      suffix: ' appears',
+      startOffset: 2,
+      endOffset: 6,
+    },
+    10,
+    'semantic-entry',
+  );
+  const restored = sanitizePersistedGlossaryEntries(
+    JSON.parse(JSON.stringify([entry])),
+    'document-office',
+    'docx',
+  );
+
+  assert.equal(restored.length, 1);
+  assert.equal(restored[0].glossaryEntryId, entry.glossaryEntryId);
+  assert.equal(restored[0].locationKind, 'semantic');
+  assert.deepEqual(
+    restored[0].locationKind === 'semantic' ? restored[0].anchor : null,
+    entry.anchor,
+  );
+  assert.equal('pageNumber' in restored[0], false);
+  assert.equal(
+    sanitizePersistedGlossaryEntries([entry], 'document-office', 'pdf').length,
+    0,
+  );
+});
+
 function glossary(
   id: string,
   pageNumber: number,
@@ -603,13 +795,7 @@ function contrastRatio(first: string, second: string): number {
 function relativeLuminance(hex: string): number {
   const channels = [1, 3, 5].map((index) => {
     const channel = Number.parseInt(hex.slice(index, index + 2), 16) / 255;
-    return channel <= 0.04045
-      ? channel / 12.92
-      : ((channel + 0.055) / 1.055) ** 2.4;
+    return channel <= 0.04045 ? channel / 12.92 : ((channel + 0.055) / 1.055) ** 2.4;
   });
-  return (
-    0.2126 * channels[0] +
-    0.7152 * channels[1] +
-    0.0722 * channels[2]
-  );
+  return 0.2126 * channels[0] + 0.7152 * channels[1] + 0.0722 * channels[2];
 }

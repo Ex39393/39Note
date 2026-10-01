@@ -1,15 +1,14 @@
-import {
-  useEffect,
-  useMemo,
-  useRef,
-  useState,
-  type PointerEvent as ReactPointerEvent,
-} from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import type { Note } from '../types/note';
-import type { GlossaryEntry, NotesPrintLayout } from '../types/glossary';
+import {
+  isPdfGlossaryEntry,
+  type GlossaryEntry,
+  type NotesPrintLayout,
+} from '../types/glossary';
 import { getDefaultPrintLayout } from '../utils/glossary';
 import { formatPdfSourceTextForDisplay } from '../utils/pdfSourceText';
 import { DrawerEdgeHandle } from './DrawerEdgeHandle';
+import { NoteDragHandle, type NoteDragStartHandler } from './NoteDragHandle';
 
 interface NotesPanelProps {
   notes: Note[];
@@ -30,8 +29,12 @@ interface NotesPanelProps {
   onEditBeforePrinting: (layout: NotesPrintLayout) => void;
   onNavigateGlossary: (entry: GlossaryEntry) => void;
   onRemoveGlossary: (glossaryEntryId: string) => void;
-  onBeginNoteDrag: (note: Note, event: ReactPointerEvent<HTMLButtonElement>) => void;
+  onBeginNoteDrag: NoteDragStartHandler;
   onOpenLargeEditor: (note: Note) => void;
+}
+
+function getGlossaryLocationLabel(entry: GlossaryEntry): string {
+  return isPdfGlossaryEntry(entry) ? `Page ${entry.pageNumber}` : entry.locationLabel;
 }
 
 export function NotesPanel({
@@ -70,28 +73,28 @@ export function NotesPanel({
     [notes, searchQuery],
   );
 
-  if (!isOpen) {
-    return (
-      <aside className="notes-panel is-closed" aria-label="Notes and Glossary">
-        <DrawerEdgeHandle
-          accessibleLabel={`Open Notes and Glossary (${notes.length + glossaryEntries.length})`}
-          isOpen={false}
-          side="right"
-          onToggle={onToggle}
-        />
-      </aside>
-    );
-  }
-
   return (
-    <aside className="notes-panel" aria-label="Notes and Glossary">
+    <aside
+      className={`notes-panel ${isOpen ? 'is-open' : 'is-closed'}`}
+      aria-label="Notes and Glossary"
+      data-reader-occlusion-active={isOpen ? 'true' : 'false'}
+      data-reader-occlusion-edge="right"
+    >
       <DrawerEdgeHandle
-        accessibleLabel="Collapse Notes and Glossary"
-        isOpen
+        accessibleLabel={
+          isOpen
+            ? 'Collapse Notes and Glossary'
+            : `Open Notes and Glossary (${notes.length + glossaryEntries.length})`
+        }
+        isOpen={isOpen}
         side="right"
         onToggle={onToggle}
       />
-      <div className="notes-panel-header">
+      <div
+        className="notes-panel-header"
+        aria-hidden={isOpen ? undefined : true}
+        inert={isOpen ? undefined : true}
+      >
         <div className="notes-panel-heading">
           <h2>Notes &amp; Glossary</h2>
         </div>
@@ -119,7 +122,11 @@ export function NotesPanel({
           <span>{notes.length + glossaryEntries.length}</span>
         </div>
       </div>
-      <div className="notes-panel-content">
+      <div
+        className="notes-panel-content"
+        aria-hidden={isOpen ? undefined : true}
+        inert={isOpen ? undefined : true}
+      >
         <section className="notes-drawer-section">
           <button
             className="notes-section-toggle"
@@ -159,7 +166,7 @@ export function NotesPanel({
               <div className="notes-card-list">
                 {notes.length === 0 ? (
                   <p className="notes-empty">
-                    Select PDF text and choose Add Note to begin.
+                    Highlight or underline PDF text, then choose Add Note from its Tag.
                   </p>
                 ) : matchingNotes.length === 0 ? (
                   <p className="notes-empty">No notes match this search.</p>
@@ -207,7 +214,7 @@ export function NotesPanel({
                   <article className="glossary-card" key={entry.glossaryEntryId}>
                     <button
                       className="glossary-card-navigation"
-                      aria-label={`Go to ${entry.displayedWord} on page ${entry.pageNumber}`}
+                      aria-label={`Go to ${entry.displayedWord} at ${getGlossaryLocationLabel(entry)}`}
                       type="button"
                       onClick={() => onNavigateGlossary(entry)}
                     >
@@ -215,13 +222,13 @@ export function NotesPanel({
                       <p>{entry.definition}</p>
                     </button>
                     <div>
-                      <span>Page {entry.pageNumber}</span>
+                      <span>{getGlossaryLocationLabel(entry)}</span>
                       <button
                         aria-label={`Remove ${entry.displayedWord} from Glossary`}
                         type="button"
                         onClick={() => onRemoveGlossary(entry.glossaryEntryId)}
                       >
-                        Remove
+                        Remove from Glossary
                       </button>
                     </div>
                   </article>
@@ -242,8 +249,8 @@ export function NotesPanel({
                   English Wiktionary
                 </a>
                 <p>
-                  NLM MeSH 2026 · Courtesy of the U.S. National Library of
-                  Medicine · No endorsement implied
+                  NLM MeSH 2026 · Courtesy of the U.S. National Library of Medicine · No
+                  endorsement implied
                 </p>
                 <a
                   href="https://www.nlm.nih.gov/databases/download/terms_and_conditions_mesh.html"
@@ -255,8 +262,8 @@ export function NotesPanel({
                 <p>
                   39Note sends only the selected word as dictionary query content. No
                   PDF text, filenames, Notes, annotations, Glossary contents, or
-                  document identifiers are sent. Normal network metadata may still be
-                  visible to the provider.
+                  document identifiers are sent.
+                  {' Normal network metadata may still be visible to the provider.'}
                 </p>
                 <button
                   type="button"
@@ -290,6 +297,8 @@ export function NotesPanel({
           role="dialog"
           aria-modal="true"
           aria-labelledby="notes-print-title"
+          aria-hidden={isOpen ? undefined : true}
+          inert={isOpen ? undefined : true}
         >
           <h3 id="notes-print-title">Print Notes and Glossary</h3>
           <fieldset>
@@ -377,7 +386,7 @@ interface NoteCardProps {
   onUpdate: (noteId: string, content: string) => void;
   onUpdateDisplayNumber: (noteId: string, displayNumber: string) => void;
   onDelete: (noteId: string) => void;
-  onBeginNoteDrag: (note: Note, event: ReactPointerEvent<HTMLButtonElement>) => void;
+  onBeginNoteDrag: NoteDragStartHandler;
   onOpenLargeEditor: (note: Note) => void;
 }
 
@@ -413,34 +422,17 @@ function NoteCard({
   return (
     <article
       className={`note-card ${isDragging ? 'is-dragging' : ''}`}
+      data-note-drag-source="true"
       onClick={() => onNavigate(note)}
     >
       <blockquote>{formatPdfSourceTextForDisplay(note.selectedText)}</blockquote>
       <div className="note-card-meta">
         <div className="note-card-location">
-          <button
-            aria-label="Drag to open large editor"
-            className="note-drag-handle"
-            type="button"
-            onPointerDown={(event) => {
-              if (event.button !== 0) {
-                return;
-              }
-
-              event.preventDefault();
-              event.stopPropagation();
-              onBeginNoteDrag(note, event);
-            }}
-            onKeyDown={(event) => {
-              if (event.key === 'Enter' || event.key === ' ') {
-                event.preventDefault();
-                event.stopPropagation();
-                onOpenLargeEditor(note);
-              }
-            }}
-          >
-            ⠿
-          </button>
+          <NoteDragHandle
+            note={note}
+            onBeginNoteDrag={onBeginNoteDrag}
+            onOpenLargeEditor={onOpenLargeEditor}
+          />
           <label>
             <span className="visually-hidden">Note number</span>
             <input

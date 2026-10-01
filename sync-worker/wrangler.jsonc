@@ -1,0 +1,15 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "39note-sync-auth",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-08-25",
+  "workers_dev": true,
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "39note-sync-auth",
+      "database_id": "c6e721bf-31aa-4ec3-a33e-35a7ddd3a399",
+      "migrations_dir": "migrations",
+    },
+  ],
+}

@@ -66,10 +66,7 @@ import type { NoteAnchor } from '../types/noteAnchor';
 import type { GlossaryEntry, NotesPrintLayout } from '../types/glossary';
 import type { PdfAnnotation } from '../types/highlight';
 import type { PrintDraftAddition } from '../types/productivity';
-import {
-  getPrintModeContent,
-  type PrintSourceGroup,
-} from '../utils/annotationPrint';
+import { getPrintModeContent, type PrintSourceGroup } from '../utils/annotationPrint';
 import { getDictionaryAttributionText } from '../utils/dictionary';
 import { formatPdfSourceTextForDisplay } from '../utils/pdfSourceText';
 import {
@@ -90,6 +87,13 @@ interface PrintComposerEditorProps {
   layout: NotesPrintLayout;
   initialEditorStateJson: string;
   pendingAdditions: readonly PrintDraftAddition[];
+  blocksDrawerOpen: boolean;
+  formattingDrawerOpen: boolean;
+  onToggleBlocksDrawer: () => void;
+  onToggleFormattingDrawer: () => void;
+  onCloseBlocksDrawer: () => void;
+  onCloseFormattingDrawer: () => void;
+  onCloseDrawers: () => void;
   onPendingAdditionsConsumed: () => void;
   onChange: (editorStateJson: string) => void;
   onReady: (editor: LexicalEditor) => void;
@@ -104,10 +108,28 @@ export function PrintComposerEditor({
   layout,
   initialEditorStateJson,
   pendingAdditions,
+  blocksDrawerOpen,
+  formattingDrawerOpen,
+  onToggleBlocksDrawer,
+  onToggleFormattingDrawer,
+  onCloseBlocksDrawer,
+  onCloseFormattingDrawer,
+  onCloseDrawers,
   onPendingAdditionsConsumed,
   onChange,
   onReady,
 }: PrintComposerEditorProps) {
+  useEffect(() => {
+    if (!blocksDrawerOpen && !formattingDrawerOpen) return;
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape') return;
+      event.preventDefault();
+      onCloseDrawers();
+    };
+    window.addEventListener('keydown', closeOnEscape);
+    return () => window.removeEventListener('keydown', closeOnEscape);
+  }, [blocksDrawerOpen, formattingDrawerOpen, onCloseDrawers]);
+
   const initialConfig = {
     namespace: '39NotePrintComposer',
     nodes: [
@@ -162,29 +184,47 @@ export function PrintComposerEditor({
         pendingAdditions={pendingAdditions}
         onPendingAdditionsConsumed={onPendingAdditionsConsumed}
       />
-      <PrintEditorToolbar />
-      <div className="print-editor-workspace">
-        <PrintBlockManager />
-        <div className="print-editor-canvas-shell">
-          <RichTextPlugin
-            contentEditable={
-              <ContentEditable
-                aria-label="Editable print draft"
-                className="print-editor-content"
-                spellCheck
-              />
-            }
-            ErrorBoundary={({ children }) => children}
-          />
-          <HistoryPlugin />
-          <ListPlugin />
-          <LinkPlugin />
-          <TablePlugin hasCellMerge={false} hasCellBackgroundColor />
-          <HorizontalRulePlugin />
-          <OnChangePlugin
-            ignoreSelectionChange
-            onChange={(editorState) => onChange(JSON.stringify(editorState.toJSON()))}
-          />
+      <div className="print-composer-editor">
+        <PrintEditorToolbar
+          blocksDrawerOpen={blocksDrawerOpen}
+          formattingDrawerOpen={formattingDrawerOpen}
+          onToggleBlocksDrawer={onToggleBlocksDrawer}
+          onToggleFormattingDrawer={onToggleFormattingDrawer}
+          onCloseFormattingDrawer={onCloseFormattingDrawer}
+        />
+        <div className="print-editor-workspace">
+          {blocksDrawerOpen || formattingDrawerOpen ? (
+            <button
+              aria-label="Close Print Composer drawer"
+              className="print-drawer-backdrop"
+              type="button"
+              onClick={onCloseDrawers}
+            />
+          ) : null}
+          {blocksDrawerOpen ? (
+            <PrintBlockManager onClose={onCloseBlocksDrawer} />
+          ) : null}
+          <div className="print-editor-canvas-shell">
+            <RichTextPlugin
+              contentEditable={
+                <ContentEditable
+                  aria-label="Editable print draft"
+                  className="print-editor-content"
+                  spellCheck
+                />
+              }
+              ErrorBoundary={({ children }) => children}
+            />
+            <HistoryPlugin />
+            <ListPlugin />
+            <LinkPlugin />
+            <TablePlugin hasCellMerge={false} hasCellBackgroundColor />
+            <HorizontalRulePlugin />
+            <OnChangePlugin
+              ignoreSelectionChange
+              onChange={(editorState) => onChange(JSON.stringify(editorState.toJSON()))}
+            />
+          </div>
         </div>
       </div>
     </LexicalComposer>
@@ -229,12 +269,7 @@ function InitialContentPlugin({
       if (root.isEmpty() || hasOnlyEmptyDefaultContent) {
         root.clear();
         root.append(createTitleBlock(documentTitle));
-        const content = getPrintModeContent(
-          layout,
-          annotations,
-          notes,
-          noteAnchors,
-        );
+        const content = getPrintModeContent(layout, annotations, notes, noteAnchors);
         if (layout === 'all-annotations') {
           for (const group of content) root.append(createSourceGroupBlock(group));
         } else {
@@ -266,7 +301,19 @@ function InitialContentPlugin({
   return null;
 }
 
-function PrintEditorToolbar() {
+function PrintEditorToolbar({
+  blocksDrawerOpen,
+  formattingDrawerOpen,
+  onToggleBlocksDrawer,
+  onToggleFormattingDrawer,
+  onCloseFormattingDrawer,
+}: {
+  blocksDrawerOpen: boolean;
+  formattingDrawerOpen: boolean;
+  onToggleBlocksDrawer: () => void;
+  onToggleFormattingDrawer: () => void;
+  onCloseFormattingDrawer: () => void;
+}) {
   const [editor] = useLexicalComposerContext();
   const [canUndo, setCanUndo] = useState(false);
   const [canRedo, setCanRedo] = useState(false);
@@ -382,329 +429,452 @@ function PrintEditorToolbar() {
   };
 
   return (
-    <div className="print-editor-toolbar" role="toolbar" aria-label="Print formatting">
-      <div className="print-toolbar-group">
-        <button
-          aria-label="Undo"
-          disabled={!canUndo}
-          title="Undo (Ctrl+Z)"
-          type="button"
-          onClick={() => editor.dispatchCommand(UNDO_COMMAND, undefined)}
-        >
-          ↶
-        </button>
-        <button
-          aria-label="Redo"
-          disabled={!canRedo}
-          title="Redo (Ctrl+Y or Ctrl+Shift+Z)"
-          type="button"
-          onClick={() => editor.dispatchCommand(REDO_COMMAND, undefined)}
-        >
-          ↷
-        </button>
-        <button type="button" onClick={clearFormatting}>
-          Clear formatting
-        </button>
-        <button
-          type="button"
-          onClick={() =>
-            void navigator.clipboard.readText().then((text) => {
-              editor.update(() => {
-                const selection = $getSelection();
-                if ($isRangeSelection(selection)) selection.insertRawText(text);
-              });
-            })
-          }
-        >
-          Paste plain text
-        </button>
-      </div>
-      <div className="print-toolbar-group">
-        <button
-          aria-label="Bold"
-          aria-pressed={activeFormats.bold}
-          title="Bold (Ctrl+B)"
-          type="button"
-          onClick={() => editor.dispatchCommand(FORMAT_TEXT_COMMAND, 'bold')}
-        >
-          <strong>B</strong>
-        </button>
-        <button
-          aria-label="Italic"
-          aria-pressed={activeFormats.italic}
-          title="Italic (Ctrl+I)"
-          type="button"
-          onClick={() => editor.dispatchCommand(FORMAT_TEXT_COMMAND, 'italic')}
-        >
-          <em>I</em>
-        </button>
-        <button
-          aria-label="Underline"
-          aria-pressed={activeFormats.underline}
-          title="Underline (Ctrl+U)"
-          type="button"
-          onClick={() => editor.dispatchCommand(FORMAT_TEXT_COMMAND, 'underline')}
-        >
-          <u>U</u>
-        </button>
-        <button
-          aria-label="Strikethrough"
-          aria-pressed={activeFormats.strikethrough}
-          title="Strikethrough"
-          type="button"
-          onClick={() => editor.dispatchCommand(FORMAT_TEXT_COMMAND, 'strikethrough')}
-        >
-          <s>S</s>
-        </button>
-        <button
-          aria-label="Superscript"
-          aria-pressed={activeFormats.superscript}
-          title="Superscript"
-          type="button"
-          onClick={() => editor.dispatchCommand(FORMAT_TEXT_COMMAND, 'superscript')}
-        >
-          x²
-        </button>
-        <button
-          aria-label="Subscript"
-          aria-pressed={activeFormats.subscript}
-          title="Subscript"
-          type="button"
-          onClick={() => editor.dispatchCommand(FORMAT_TEXT_COMMAND, 'subscript')}
-        >
-          x₂
-        </button>
-        <label>
-          <span className="visually-hidden">Font family</span>
-          <select
-            aria-label="Font family"
-            defaultValue="Georgia"
-            onChange={(event) => patchTextStyle({ 'font-family': event.target.value })}
+    <>
+      <div
+        className="print-editor-toolbar print-editor-toolbar-compact"
+        role="toolbar"
+        aria-label="Print editing"
+      >
+        <div className="print-toolbar-group">
+          <button
+            aria-label="Undo"
+            disabled={!canUndo}
+            title="Undo (Ctrl+Z)"
+            type="button"
+            onClick={() => editor.dispatchCommand(UNDO_COMMAND, undefined)}
           >
-            <option value="Georgia, serif">Georgia</option>
-            <option value="Arial, sans-serif">Arial</option>
-            <option value="'Times New Roman', serif">Times New Roman</option>
-            <option value="Verdana, sans-serif">Verdana</option>
-            <option value="'Courier New', monospace">Courier New</option>
-          </select>
-        </label>
-        <label>
-          <span className="visually-hidden">Font size</span>
-          <select
-            aria-label="Font size"
-            defaultValue="12pt"
-            onChange={(event) => patchTextStyle({ 'font-size': event.target.value })}
+            ↶
+          </button>
+          <button
+            aria-label="Redo"
+            disabled={!canRedo}
+            title="Redo (Ctrl+Y or Ctrl+Shift+Z)"
+            type="button"
+            onClick={() => editor.dispatchCommand(REDO_COMMAND, undefined)}
           >
-            {[8, 9, 10, 11, 12, 14, 16, 18, 24, 32, 40, 48].map((size) => (
-              <option key={size} value={`${size}pt`}>
-                {size}
-              </option>
-            ))}
-          </select>
-        </label>
-        <label className="print-color-control">
-          Text
-          <input
-            aria-label="Text colour"
-            type="color"
-            defaultValue="#171717"
-            onChange={(event) => patchTextStyle({ color: event.target.value })}
-          />
-        </label>
-        <label className="print-color-control">
-          Highlight
-          <input
-            aria-label="Text highlight colour"
-            type="color"
-            defaultValue="#fff59d"
-            onChange={(event) =>
-              patchTextStyle({ 'background-color': event.target.value })
-            }
-          />
-        </label>
+            ↷
+          </button>
+        </div>
+        <div className="print-toolbar-group">
+          <button
+            aria-label="Bold"
+            aria-pressed={activeFormats.bold}
+            title="Bold (Ctrl+B)"
+            type="button"
+            onClick={() => editor.dispatchCommand(FORMAT_TEXT_COMMAND, 'bold')}
+          >
+            <strong>B</strong>
+          </button>
+          <button
+            aria-label="Italic"
+            aria-pressed={activeFormats.italic}
+            title="Italic (Ctrl+I)"
+            type="button"
+            onClick={() => editor.dispatchCommand(FORMAT_TEXT_COMMAND, 'italic')}
+          >
+            <em>I</em>
+          </button>
+          <button
+            aria-label="Underline"
+            aria-pressed={activeFormats.underline}
+            title="Underline (Ctrl+U)"
+            type="button"
+            onClick={() => editor.dispatchCommand(FORMAT_TEXT_COMMAND, 'underline')}
+          >
+            <u>U</u>
+          </button>
+        </div>
+        <div className="print-toolbar-drawer-actions">
+          <button
+            aria-controls="print-blocks-drawer"
+            aria-expanded={blocksDrawerOpen}
+            type="button"
+            onClick={onToggleBlocksDrawer}
+          >
+            Blocks
+          </button>
+          <button
+            aria-controls="print-formatting-drawer"
+            aria-expanded={formattingDrawerOpen}
+            type="button"
+            onClick={onToggleFormattingDrawer}
+          >
+            Formatting
+          </button>
+        </div>
       </div>
-      <div className="print-toolbar-group">
-        <select
-          aria-label="Paragraph style"
-          defaultValue="paragraph"
-          onChange={(event) =>
-            setBlockType(
-              event.target.value as 'paragraph' | 'h1' | 'h2' | 'h3' | 'quote',
-            )
-          }
+      {formattingDrawerOpen ? (
+        <aside
+          aria-label="Formatting"
+          className="print-formatting-drawer"
+          id="print-formatting-drawer"
+          role="dialog"
         >
-          <option value="paragraph">Normal</option>
-          <option value="h1">Heading 1</option>
-          <option value="h2">Heading 2</option>
-          <option value="h3">Heading 3</option>
-          <option value="quote">Block quote</option>
-        </select>
-        <button
-          aria-label="Align left"
-          type="button"
-          onClick={() => editor.dispatchCommand(FORMAT_ELEMENT_COMMAND, 'left')}
-        >
-          Left
-        </button>
-        <button
-          aria-label="Align centre"
-          type="button"
-          onClick={() => editor.dispatchCommand(FORMAT_ELEMENT_COMMAND, 'center')}
-        >
-          Centre
-        </button>
-        <button
-          aria-label="Align right"
-          type="button"
-          onClick={() => editor.dispatchCommand(FORMAT_ELEMENT_COMMAND, 'right')}
-        >
-          Right
-        </button>
-        <button
-          aria-label="Justify"
-          type="button"
-          onClick={() => editor.dispatchCommand(FORMAT_ELEMENT_COMMAND, 'justify')}
-        >
-          Justify
-        </button>
-        <button
-          aria-label="Decrease indent"
-          type="button"
-          onClick={() => editor.dispatchCommand(OUTDENT_CONTENT_COMMAND, undefined)}
-        >
-          Outdent
-        </button>
-        <button
-          aria-label="Increase indent"
-          type="button"
-          onClick={() => editor.dispatchCommand(INDENT_CONTENT_COMMAND, undefined)}
-        >
-          Indent
-        </button>
-        <select
-          aria-label="Line spacing"
-          defaultValue="1.5"
-          onChange={(event) => applyBlockStyle('line-height', event.target.value)}
-        >
-          <option value="1">Single</option>
-          <option value="1.15">1.15</option>
-          <option value="1.5">1.5</option>
-          <option value="2">Double</option>
-        </select>
-        <select
-          aria-label="Paragraph spacing before"
-          defaultValue="0pt"
-          onChange={(event) => applyBlockStyle('margin-top', event.target.value)}
-        >
-          <option value="0pt">Before 0</option>
-          <option value="6pt">Before 6</option>
-          <option value="12pt">Before 12</option>
-          <option value="18pt">Before 18</option>
-        </select>
-        <select
-          aria-label="Paragraph spacing after"
-          defaultValue="10pt"
-          onChange={(event) => applyBlockStyle('margin-bottom', event.target.value)}
-        >
-          <option value="0pt">After 0</option>
-          <option value="6pt">After 6</option>
-          <option value="10pt">After 10</option>
-          <option value="18pt">After 18</option>
-        </select>
-        <button
-          type="button"
-          onClick={() => {
-            applyBlockStyle('break-after', 'avoid-page');
-            applyBlockStyle('page-break-after', 'avoid');
-          }}
-        >
-          Keep with next
-        </button>
-      </div>
-      <div className="print-toolbar-group">
-        <button
-          type="button"
-          onClick={() =>
-            editor.dispatchCommand(INSERT_UNORDERED_LIST_COMMAND, undefined)
-          }
-        >
-          Bullets
-        </button>
-        <button
-          type="button"
-          onClick={() => editor.dispatchCommand(INSERT_ORDERED_LIST_COMMAND, undefined)}
-        >
-          Numbering
-        </button>
-        <button
-          type="button"
-          onClick={() => editor.dispatchCommand(REMOVE_LIST_COMMAND, undefined)}
-        >
-          Remove list
-        </button>
-        <button type="button" onClick={editLink}>
-          Add/edit link
-        </button>
-        <button
-          type="button"
-          onClick={() => editor.dispatchCommand(TOGGLE_LINK_COMMAND, null)}
-        >
-          Remove link
-        </button>
-        <button
-          type="button"
-          onClick={() =>
-            editor.dispatchCommand(INSERT_HORIZONTAL_RULE_COMMAND, undefined)
-          }
-        >
-          Horizontal rule
-        </button>
-        <button
-          type="button"
-          onClick={() =>
-            editor.update(() => $insertNodeToNearestRoot($createPageBreakNode()))
-          }
-        >
-          Page break
-        </button>
-        <button
-          type="button"
-          onClick={() =>
-            editor.dispatchCommand(INSERT_TABLE_COMMAND, {
-              columns: '3',
-              rows: '3',
-              includeHeaders: { rows: true, columns: false },
-            })
-          }
-        >
-          Insert table
-        </button>
-        <button
-          type="button"
-          onClick={() => editor.update(() => void $insertTableRowAtSelection(true))}
-        >
-          Add row
-        </button>
-        <button
-          type="button"
-          onClick={() => editor.update(() => $deleteTableRowAtSelection())}
-        >
-          Remove row
-        </button>
-        <button
-          type="button"
-          onClick={() => editor.update(() => void $insertTableColumnAtSelection(true))}
-        >
-          Add column
-        </button>
-        <button
-          type="button"
-          onClick={() => editor.update(() => $deleteTableColumnAtSelection())}
-        >
-          Remove column
-        </button>
-      </div>
-    </div>
+          <header>
+            <div>
+              <h3>Formatting</h3>
+              <p>Text, paragraph, list, link, page and table controls</p>
+            </div>
+            <button
+              aria-label="Close Formatting drawer"
+              type="button"
+              onClick={onCloseFormattingDrawer}
+            >
+              <span aria-hidden="true">×</span>
+            </button>
+          </header>
+          <div
+            className="print-formatting-controls"
+            role="toolbar"
+            aria-label="Print formatting"
+          >
+            <div className="print-toolbar-group">
+              <button
+                aria-label="Undo"
+                disabled={!canUndo}
+                title="Undo (Ctrl+Z)"
+                type="button"
+                onClick={() => editor.dispatchCommand(UNDO_COMMAND, undefined)}
+              >
+                ↶
+              </button>
+              <button
+                aria-label="Redo"
+                disabled={!canRedo}
+                title="Redo (Ctrl+Y or Ctrl+Shift+Z)"
+                type="button"
+                onClick={() => editor.dispatchCommand(REDO_COMMAND, undefined)}
+              >
+                ↷
+              </button>
+              <button type="button" onClick={clearFormatting}>
+                Clear formatting
+              </button>
+              <button
+                type="button"
+                onClick={() =>
+                  void navigator.clipboard.readText().then((text) => {
+                    editor.update(() => {
+                      const selection = $getSelection();
+                      if ($isRangeSelection(selection)) selection.insertRawText(text);
+                    });
+                  })
+                }
+              >
+                Paste plain text
+              </button>
+            </div>
+            <div className="print-toolbar-group">
+              <button
+                aria-label="Bold"
+                aria-pressed={activeFormats.bold}
+                title="Bold (Ctrl+B)"
+                type="button"
+                onClick={() => editor.dispatchCommand(FORMAT_TEXT_COMMAND, 'bold')}
+              >
+                <strong>B</strong>
+              </button>
+              <button
+                aria-label="Italic"
+                aria-pressed={activeFormats.italic}
+                title="Italic (Ctrl+I)"
+                type="button"
+                onClick={() => editor.dispatchCommand(FORMAT_TEXT_COMMAND, 'italic')}
+              >
+                <em>I</em>
+              </button>
+              <button
+                aria-label="Underline"
+                aria-pressed={activeFormats.underline}
+                title="Underline (Ctrl+U)"
+                type="button"
+                onClick={() => editor.dispatchCommand(FORMAT_TEXT_COMMAND, 'underline')}
+              >
+                <u>U</u>
+              </button>
+              <button
+                aria-label="Strikethrough"
+                aria-pressed={activeFormats.strikethrough}
+                title="Strikethrough"
+                type="button"
+                onClick={() =>
+                  editor.dispatchCommand(FORMAT_TEXT_COMMAND, 'strikethrough')
+                }
+              >
+                <s>S</s>
+              </button>
+              <button
+                aria-label="Superscript"
+                aria-pressed={activeFormats.superscript}
+                title="Superscript"
+                type="button"
+                onClick={() =>
+                  editor.dispatchCommand(FORMAT_TEXT_COMMAND, 'superscript')
+                }
+              >
+                x²
+              </button>
+              <button
+                aria-label="Subscript"
+                aria-pressed={activeFormats.subscript}
+                title="Subscript"
+                type="button"
+                onClick={() => editor.dispatchCommand(FORMAT_TEXT_COMMAND, 'subscript')}
+              >
+                x₂
+              </button>
+              <label>
+                <span className="visually-hidden">Font family</span>
+                <select
+                  aria-label="Font family"
+                  defaultValue="Georgia"
+                  onChange={(event) =>
+                    patchTextStyle({ 'font-family': event.target.value })
+                  }
+                >
+                  <option value="Georgia, serif">Georgia</option>
+                  <option value="Arial, sans-serif">Arial</option>
+                  <option value="'Times New Roman', serif">Times New Roman</option>
+                  <option value="Verdana, sans-serif">Verdana</option>
+                  <option value="'Courier New', monospace">Courier New</option>
+                </select>
+              </label>
+              <label>
+                <span className="visually-hidden">Font size</span>
+                <select
+                  aria-label="Font size"
+                  defaultValue="12pt"
+                  onChange={(event) =>
+                    patchTextStyle({ 'font-size': event.target.value })
+                  }
+                >
+                  {[8, 9, 10, 11, 12, 14, 16, 18, 24, 32, 40, 48].map((size) => (
+                    <option key={size} value={`${size}pt`}>
+                      {size}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label className="print-color-control">
+                Text
+                <input
+                  aria-label="Text colour"
+                  type="color"
+                  defaultValue="#171717"
+                  onChange={(event) => patchTextStyle({ color: event.target.value })}
+                />
+              </label>
+              <label className="print-color-control">
+                Highlight
+                <input
+                  aria-label="Text highlight colour"
+                  type="color"
+                  defaultValue="#fff59d"
+                  onChange={(event) =>
+                    patchTextStyle({ 'background-color': event.target.value })
+                  }
+                />
+              </label>
+            </div>
+            <div className="print-toolbar-group">
+              <select
+                aria-label="Paragraph style"
+                defaultValue="paragraph"
+                onChange={(event) =>
+                  setBlockType(
+                    event.target.value as 'paragraph' | 'h1' | 'h2' | 'h3' | 'quote',
+                  )
+                }
+              >
+                <option value="paragraph">Normal</option>
+                <option value="h1">Heading 1</option>
+                <option value="h2">Heading 2</option>
+                <option value="h3">Heading 3</option>
+                <option value="quote">Block quote</option>
+              </select>
+              <button
+                aria-label="Align left"
+                type="button"
+                onClick={() => editor.dispatchCommand(FORMAT_ELEMENT_COMMAND, 'left')}
+              >
+                Left
+              </button>
+              <button
+                aria-label="Align centre"
+                type="button"
+                onClick={() => editor.dispatchCommand(FORMAT_ELEMENT_COMMAND, 'center')}
+              >
+                Centre
+              </button>
+              <button
+                aria-label="Align right"
+                type="button"
+                onClick={() => editor.dispatchCommand(FORMAT_ELEMENT_COMMAND, 'right')}
+              >
+                Right
+              </button>
+              <button
+                aria-label="Justify"
+                type="button"
+                onClick={() =>
+                  editor.dispatchCommand(FORMAT_ELEMENT_COMMAND, 'justify')
+                }
+              >
+                Justify
+              </button>
+              <button
+                aria-label="Decrease indent"
+                type="button"
+                onClick={() =>
+                  editor.dispatchCommand(OUTDENT_CONTENT_COMMAND, undefined)
+                }
+              >
+                Outdent
+              </button>
+              <button
+                aria-label="Increase indent"
+                type="button"
+                onClick={() =>
+                  editor.dispatchCommand(INDENT_CONTENT_COMMAND, undefined)
+                }
+              >
+                Indent
+              </button>
+              <select
+                aria-label="Line spacing"
+                defaultValue="1.5"
+                onChange={(event) => applyBlockStyle('line-height', event.target.value)}
+              >
+                <option value="1">Single</option>
+                <option value="1.15">1.15</option>
+                <option value="1.5">1.5</option>
+                <option value="2">Double</option>
+              </select>
+              <select
+                aria-label="Paragraph spacing before"
+                defaultValue="0pt"
+                onChange={(event) => applyBlockStyle('margin-top', event.target.value)}
+              >
+                <option value="0pt">Before 0</option>
+                <option value="6pt">Before 6</option>
+                <option value="12pt">Before 12</option>
+                <option value="18pt">Before 18</option>
+              </select>
+              <select
+                aria-label="Paragraph spacing after"
+                defaultValue="10pt"
+                onChange={(event) =>
+                  applyBlockStyle('margin-bottom', event.target.value)
+                }
+              >
+                <option value="0pt">After 0</option>
+                <option value="6pt">After 6</option>
+                <option value="10pt">After 10</option>
+                <option value="18pt">After 18</option>
+              </select>
+              <button
+                type="button"
+                onClick={() => {
+                  applyBlockStyle('break-after', 'avoid-page');
+                  applyBlockStyle('page-break-after', 'avoid');
+                }}
+              >
+                Keep with next
+              </button>
+            </div>
+            <div className="print-toolbar-group">
+              <button
+                type="button"
+                onClick={() =>
+                  editor.dispatchCommand(INSERT_UNORDERED_LIST_COMMAND, undefined)
+                }
+              >
+                Bullets
+              </button>
+              <button
+                type="button"
+                onClick={() =>
+                  editor.dispatchCommand(INSERT_ORDERED_LIST_COMMAND, undefined)
+                }
+              >
+                Numbering
+              </button>
+              <button
+                type="button"
+                onClick={() => editor.dispatchCommand(REMOVE_LIST_COMMAND, undefined)}
+              >
+                Remove list
+              </button>
+              <button type="button" onClick={editLink}>
+                Add/edit link
+              </button>
+              <button
+                type="button"
+                onClick={() => editor.dispatchCommand(TOGGLE_LINK_COMMAND, null)}
+              >
+                Remove link
+              </button>
+              <button
+                type="button"
+                onClick={() =>
+                  editor.dispatchCommand(INSERT_HORIZONTAL_RULE_COMMAND, undefined)
+                }
+              >
+                Horizontal rule
+              </button>
+              <button
+                type="button"
+                onClick={() =>
+                  editor.update(() => $insertNodeToNearestRoot($createPageBreakNode()))
+                }
+              >
+                Page break
+              </button>
+              <button
+                type="button"
+                onClick={() =>
+                  editor.dispatchCommand(INSERT_TABLE_COMMAND, {
+                    columns: '3',
+                    rows: '3',
+                    includeHeaders: { rows: true, columns: false },
+                  })
+                }
+              >
+                Insert table
+              </button>
+              <button
+                type="button"
+                onClick={() =>
+                  editor.update(() => void $insertTableRowAtSelection(true))
+                }
+              >
+                Add row
+              </button>
+              <button
+                type="button"
+                onClick={() => editor.update(() => $deleteTableRowAtSelection())}
+              >
+                Remove row
+              </button>
+              <button
+                type="button"
+                onClick={() =>
+                  editor.update(() => void $insertTableColumnAtSelection(true))
+                }
+              >
+                Add column
+              </button>
+              <button
+                type="button"
+                onClick={() => editor.update(() => $deleteTableColumnAtSelection())}
+              >
+                Remove column
+              </button>
+            </div>
+          </div>
+        </aside>
+      ) : null}
+    </>
   );
 }
 
@@ -715,29 +885,32 @@ interface BlockSummary {
   hidden: boolean;
 }
 
-function PrintBlockManager() {
+function PrintBlockManager({ onClose }: { onClose: () => void }) {
   const [editor] = useLexicalComposerContext();
   const [blocks, setBlocks] = useState<BlockSummary[]>([]);
   const draggedIdRef = useRef<string | null>(null);
-  useEffect(
-    () =>
-      editor.registerUpdateListener(({ editorState }) => {
-        editorState.read(() => {
-          setBlocks(
-            $getRoot()
-              .getChildren()
-              .filter($isPrintBlockNode)
-              .map((block) => ({
-                sourceId: block.getSourceId(),
-                label: block.getLabel(),
-                kind: block.getBlockKind(),
-                hidden: block.isHidden(),
-              })),
-          );
-        });
-      }),
-    [editor],
-  );
+  useEffect(() => {
+    const updateBlocks = (editorState: ReturnType<typeof editor.getEditorState>) => {
+      editorState.read(() => {
+        setBlocks(
+          $getRoot()
+            .getChildren()
+            .filter($isPrintBlockNode)
+            .map((block) => ({
+              sourceId: block.getSourceId(),
+              label: block.getLabel(),
+              kind: block.getBlockKind(),
+              hidden: block.isHidden(),
+            })),
+        );
+      });
+    };
+
+    updateBlocks(editor.getEditorState());
+    return editor.registerUpdateListener(({ editorState }) => {
+      updateBlocks(editorState);
+    });
+  }, [editor]);
   const toggle = (sourceId: string, hidden: boolean) => {
     editor.update(() => {
       const block = $getRoot()
@@ -764,8 +937,18 @@ function PrintBlockManager() {
     });
   };
   return (
-    <aside className="print-block-manager" aria-label="Print blocks">
-      <h3>Print blocks</h3>
+    <aside
+      className="print-block-manager"
+      id="print-blocks-drawer"
+      aria-label="Print blocks"
+      role="dialog"
+    >
+      <header>
+        <h3>Print blocks</h3>
+        <button aria-label="Close Blocks drawer" type="button" onClick={onClose}>
+          <span aria-hidden="true">×</span>
+        </button>
+      </header>
       <p>Drag to reorder. Hidden blocks remain in this draft.</p>
       <div className="print-block-add-actions">
         <button type="button" onClick={() => appendCustomBlock('text')}>
@@ -876,9 +1059,11 @@ function createNoteBlock(note: Note): PrintBlockNode {
   const heading = $createHeadingNode('h2');
   heading.append($createTextNode(label));
   const source = $createQuoteNode();
-  source.append($createTextNode(
-    formatPdfSourceTextForDisplay(note.selectedText) || 'Source text unavailable',
-  ));
+  source.append(
+    $createTextNode(
+      formatPdfSourceTextForDisplay(note.selectedText) || 'Source text unavailable',
+    ),
+  );
   const body = $createParagraphNode();
   body.append($createTextNode(note.content || ''));
   const page = $createParagraphNode();
@@ -888,11 +1073,16 @@ function createNoteBlock(note: Note): PrintBlockNode {
 }
 
 function createSourceGroupBlock(group: PrintSourceGroup): PrintBlockNode {
-  const typeLabel = group.annotations.length > 0
-    ? [...new Set(group.annotations.map((annotation) =>
-        annotation.type === 'highlight' ? 'Highlight' : 'Underline'
-      ))].join(' · ')
-    : 'Note';
+  const typeLabel =
+    group.annotations.length > 0
+      ? [
+          ...new Set(
+            group.annotations.map((annotation) =>
+              annotation.type === 'highlight' ? 'Highlight' : 'Underline',
+            ),
+          ),
+        ].join(' · ')
+      : 'Note';
   const label = `${typeLabel} · Page ${group.pageNumber}`;
   const block = $createPrintBlockNode(
     group.id,
@@ -902,15 +1092,15 @@ function createSourceGroupBlock(group: PrintSourceGroup): PrintBlockNode {
   const heading = $createHeadingNode('h2');
   heading.append($createTextNode(label));
   const source = $createQuoteNode();
-  source.append($createTextNode(
-    formatPdfSourceTextForDisplay(group.sourceText) || 'Source text unavailable',
-  ));
+  source.append(
+    $createTextNode(
+      formatPdfSourceTextForDisplay(group.sourceText) || 'Source text unavailable',
+    ),
+  );
   block.append(heading, source);
   for (const note of group.notes) {
     const paragraph = $createParagraphNode();
-    const noteLabel = $createTextNode(
-      `${note.displayNumber.trim() || 'Note'}. `,
-    );
+    const noteLabel = $createTextNode(`${note.displayNumber.trim() || 'Note'}. `);
     noteLabel.toggleFormat('bold');
     paragraph.append(noteLabel, $createTextNode(note.content));
     block.append(paragraph);
@@ -942,9 +1132,7 @@ function createGlossaryAttributionBlock(
   );
   const paragraph = $createParagraphNode();
   paragraph.append(
-    $createTextNode(
-      getDictionaryAttributionText(entries.map((entry) => entry.source)),
-    ),
+    $createTextNode(getDictionaryAttributionText(entries.map((entry) => entry.source))),
   );
   block.append(paragraph);
   return block;

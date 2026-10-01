@@ -1,5 +1,8 @@
-import type { NotesPrintLayout } from '../types/glossary';
-import { getPrintLayoutCss } from '../utils/printSession';
+import {
+  getPrintTemplateClassName,
+  getPrintTemplateCss,
+  type PrintPresentation,
+} from './printTemplates.ts';
 
 const ALLOWED_TAGS = new Set([
   'ARTICLE',
@@ -93,7 +96,7 @@ export function sanitizeComposerHtml(html: string): string {
 export function printComposerHtml(
   html: string,
   documentTitle: string,
-  layout: NotesPrintLayout,
+  presentation: PrintPresentation,
   onComplete: () => void,
 ): (() => void) | null {
   const printWindow = window.open('', '_blank', 'width=980,height=780');
@@ -124,14 +127,14 @@ export function printComposerHtml(
   .print-block-glossary { margin-bottom: 7pt; }
   .print-block-glossary p { margin-bottom: 0; }
   .print-page-break { display: block; break-before: page; page-break-before: always; height: 0; }
-  ${getPrintLayoutCss(layout)}
+  ${getPrintTemplateCss(presentation)}
   body.print-layout-space-saving { font-size: 10pt; line-height: 1.3; }
   body.print-layout-space-saving .print-composer-block { margin-bottom: 10pt; }
   body.print-layout-extra-large { font-size: 16pt; line-height: 1.55; }
   body.print-layout-extra-large .print-composer-block { margin-bottom: 28pt; }
   body.print-layout-all-annotations .print-composer-block { margin-bottom: 14pt; }
   @media print { a { color: inherit; } }
-</style></head><body class="print-layout-${layout}" data-print-layout="${layout}"><main>${safeContent}</main></body></html>`);
+</style></head><body class="${getPrintTemplateClassName(presentation)}" data-print-template="${presentation.baseTemplateId}" data-print-content="${presentation.contentMode}"><main>${safeContent}</main></body></html>`);
   printWindow.document.close();
   const print = () => {
     if (printWindow.closed) {

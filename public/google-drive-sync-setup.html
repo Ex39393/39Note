@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>39Note persistent Google Drive sync</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        font-family: system-ui, sans-serif;
+        line-height: 1.55;
+      }
+      body {
+        max-width: 780px;
+        margin: 0 auto;
+        padding: 32px 20px 64px;
+      }
+      h1,
+      h2 {
+        line-height: 1.2;
+      }
+      code {
+        overflow-wrap: anywhere;
+      }
+      .notice {
+        padding: 14px;
+        border: 1px solid #7d8aa2;
+        border-radius: 10px;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Persistent personal Google Drive sync</h1>
+    <p class="notice">
+      39Note requests only <code>drive.file</code>. PDFs and editable study data travel
+      directly between this browser and Google Drive—not through the authentication
+      service.
+    </p>
+    <h2>Connection</h2>
+    <p>
+      Choose <strong>Connect Google Drive</strong> in the toolbar. After the first
+      approval, this browser stores an independent revocable device authorization and
+      can reconnect after reload or browser restart without another prompt.
+    </p>
+    <p>
+      If 39Note says <strong>Persistent sync backend not configured</strong>, this build
+      needs the public <code>VITE_39NOTE_SYNC_AUTH_URL</code> setting. Google client IDs
+      and secrets cannot be entered in the browser.
+    </p>
+    <h2>What is stored where</h2>
+    <ul>
+      <li>
+        Google Drive: original PDFs and allowlisted editable study data in a visible
+        <strong>39Note</strong> folder.
+      </li>
+      <li>
+        Authentication service: an AES-256-GCM-encrypted Google refresh token, an opaque
+        account ID, and hashed/revocable device-session metadata.
+      </li>
+      <li>
+        This browser: local library data and its device-session token. Google access
+        tokens stay in memory only.
+      </li>
+    </ul>
+    <p>
+      Drive content uses HTTPS and Google Drive storage but is not end-to-end encrypted
+      by 39Note. AI API keys, passwords, Google client secrets, and custom
+      authentication headers never sync.
+    </p>
+    <h2>Devices and revocation</h2>
+    <p>
+      Open <strong>Authorized devices</strong> to inspect the device count, switch
+      Google accounts explicitly, disconnect only this browser, or disconnect all
+      devices and revoke the Google grant.
+    </p>
+    <h2>Offline and outages</h2>
+    <p>
+      39Note remains usable locally. Changes stay queued while offline or while the
+      authentication service is unavailable.
+    </p>
+    <p><a href="./">Return to 39Note</a></p>
+  </body>
+</html>

@@ -1,18 +1,11 @@
-import {
-  lazy,
-  Suspense,
-  useCallback,
-  useEffect,
-  useRef,
-  useState,
-  type PointerEvent as ReactPointerEvent,
-} from 'react';
+import { lazy, Suspense, useCallback, useEffect, useRef, useState } from 'react';
 import type { PDFDocumentProxy } from 'pdfjs-dist';
 import { Sidebar } from './Sidebar';
 import { Toolbar } from './Toolbar';
 import { Viewer, type ViewerHandle } from './Viewer';
 import { NotesPanel } from './NotesPanel';
 import { LargeNoteEditor } from './LargeNoteEditor';
+import type { NoteDragStartHandler } from './NoteDragHandle';
 import { WebLocalDataNotice } from './WebLocalDataNotice';
 import { AnnotatedPdfExportDialog } from './AnnotatedPdfExportDialog';
 import type { AnnotationFilterState } from './pdf/AnnotationFilterControl';
@@ -30,6 +23,7 @@ import type {
   GlossaryEntry,
   NotesPrintLayout,
 } from '../types/glossary';
+import { isPdfGlossaryEntry } from '../types/glossary';
 import type {
   AnnotatedPdfExportOptions,
   AnnotatedPdfExportProgress,
@@ -44,24 +38,32 @@ import type {
   DocumentOpenTarget,
 } from '../types/documentOpen';
 import type { ReadingPosition } from '../types/library';
+import { createNoteAnchorFromSelection } from '../utils/annotationOverlap';
 import {
-  createNoteAnchorFromAnnotation,
-  createNoteAnchorFromSelection,
-  findMatchingNote,
-  findMatchingNoteForSources,
-} from '../utils/annotationOverlap';
+  addNoteToAnnotationTag,
+  deleteAnnotationTag,
+  deleteNoteFromTagState,
+  deriveAnnotationTags,
+} from '../utils/annotationTags';
 import {
   deleteDocumentState,
   deleteDocumentStates,
+  loadStoredDocumentSource,
   loadStoredPdfFile,
   loadDocumentState,
-  removeStoredPdfCopy,
+  removeStoredDocumentSource,
   saveDocumentState,
   saveReadingPosition,
-  storePdfFile,
+  storeDocumentSource,
   updateDocumentDisplayTitle,
   updateDocumentOrganization,
 } from '../services/annotationPersistence';
+import {
+  DOCUMENT_MIME_TYPES,
+  getDocumentTypeForMimeType,
+  hasDocumentFileExtension,
+  type DocumentType,
+} from '../types/document';
 import {
   createHighlightsFromSelections,
   createUnderlinesFromSelections,
@@ -78,6 +80,7 @@ import {
 import { logNavigationDiagnostic } from '../utils/navigationDiagnostics';
 import { normalizePdfRotation } from '../utils/annotatedPdfExportModel';
 import { selectAnnotationsForExport } from '../utils/annotatedPdfExportSelection';
+import { calculateManualZoomStep, type PdfZoomDirection } from '../utils/pdfPageScale';
 import {
   createGlossaryEntryFromBubble,
   removeGlossaryEntry as removeGlossaryEntryFromState,
@@ -86,15 +89,57 @@ import {
   appendPrintDraftAddition,
   deleteProductivityDocumentData,
 } from '../services/productivityPersistence';
+import {
+  notifyLocalRemovalLifecycle,
+  registerPersistenceFlusher,
+} from '../services/persistentChange';
+import type { PaperUpdateReviewRequest } from '../sync/PaperSyncControl';
+import {
+  CollectionsHomePage,
+  HomeFloatingButton,
+  HomeLandingPage,
+  HomeWorkspace,
+  SettingsHomePage,
+  TagsHomePage,
+  ThemeHomePage,
+  type HomeSection,
+} from './HomeWorkspace.tsx';
 
 const LibraryPanel = lazy(() =>
   import('./LibraryPanel').then((module) => ({ default: module.LibraryPanel })),
 );
 const PrintComposer = lazy(() =>
-  import('../print/PrintComposer').then((module) => ({ default: module.PrintComposer })),
+  import('../print/PrintComposer').then((module) => ({
+    default: module.PrintComposer,
+  })),
 );
 const AssistantPanel = lazy(() =>
   import('../ai/AssistantPanel').then((module) => ({ default: module.AssistantPanel })),
+);
+const AiConfigurationPage = lazy(() =>
+  import('../ai/AssistantPanel').then((module) => ({
+    default: module.AiConfigurationPage,
+  })),
+);
+const PaperSyncHomePage = lazy(() =>
+  import('../sync/PaperSyncControl').then((module) => ({
+    default: module.PaperSyncHomePage,
+  })),
+);
+const PaperReaderSyncStatus = lazy(() =>
+  import('../sync/PaperSyncControl').then((module) => ({
+    default: module.PaperReaderSyncStatus,
+  })),
+);
+const PaperRemoteUpdateLayer = lazy(() =>
+  import('../sync/PaperSyncControl').then((module) => ({
+    default: module.PaperRemoteUpdateLayer,
+  })),
+);
+const OfficePdfConverterDialog = lazy(() =>
+  import('./OfficePdfConverterDialog').then((module) => ({
+    default: module.OfficePdfConverterDialog,
+  })),
 );
 
 type FitMode = 'width' | 'page' | null;
@@ -115,6 +160,7 @@ interface NoteDragPreviewState {
   offsetY: number;
   initialX: number;
   initialY: number;
+  onDropInTarget?: () => void;
 }
 
 export function AppLayout() {
@@ -128,6 +174,7 @@ export function AppLayout() {
       : 300;
   });
   const [file, setFile] = useState<File | null>(null);
+  const [activeDocumentType, setActiveDocumentType] = useState<'pdf' | null>(null);
   const [pdfDocument, setPdfDocument] = useState<PDFDocumentProxy | null>(null);
   const [fitMode, setFitMode] = useState<FitMode>('width');
   const [zoom, setZoom] = useState(1);
@@ -146,10 +193,18 @@ export function AppLayout() {
   const [isDocumentHydrated, setIsDocumentHydrated] = useState(false);
   const [focusedNoteId, setFocusedNoteId] = useState<string | null>(null);
   const [isNotesDrawerOpen, setIsNotesDrawerOpen] = useState(false);
-  const [isLibraryOpen, setIsLibraryOpen] = useState(false);
+  const [applicationView, setApplicationView] = useState<'reader' | 'home'>('reader');
+  const [homeSection, setHomeSection] = useState<HomeSection>('home');
+  const [paperUpdateReviewRequest, setPaperUpdateReviewRequest] =
+    useState<PaperUpdateReviewRequest | null>(null);
+  const paperUpdateReviewSequenceRef = useRef(0);
   const [libraryRefreshToken, setLibraryRefreshToken] = useState(0);
   const [librarySearchFocusRequestId, setLibrarySearchFocusRequestId] = useState(0);
   const [openFileRequestId, setOpenFileRequestId] = useState(0);
+  const [officeConversionRequest, setOfficeConversionRequest] = useState<{
+    requestId: number;
+    file?: File;
+  } | null>(null);
   const [storageWarning, setStorageWarning] = useState<string | null>(null);
   const [exportWarning, setExportWarning] = useState<string | null>(null);
   const [isPdfExporting, setIsPdfExporting] = useState(false);
@@ -173,9 +228,9 @@ export function AppLayout() {
   const [printComposerLayout, setPrintComposerLayout] =
     useState<NotesPrintLayout>('standard');
   const [isAiOpen, setIsAiOpen] = useState(false);
-  const [aiStatus, setAiStatus] = useState<
-    'disconnected' | 'connected' | 'generating'
-  >('disconnected');
+  const [aiStatus, setAiStatus] = useState<'disconnected' | 'connected' | 'generating'>(
+    'disconnected',
+  );
   const [readingRestoreToast, setReadingRestoreToast] = useState<string | null>(null);
   const [annotationFilter, setAnnotationFilter] = useState<AnnotationFilterState>({
     types: ['highlight', 'underline'],
@@ -186,6 +241,7 @@ export function AppLayout() {
     null,
   );
   const viewerRef = useRef<ViewerHandle>(null);
+  const effectiveZoomRef = useRef(effectiveZoom);
   const zoomOperationRef = useRef(0);
   const hydrationRequestRef = useRef(0);
   const documentGenerationRef = useRef(0);
@@ -201,6 +257,8 @@ export function AppLayout() {
   const pendingLibraryNavigationRef = useRef<PendingLibraryNavigation | null>(null);
   const persistenceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const readingPositionTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const skipNextDocumentPersistenceRef = useRef(false);
+  const skipNextReadingPositionSaveRef = useRef(false);
   const lastNavigationDiagnosticKeyRef = useRef<string | null>(null);
   const noteDropTargetRef = useRef<HTMLDivElement>(null);
   const noteDragPreviewRef = useRef<HTMLDivElement>(null);
@@ -209,6 +267,7 @@ export function AppLayout() {
   const pdfExportCleanupRef = useRef<(() => void) | null>(null);
   const documentStateRef = useRef({
     documentIdentity,
+    documentType: activeDocumentType,
     annotations,
     noteAnchors,
     notes,
@@ -218,8 +277,16 @@ export function AppLayout() {
     isDocumentHydrated,
   });
 
+  effectiveZoomRef.current = effectiveZoom;
+
+  const updateEffectiveZoom = useCallback((nextZoom: number) => {
+    effectiveZoomRef.current = nextZoom;
+    setEffectiveZoom(nextZoom);
+  }, []);
+
   documentStateRef.current = {
     documentIdentity,
+    documentType: activeDocumentType,
     annotations,
     noteAnchors,
     notes,
@@ -251,6 +318,7 @@ export function AppLayout() {
       currentState.glossaryEntries,
       currentState.nextNoteNumber,
       currentState.documentDisplayTitle ?? currentState.documentIdentity.documentName,
+      currentState.documentType ?? undefined,
     );
     if (wasSaved) {
       setLibraryRefreshToken((currentToken) => currentToken + 1);
@@ -267,7 +335,88 @@ export function AppLayout() {
     return persistCurrentDocument();
   }, [persistCurrentDocument]);
 
+  useEffect(
+    () =>
+      registerPersistenceFlusher('reader', async () => {
+        if (persistenceTimerRef.current === null) return false;
+        return flushPersistence();
+      }),
+    [flushPersistence],
+  );
+
   useEffect(() => {
+    const handleSyncApplied = (event: Event) => {
+      const customEvent = event as CustomEvent<{
+        changedDocumentIds?: string[];
+        deletedDocumentIds?: string[];
+      }>;
+      const currentDocumentId = documentStateRef.current.documentIdentity?.documentId;
+      setLibraryRefreshToken((currentToken) => currentToken + 1);
+      if (
+        currentDocumentId &&
+        customEvent.detail?.deletedDocumentIds?.includes(currentDocumentId)
+      ) {
+        setFile(null);
+        setActiveDocumentType(null);
+        setPdfDocument(null);
+        setDocumentIdentity(null);
+        setDocumentDisplayTitle(null);
+        setAnnotations([]);
+        setNoteAnchors([]);
+        setNotes([]);
+        setGlossaryEntries([]);
+        setNextNoteNumber(1);
+        setIsDocumentHydrated(false);
+        setIsPrintComposerOpen(false);
+        setIsAiOpen(false);
+        setStorageWarning('The open document was deleted by a synchronized change.');
+        return;
+      }
+      if (
+        !currentDocumentId ||
+        !customEvent.detail?.changedDocumentIds?.includes(currentDocumentId)
+      )
+        return;
+      void loadDocumentState(currentDocumentId).then((state) => {
+        if (
+          !state ||
+          documentStateRef.current.documentIdentity?.documentId !== currentDocumentId
+        )
+          return;
+        skipNextDocumentPersistenceRef.current = true;
+        setAnnotations(state.annotations);
+        setNoteAnchors(state.noteAnchors);
+        setNotes(state.notes);
+        setGlossaryEntries(state.glossaryEntries);
+        setNextNoteNumber(state.nextNoteNumber);
+        setDocumentDisplayTitle(state.displayTitle);
+        if (state.readingPosition) {
+          skipNextReadingPositionSaveRef.current = true;
+          hydratedReadingPositionRef.current = state.readingPosition;
+          setFitMode(
+            state.readingPosition.zoomMode === 'fit-width'
+              ? 'width'
+              : state.readingPosition.zoomMode === 'fit-page'
+                ? 'page'
+                : null,
+          );
+          setZoom(state.readingPosition.zoomPercent);
+          setEffectiveZoom(state.readingPosition.zoomPercent);
+          requestAnimationFrame(() => {
+            viewerRef.current?.restoreReadingPosition(state.readingPosition!);
+          });
+        }
+      });
+    };
+    window.addEventListener('39note:sync-applied', handleSyncApplied);
+    return () => window.removeEventListener('39note:sync-applied', handleSyncApplied);
+  }, []);
+
+  useEffect(() => {
+    if (skipNextDocumentPersistenceRef.current) {
+      skipNextDocumentPersistenceRef.current = false;
+      return;
+    }
     if (!documentIdentity || !isDocumentHydrated) {
       return;
     }
@@ -354,6 +503,21 @@ export function AppLayout() {
 
   const openDocument = useCallback(
     (nextFile: File, requestedOpen?: DocumentOpenRequest) => {
+      const prepared = prepareSupportedDocumentFile(nextFile);
+      if (!prepared) {
+        setStorageWarning(
+          'Choose a valid PDF, PowerPoint (.pptx), or Word (.docx) document.',
+        );
+        return;
+      }
+      if (prepared.documentType !== 'pdf') {
+        setStorageWarning(null);
+        setOfficeConversionRequest({
+          requestId: Date.now(),
+          file: prepared.file,
+        });
+        return;
+      }
       void flushPersistence();
       hydrationRequestRef.current += 1;
       documentGenerationRef.current += 1;
@@ -372,7 +536,8 @@ export function AppLayout() {
         pendingLibraryNavigationRef.current = null;
         setPendingLibraryNavigation(null);
       }
-      setFile(nextFile);
+      setFile(prepared.file);
+      setActiveDocumentType('pdf');
       setPdfDocument(null);
       setFitMode('width');
       setZoom(1);
@@ -390,15 +555,16 @@ export function AppLayout() {
       setGlossaryEntries([]);
       setNextNoteNumber(1);
       setDocumentIdentity(null);
-      setDocumentDisplayTitle(nextFile.name);
+      setDocumentDisplayTitle(prepared.file.name);
       setIsDocumentHydrated(false);
       setFocusedNoteId(null);
       setNoteDragPreview(null);
       setLargeEditorNoteId(null);
       setSelectedPdfText([]);
       setIsPrintComposerOpen(false);
+      setIsAiOpen(false);
       setExportWarning(null);
-      setIsLibraryOpen(false);
+      setApplicationView('reader');
     },
     [commitDocumentOpenRequest, createDocumentOpenRequest, flushPersistence],
   );
@@ -415,7 +581,7 @@ export function AppLayout() {
           currentOpenRequest.documentId !== identity.documentId
         ) {
           setStorageWarning(
-            'The selected PDF does not match the requested Library document.',
+            'The selected source does not match the requested Library document.',
           );
           return;
         }
@@ -428,6 +594,7 @@ export function AppLayout() {
       }
 
       setDocumentIdentity(identity);
+      setActiveDocumentType('pdf');
       setDocumentDisplayTitle(identity.documentName);
       setIsDocumentHydrated(false);
       setAnnotations([]);
@@ -436,13 +603,13 @@ export function AppLayout() {
       setGlossaryEntries([]);
       setFocusedNoteId(null);
 
-      void storePdfFile(identity, sourceFile).then((wasStored) => {
+      void storeDocumentSource(identity, sourceFile, 'pdf').then((wasStored) => {
         if (wasStored) {
           setStorageWarning(null);
           setLibraryRefreshToken((currentToken) => currentToken + 1);
         } else {
           setStorageWarning(
-            'The PDF copy could not be saved locally. Reading and annotations remain available.',
+            'The source document could not be saved locally. Reading and annotations remain available.',
           );
         }
       });
@@ -455,6 +622,12 @@ export function AppLayout() {
           return;
         }
 
+        if (persistedState && persistedState.documentType !== 'pdf') {
+          setStorageWarning(
+            'Stored data for this document has a different verified file type.',
+          );
+          return;
+        }
         setAnnotations(persistedState?.annotations ?? []);
         setNoteAnchors(persistedState?.noteAnchors ?? []);
         setNotes(persistedState?.notes ?? []);
@@ -469,9 +642,14 @@ export function AppLayout() {
   );
 
   useEffect(() => {
+    if (skipNextReadingPositionSaveRef.current) {
+      skipNextReadingPositionSaveRef.current = false;
+      return;
+    }
     if (
       !documentIdentity ||
       !isDocumentHydrated ||
+      activeDocumentType !== 'pdf' ||
       currentPage < 1 ||
       openingResolutionRef.current === 'pending'
     )
@@ -487,7 +665,14 @@ export function AppLayout() {
       if (readingPositionTimerRef.current !== null)
         clearTimeout(readingPositionTimerRef.current);
     };
-  }, [currentPage, documentIdentity, effectiveZoom, fitMode, isDocumentHydrated]);
+  }, [
+    activeDocumentType,
+    currentPage,
+    documentIdentity,
+    effectiveZoom,
+    fitMode,
+    isDocumentHydrated,
+  ]);
 
   const createHighlights = useCallback(
     (selections: PdfTextSelection[], color: HighlightColor) => {
@@ -517,107 +702,74 @@ export function AppLayout() {
     [isDocumentHydrated],
   );
 
-  const removeAnnotation = useCallback((annotationId: string) => {
-    const annotation = annotations.find((candidate) => candidate.id === annotationId);
-    if (!annotation) return;
-    const linkedNotes = notes.filter((note) => note.annotationId === annotationId);
-    if (linkedNotes.length > 0) {
-      const anchor = createNoteAnchorFromAnnotation(annotation);
-      setNoteAnchors((currentAnchors) => [...currentAnchors, anchor]);
-      setNotes((currentNotes) =>
-        currentNotes.map((note) =>
-          note.annotationId === annotationId
-            ? { ...note, annotationId: anchor.id, updatedAt: Date.now() }
-            : note,
-        ),
-      );
-    }
-    setAnnotations((currentAnnotations) =>
-      currentAnnotations.filter((candidate) => candidate.id !== annotationId),
+  const addNoteToMarkedAnnotation = useCallback((annotationId: string) => {
+    const current = documentStateRef.current;
+    if (!current.isDocumentHydrated) return;
+    const result = addNoteToAnnotationTag(
+      {
+        annotations: current.annotations,
+        notes: current.notes,
+        noteAnchors: current.noteAnchors,
+      },
+      annotationId,
+      {
+        id: crypto.randomUUID(),
+        displayNumber: String(current.nextNoteNumber),
+      },
     );
-  }, [annotations, notes]);
+    if (!result.createdNote) return;
 
-  const addNoteFromSelection = useCallback(
-    (selections: PdfTextSelection[]) => {
-      if (!isDocumentHydrated) {
-        return;
-      }
+    const nextNoteNumber = current.nextNoteNumber + 1;
+    documentStateRef.current = {
+      ...current,
+      notes: result.state.notes,
+      noteAnchors: result.state.noteAnchors,
+      nextNoteNumber,
+    };
+    setNotes(result.state.notes);
+    setNoteAnchors(result.state.noteAnchors);
+    setNextNoteNumber(nextNoteNumber);
+  }, []);
 
-      const existingNote = findMatchingNote(
-        selections,
-        notes,
-        annotations,
-        noteAnchors,
+  const removeMarkedAnnotation = useCallback(
+    (annotationId: string, confirmed: boolean) => {
+      const current = documentStateRef.current;
+      if (!current.isDocumentHydrated) return;
+      const attachedNoteId = deriveAnnotationTags(
+        current.annotations,
+        current.notes,
+        current.noteAnchors,
+      ).find((tag) => tag.annotation.id === annotationId)?.note?.id;
+      const result = deleteAnnotationTag(
+        {
+          annotations: current.annotations,
+          notes: current.notes,
+          noteAnchors: current.noteAnchors,
+        },
+        annotationId,
+        confirmed,
       );
-      if (existingNote) {
-        setFocusedNoteId(existingNote.id);
-        setIsNotesDrawerOpen(true);
-        viewerRef.current?.navigateToAnnotation(existingNote.annotationId);
-        return;
-      }
+      if (!result.deleted) return;
 
-      const anchor = selections.flatMap((selection) => {
-        const nextAnchor = createNoteAnchorFromSelection(selection);
-        return nextAnchor ? [nextAnchor] : [];
-      })[0];
-      if (!anchor) return;
-
-      const timestamp = Date.now();
-      const note: Note = {
-        id: crypto.randomUUID(),
-        annotationId: anchor.id,
-        pageNumber: anchor.pageNumber,
-        displayNumber: String(nextNoteNumber),
-        selectedText: anchor.text,
-        content: '',
-        createdAt: timestamp,
-        updatedAt: timestamp,
+      documentStateRef.current = {
+        ...current,
+        annotations: result.state.annotations,
+        notes: result.state.notes,
+        noteAnchors: result.state.noteAnchors,
       };
-
-      setNoteAnchors((currentAnchors) => [...currentAnchors, anchor]);
-      setNotes((currentNotes) => [note, ...currentNotes]);
-      setNextNoteNumber((currentNumber) => currentNumber + 1);
-      setFocusedNoteId(note.id);
-      setIsNotesDrawerOpen(true);
-    },
-    [annotations, isDocumentHydrated, nextNoteNumber, noteAnchors, notes],
-  );
-
-  const addNoteFromMarkedSource = useCallback(
-    (sourceAnnotations: PdfAnnotation[]) => {
-      if (!isDocumentHydrated || sourceAnnotations.length === 0) return;
-      const existingNote = findMatchingNoteForSources(
-        sourceAnnotations,
-        notes,
-        annotations,
-        noteAnchors,
-      );
-      if (existingNote) {
-        setFocusedNoteId(existingNote.id);
-        setIsNotesDrawerOpen(true);
-        viewerRef.current?.navigateToAnnotation(existingNote.annotationId);
-        return;
+      setAnnotations(result.state.annotations);
+      setNotes(result.state.notes);
+      setNoteAnchors(result.state.noteAnchors);
+      if (attachedNoteId) {
+        setFocusedNoteId((currentId) =>
+          currentId === attachedNoteId ? null : currentId,
+        );
+        setLargeEditorNoteId((currentId) =>
+          currentId === attachedNoteId ? null : currentId,
+        );
       }
-      const source = sourceAnnotations[0];
-      const anchor = createNoteAnchorFromAnnotation(source);
-      const timestamp = Date.now();
-      const note: Note = {
-        id: crypto.randomUUID(),
-        annotationId: anchor.id,
-        pageNumber: anchor.pageNumber,
-        displayNumber: String(nextNoteNumber),
-        selectedText: anchor.text,
-        content: '',
-        createdAt: timestamp,
-        updatedAt: timestamp,
-      };
-      setNoteAnchors((currentAnchors) => [...currentAnchors, anchor]);
-      setNotes((currentNotes) => [note, ...currentNotes]);
-      setNextNoteNumber((currentNumber) => currentNumber + 1);
-      setFocusedNoteId(note.id);
-      setIsNotesDrawerOpen(true);
     },
-    [annotations, isDocumentHydrated, nextNoteNumber, noteAnchors, notes],
+    [],
   );
 
   const createAnnotationFromNoteSource = useCallback(
@@ -627,9 +779,10 @@ export function AppLayout() {
       color: HighlightColor | UnderlineColor,
     ) => {
       if (!isDocumentHydrated) return;
-      const nextAnnotation = type === 'highlight'
-        ? createAnnotationFromSource(source, type, color as HighlightColor)
-        : createAnnotationFromSource(source, type, color as UnderlineColor);
+      const nextAnnotation =
+        type === 'highlight'
+          ? createAnnotationFromSource(source, type, color as HighlightColor)
+          : createAnnotationFromSource(source, type, color as UnderlineColor);
       if (!nextAnnotation) return;
       setAnnotations((currentAnnotations) =>
         addAnnotationFromSourceIfMissing(currentAnnotations, nextAnnotation),
@@ -679,7 +832,14 @@ export function AppLayout() {
       setNextNoteNumber((current) => current + 1);
       setFocusedNoteId(note.id);
       setIsNotesDrawerOpen(true);
-    }, [currentPage, documentIdentity, isDocumentHydrated, nextNoteNumber, selectedPdfText],
+    },
+    [
+      currentPage,
+      documentIdentity,
+      isDocumentHydrated,
+      nextNoteNumber,
+      selectedPdfText,
+    ],
   );
 
   const sendAiOutputToPrintDraft = useCallback(
@@ -691,21 +851,27 @@ export function AppLayout() {
   );
 
   const deleteNote = useCallback((noteId: string) => {
-    const note = notes.find((candidate) => candidate.id === noteId);
-    if (!note) return;
-    setNotes((currentNotes) => currentNotes.filter((candidate) => candidate.id !== noteId));
-    if (
-      noteAnchors.some((anchor) => anchor.id === note.annotationId) &&
-      !notes.some(
-        (candidate) =>
-          candidate.id !== noteId && candidate.annotationId === note.annotationId,
-      )
-    ) {
-      setNoteAnchors((currentAnchors) =>
-        currentAnchors.filter((anchor) => anchor.id !== note.annotationId),
-      );
-    }
-  }, [noteAnchors, notes]);
+    const current = documentStateRef.current;
+    const state = deleteNoteFromTagState(
+      {
+        annotations: current.annotations,
+        notes: current.notes,
+        noteAnchors: current.noteAnchors,
+      },
+      noteId,
+    );
+    if (state.notes === current.notes) return;
+
+    documentStateRef.current = {
+      ...current,
+      notes: state.notes,
+      noteAnchors: state.noteAnchors,
+    };
+    setNotes(state.notes);
+    setNoteAnchors(state.noteAnchors);
+    setFocusedNoteId((currentId) => (currentId === noteId ? null : currentId));
+    setLargeEditorNoteId((currentId) => (currentId === noteId ? null : currentId));
+  }, []);
 
   const addGlossaryEntry = useCallback(
     (
@@ -731,37 +897,67 @@ export function AppLayout() {
     [documentIdentity, isDocumentHydrated],
   );
 
-  const removeGlossaryEntry = useCallback((glossaryEntryId: string) => {
-    setGlossaryEntries((currentEntries) => {
+  const removeGlossaryEntry = useCallback(
+    (glossaryEntryId: string): boolean => {
+      const current = documentStateRef.current;
+      const entry = current.glossaryEntries.find(
+        (candidate) => candidate.glossaryEntryId === glossaryEntryId,
+      );
+      if (
+        !current.documentIdentity ||
+        !current.isDocumentHydrated ||
+        !entry ||
+        entry.documentId !== current.documentIdentity.documentId
+      ) {
+        return false;
+      }
       const result = removeGlossaryEntryFromState(
-        currentEntries,
-        documentStateRef.current.annotations,
+        current.glossaryEntries,
+        current.annotations,
         glossaryEntryId,
       );
-      return result.entries;
-    });
-    window.setTimeout(() => void flushPersistence(), 0);
-  }, [flushPersistence]);
+      documentStateRef.current = {
+        ...current,
+        glossaryEntries: result.entries,
+      };
+      setGlossaryEntries(result.entries);
+      window.setTimeout(() => void flushPersistence(), 0);
+      return true;
+    },
+    [flushPersistence],
+  );
 
-  const navigateToGlossaryEntry = useCallback((entry: GlossaryEntry) => {
-    if (
-      !documentIdentity ||
-      !isDocumentHydrated ||
-      entry.documentId !== documentIdentity.documentId
-    ) {
-      return;
-    }
-    openingResolutionRef.current = 'pending';
-    initialNavigationApplicationRef.current = null;
-    commitDocumentOpenRequest({
-      ...createDocumentOpenRequest(documentIdentity.documentId, 'document-glossary', {
-        type: 'glossary',
-        glossaryEntryId: entry.glossaryEntryId,
-        pageNumber: entry.pageNumber,
-      }),
-      generation: documentGenerationRef.current,
-    });
-  }, [commitDocumentOpenRequest, createDocumentOpenRequest, documentIdentity, isDocumentHydrated]);
+  const navigateToGlossaryEntry = useCallback(
+    (entry: GlossaryEntry) => {
+      if (
+        !documentIdentity ||
+        !isDocumentHydrated ||
+        entry.documentId !== documentIdentity.documentId
+      ) {
+        return;
+      }
+      if (!isPdfGlossaryEntry(entry)) {
+        viewerRef.current?.navigateToGlossaryEntry(entry.glossaryEntryId);
+        return;
+      }
+      openingResolutionRef.current = 'pending';
+      initialNavigationApplicationRef.current = null;
+      commitDocumentOpenRequest({
+        ...createDocumentOpenRequest(documentIdentity.documentId, 'document-glossary', {
+          type: 'glossary',
+          glossaryEntryId: entry.glossaryEntryId,
+          pageNumber: entry.pageNumber,
+        }),
+        generation: documentGenerationRef.current,
+      });
+    },
+    [
+      commitDocumentOpenRequest,
+      createDocumentOpenRequest,
+      documentIdentity,
+      isDocumentHydrated,
+    ],
+  );
 
   const updateNoteDisplayNumber = useCallback(
     (noteId: string, displayNumber: string) => {
@@ -774,36 +970,47 @@ export function AppLayout() {
     [],
   );
 
-  const exportCurrentNotes = useCallback((layout: NotesPrintLayout) => {
-    if (isPdfExporting) {
-      return;
-    }
+  const exportCurrentNotes = useCallback(
+    (layout: NotesPrintLayout) => {
+      if (isPdfExporting) {
+        return;
+      }
 
-    setIsPdfExporting(true);
-    const completeExport = () => {
-      pdfExportCleanupRef.current = null;
-      setIsPdfExporting(false);
-    };
-    const cleanup = exportNotesAsPdf(
-      notes,
-      documentDisplayTitle ?? file?.name ?? '39Note',
-      annotations,
-      noteAnchors,
-      glossaryEntries,
-      layout,
-      completeExport,
-    );
-    if (!cleanup) {
-      setIsPdfExporting(false);
-      setExportWarning(
-        'The browser blocked the print window. Allow popups and try again.',
+      setIsPdfExporting(true);
+      const completeExport = () => {
+        pdfExportCleanupRef.current = null;
+        setIsPdfExporting(false);
+      };
+      const cleanup = exportNotesAsPdf(
+        notes,
+        documentDisplayTitle ?? file?.name ?? '39Note',
+        annotations,
+        noteAnchors,
+        glossaryEntries,
+        layout,
+        completeExport,
       );
-      return;
-    }
+      if (!cleanup) {
+        setIsPdfExporting(false);
+        setExportWarning(
+          'The browser blocked the print window. Allow popups and try again.',
+        );
+        return;
+      }
 
-    pdfExportCleanupRef.current = cleanup;
-    setExportWarning(null);
-  }, [annotations, documentDisplayTitle, file, glossaryEntries, isPdfExporting, noteAnchors, notes]);
+      pdfExportCleanupRef.current = cleanup;
+      setExportWarning(null);
+    },
+    [
+      annotations,
+      documentDisplayTitle,
+      file,
+      glossaryEntries,
+      isPdfExporting,
+      noteAnchors,
+      notes,
+    ],
+  );
 
   const exportAnnotatedPdf = useCallback(
     async (options: AnnotatedPdfExportOptions) => {
@@ -836,6 +1043,7 @@ export function AppLayout() {
           notes,
           annotationFilter,
           options.includeHiddenAnnotations,
+          noteAnchors,
         );
         const { createAnnotatedPdf } = await import('../services/annotatedPdfExport');
         const result = await createAnnotatedPdf({
@@ -880,14 +1088,16 @@ export function AppLayout() {
     ],
   );
 
-  const beginNoteDrag = useCallback(
-    (note: Note, event: ReactPointerEvent<HTMLButtonElement>) => {
-      const noteCard = event.currentTarget.closest<HTMLElement>('.note-card');
-      if (!noteCard) {
+  const beginNoteDrag = useCallback<NoteDragStartHandler>(
+    (note, event, onDropInTarget) => {
+      const dragSource = event.currentTarget.closest<HTMLElement>(
+        '[data-note-drag-source="true"]',
+      );
+      if (!dragSource) {
         return;
       }
 
-      const rectangle = noteCard.getBoundingClientRect();
+      const rectangle = dragSource.getBoundingClientRect();
       noteDragPositionRef.current = { x: rectangle.left, y: rectangle.top };
       setNoteDragPreview({
         noteId: note.id,
@@ -898,6 +1108,7 @@ export function AppLayout() {
         offsetY: event.clientY - rectangle.top,
         initialX: rectangle.left,
         initialY: rectangle.top,
+        onDropInTarget,
       });
     },
     [],
@@ -906,7 +1117,6 @@ export function AppLayout() {
   const openLargeEditor = useCallback((note: Note) => {
     setNoteDragPreview(null);
     setLargeEditorNoteId(note.id);
-    setIsNotesDrawerOpen(true);
   }, []);
 
   useEffect(() => {
@@ -955,7 +1165,7 @@ export function AppLayout() {
 
         if (wasDroppedInTarget) {
           setLargeEditorNoteId(noteDragPreview.noteId);
-          setIsNotesDrawerOpen(true);
+          noteDragPreview.onDropInTarget?.();
         }
       }
       cancelDrag();
@@ -1013,20 +1223,51 @@ export function AppLayout() {
     [documentIdentity],
   );
 
-  const openLibrary = useCallback(() => {
-    void flushPersistence().then(() => {
-      setLibraryRefreshToken((currentToken) => currentToken + 1);
-      setIsLibraryOpen(true);
-    });
-  }, [flushPersistence]);
+  const openHomeSection = useCallback((section: HomeSection) => {
+    setHomeSection(section);
+    setApplicationView('home');
+    setIsAiOpen(false);
+    setIsNotesDrawerOpen(false);
+    setNoteDragPreview(null);
+    setLargeEditorNoteId(null);
+    setIsPrintComposerOpen(false);
+    setIsAnnotatedPdfDialogOpen(false);
+  }, []);
+
+  const openDriveManagement = useCallback(() => {
+    setPaperUpdateReviewRequest(null);
+    openHomeSection('drive');
+  }, [openHomeSection]);
+
+  const openDriveUpdateReview = useCallback(
+    (affectedDocumentIds: readonly string[]) => {
+      const documentIds = [...new Set(affectedDocumentIds)];
+      if (!documentIds.length) {
+        openDriveManagement();
+        return;
+      }
+      setPaperUpdateReviewRequest({
+        requestId: ++paperUpdateReviewSequenceRef.current,
+        documentIds,
+      });
+      openHomeSection('drive');
+    },
+    [openDriveManagement, openHomeSection],
+  );
+
+  const markDriveUpdateReviewOpened = useCallback((requestId: number) => {
+    setPaperUpdateReviewRequest((current) =>
+      current?.requestId === requestId ? null : current,
+    );
+  }, []);
 
   const openLibrarySearch = useCallback(() => {
     void flushPersistence().then(() => {
       setLibraryRefreshToken((currentToken) => currentToken + 1);
       setLibrarySearchFocusRequestId((currentRequest) => currentRequest + 1);
-      setIsLibraryOpen(true);
+      openHomeSection('library');
     });
-  }, [flushPersistence]);
+  }, [flushPersistence, openHomeSection]);
 
   useEffect(() => {
     const handleShortcuts = (event: KeyboardEvent) => {
@@ -1068,16 +1309,25 @@ export function AppLayout() {
   const forgetDocument = useCallback(
     async (documentId: string): Promise<boolean> => {
       await flushPersistence();
-      const wasForgotten = await deleteDocumentState(documentId);
-      if (!wasForgotten) {
-        return false;
+      notifyLocalRemovalLifecycle(documentId, 'started');
+      try {
+        const wasForgotten = await deleteDocumentState(documentId, false);
+        if (!wasForgotten) {
+          notifyLocalRemovalLifecycle(documentId, 'aborted');
+          return false;
+        }
+        await deleteProductivityDocumentData(documentId, false);
+        notifyLocalRemovalLifecycle(documentId, 'committed');
+      } catch (error) {
+        notifyLocalRemovalLifecycle(documentId, 'aborted');
+        throw error;
       }
-      await deleteProductivityDocumentData(documentId);
 
       if (documentIdentity?.documentId === documentId) {
         hydrationRequestRef.current += 1;
         storedPdfLoadRequestRef.current += 1;
         setFile(null);
+        setActiveDocumentType(null);
         setPageCount(0);
         setCurrentPage(0);
         setAnnotations([]);
@@ -1091,7 +1341,8 @@ export function AppLayout() {
         setNoteDragPreview(null);
         setLargeEditorNoteId(null);
         setExportWarning(null);
-        setIsLibraryOpen(true);
+        setHomeSection('library');
+        setApplicationView('home');
       }
 
       return true;
@@ -1102,10 +1353,42 @@ export function AppLayout() {
   const forgetLibraryDocuments = useCallback(
     async (ids: string[]): Promise<{ deleted: string[]; failed: string[] }> => {
       await flushPersistence();
-      const result = await deleteDocumentStates(ids);
-      await Promise.all(result.deleted.map(deleteProductivityDocumentData));
+      const lifecycleIds = [...new Set(ids)];
+      const settledLifecycleIds = new Set<string>();
+      for (const documentId of lifecycleIds) {
+        notifyLocalRemovalLifecycle(documentId, 'started');
+      }
+      let result: { deleted: string[]; failed: string[] };
+      try {
+        result = await deleteDocumentStates(ids, false);
+        for (const documentId of result.failed) {
+          notifyLocalRemovalLifecycle(documentId, 'aborted');
+          settledLifecycleIds.add(documentId);
+        }
+        await Promise.all(
+          result.deleted.map(async (documentId) => {
+            await deleteProductivityDocumentData(documentId, false);
+            notifyLocalRemovalLifecycle(documentId, 'committed');
+            settledLifecycleIds.add(documentId);
+          }),
+        );
+        for (const documentId of lifecycleIds) {
+          if (!settledLifecycleIds.has(documentId)) {
+            notifyLocalRemovalLifecycle(documentId, 'aborted');
+            settledLifecycleIds.add(documentId);
+          }
+        }
+      } catch (error) {
+        for (const documentId of lifecycleIds) {
+          if (!settledLifecycleIds.has(documentId)) {
+            notifyLocalRemovalLifecycle(documentId, 'aborted');
+          }
+        }
+        throw error;
+      }
       if (documentIdentity && result.deleted.includes(documentIdentity.documentId)) {
         setFile(null);
+        setActiveDocumentType(null);
         setDocumentIdentity(null);
         setAnnotations([]);
         setNotes([]);
@@ -1113,7 +1396,8 @@ export function AppLayout() {
         setPageCount(0);
         setCurrentPage(0);
         setIsDocumentHydrated(false);
-        setIsLibraryOpen(true);
+        setHomeSection('library');
+        setApplicationView('home');
       }
       setLibraryRefreshToken((currentToken) => currentToken + 1);
       return result;
@@ -1121,10 +1405,10 @@ export function AppLayout() {
     [documentIdentity, flushPersistence],
   );
 
-  const removeLibraryPdfCopy = useCallback(
+  const removeLibrarySourceCopy = useCallback(
     async (documentId: string): Promise<boolean> => {
       await flushPersistence();
-      const wasRemoved = await removeStoredPdfCopy(documentId);
+      const wasRemoved = await removeStoredDocumentSource(documentId);
       if (wasRemoved) {
         setLibraryRefreshToken((currentToken) => currentToken + 1);
       }
@@ -1149,15 +1433,15 @@ export function AppLayout() {
     async (documentId: string): Promise<File | null> => {
       const requestId = storedPdfLoadRequestRef.current + 1;
       storedPdfLoadRequestRef.current = requestId;
-      const storedPdfFile = await loadStoredPdfFile(documentId);
+      const storedSource = await loadStoredDocumentSource(documentId);
 
-      if (!storedPdfFile || storedPdfLoadRequestRef.current !== requestId) {
+      if (!storedSource || storedPdfLoadRequestRef.current !== requestId) {
         return null;
       }
 
-      return new File([storedPdfFile.blob], storedPdfFile.fileName, {
-        type: storedPdfFile.mimeType,
-        lastModified: storedPdfFile.lastModified,
+      return new File([storedSource.blob], storedSource.fileName, {
+        type: storedSource.mimeType,
+        lastModified: storedSource.lastModified,
       });
     },
     [],
@@ -1170,8 +1454,16 @@ export function AppLayout() {
         return false;
       }
 
+      const prepared = prepareSupportedDocumentFile(storedDocumentFile);
+      if (!prepared || prepared.documentType !== 'pdf') {
+        setStorageWarning(
+          'This experimental Office-native Library record was preserved but cannot be opened directly. Re-import the original DOCX or PPTX through the local PDF converter.',
+        );
+        return false;
+      }
+
       openDocument(
-        storedDocumentFile,
+        prepared.file,
         createDocumentOpenRequest(documentId, 'normal-library-open', null),
       );
       return true;
@@ -1237,7 +1529,16 @@ export function AppLayout() {
         return false;
       }
 
-      openDocument(storedDocumentFile, openRequest);
+      const prepared = prepareSupportedDocumentFile(storedDocumentFile);
+      if (!prepared || prepared.documentType !== 'pdf') {
+        setStorageWarning(
+          'Notes from an experimental Office-native record cannot open in the PDF reader. The record and its data were left unchanged.',
+        );
+        commitDocumentOpenRequest(null);
+        return false;
+      }
+
+      openDocument(prepared.file, openRequest);
       return true;
     },
     [
@@ -1258,6 +1559,13 @@ export function AppLayout() {
       annotationId: string,
       pageNumber: number,
     ) => {
+      const prepared = prepareSupportedDocumentFile(fileToOpen);
+      if (!prepared || prepared.documentType !== 'pdf') {
+        setStorageWarning(
+          'Choose the PDF source for this paper. DOCX and PPTX files must be converted before they can be opened.',
+        );
+        return;
+      }
       libraryNavigationRequestRef.current += 1;
       const pendingNavigation: PendingLibraryNavigation = {
         documentId,
@@ -1274,7 +1582,7 @@ export function AppLayout() {
         noteId,
       });
       commitDocumentOpenRequest(openRequest);
-      openDocument(fileToOpen, openRequest);
+      openDocument(prepared.file, openRequest);
     },
     [commitDocumentOpenRequest, createDocumentOpenRequest, openDocument],
   );
@@ -1351,7 +1659,7 @@ export function AppLayout() {
     }
 
     const target = openRequest.target;
-    const targetAnnotation =
+    const requestedTargetAnnotation =
       target?.type === 'annotation'
         ? [...annotations, ...noteAnchors].find(
             (candidate) => candidate.id === target.annotationId,
@@ -1361,6 +1669,12 @@ export function AppLayout() {
       target?.type === 'annotation' && target.noteId
         ? notes.find((candidate) => candidate.id === target.noteId)
         : undefined;
+    const targetTag = targetNote
+      ? deriveAnnotationTags(annotations, notes, noteAnchors).find(
+          (tag) => tag.note?.id === targetNote.id,
+        )
+      : undefined;
+    const targetAnnotation = targetTag?.annotation ?? requestedTargetAnnotation;
     const isRequestDocumentHydrated =
       isDocumentHydrated &&
       openRequest.documentId === documentIdentity.documentId &&
@@ -1371,7 +1685,9 @@ export function AppLayout() {
         ? 'pending'
         : targetAnnotation &&
             (openRequest.source !== 'library-note-result' ||
-              (targetNote && targetNote.annotationId === targetAnnotation.id))
+              (targetNote &&
+                (targetNote.annotationId === requestedTargetAnnotation?.id ||
+                  targetTag?.note?.id === targetNote.id)))
           ? 'found'
           : 'missing';
     }
@@ -1583,7 +1899,11 @@ export function AppLayout() {
 
     const pendingNavigation = pendingLibraryNavigationRef.current;
     if (targetNote && pendingNavigation) {
-      const readyNavigation = { ...pendingNavigation, isReadyToFocus: true };
+      const readyNavigation = {
+        ...pendingNavigation,
+        annotationId: targetAnnotation.id,
+        isReadyToFocus: true,
+      };
       pendingLibraryNavigationRef.current = readyNavigation;
       setPendingLibraryNavigation(readyNavigation);
       setIsNotesDrawerOpen(true);
@@ -1605,7 +1925,7 @@ export function AppLayout() {
       ...openRequest,
       target: {
         type: 'annotation',
-        annotationId: decision.annotationId,
+        annotationId: targetAnnotation.id,
         ...(decision.noteId ? { noteId: decision.noteId } : {}),
         pageNumber: targetAnnotation.pageNumber,
       },
@@ -1650,16 +1970,20 @@ export function AppLayout() {
         return;
       }
 
+      const markTag = deriveAnnotationTags(annotations, notes, noteAnchors).find(
+        (tag) => tag.note?.id === note.id,
+      );
+      const annotationId = markTag?.annotation.id ?? note.annotationId;
       const pendingNavigation: PendingLibraryNavigation = {
         documentId: documentIdentity.documentId,
         noteId: note.id,
-        annotationId: note.annotationId,
+        annotationId,
         isReadyToFocus: false,
       };
       const request = {
         ...createDocumentOpenRequest(documentIdentity.documentId, 'document-note', {
           type: 'annotation',
-          annotationId: note.annotationId,
+          annotationId,
           pageNumber: note.pageNumber,
           noteId: note.id,
         }),
@@ -1677,8 +2001,11 @@ export function AppLayout() {
     [
       commitDocumentOpenRequest,
       createDocumentOpenRequest,
+      annotations,
       documentIdentity,
       isDocumentHydrated,
+      noteAnchors,
+      notes,
     ],
   );
 
@@ -1715,30 +2042,30 @@ export function AppLayout() {
     viewerRef.current?.goToPage(pageNumber);
   }, []);
 
-  const beginZoomOperation = () => {
+  const beginZoomOperation = useCallback(() => {
     const nextOperationId = zoomOperationRef.current + 1;
     zoomOperationRef.current = nextOperationId;
     viewerRef.current?.captureZoomAnchor(nextOperationId);
     setZoomOperationId(nextOperationId);
-  };
+  }, []);
 
-  const zoomIn = () => {
+  const applyZoomStep = (direction: PdfZoomDirection) => {
+    const nextZoom = calculateManualZoomStep(effectiveZoomRef.current, direction);
     beginZoomOperation();
     setFitMode(null);
-    setZoom((currentZoom) => Math.min(currentZoom * 1.2, 5));
+    setZoom(nextZoom);
+    updateEffectiveZoom(nextZoom);
   };
 
-  const zoomOut = () => {
-    beginZoomOperation();
-    setFitMode(null);
-    setZoom((currentZoom) => Math.max(currentZoom / 1.2, 0.25));
-  };
+  const zoomIn = () => applyZoomStep('in');
+
+  const zoomOut = () => applyZoomStep('out');
 
   const applyZoom = (nextZoom: number) => {
     beginZoomOperation();
     setFitMode(null);
     setZoom(nextZoom);
-    setEffectiveZoom(nextZoom);
+    updateEffectiveZoom(nextZoom);
   };
 
   const largeEditorNote = largeEditorNoteId
@@ -1747,11 +2074,17 @@ export function AppLayout() {
   const draggedNote = noteDragPreview
     ? (notes.find((candidate) => candidate.id === noteDragPreview.noteId) ?? null)
     : null;
+  const notedAnnotationIds = deriveAnnotationTags(
+    annotations,
+    notes,
+    noteAnchors,
+  ).flatMap((tag) => (tag.note ? [tag.annotation.id] : []));
   const visibleExportAnnotations = selectAnnotationsForExport(
     annotations,
     notes,
     annotationFilter,
     false,
+    noteAnchors,
   );
   const nonEmptyNotedAnnotationIds = new Set(
     notes
@@ -1766,162 +2099,252 @@ export function AppLayout() {
   const visibleNonEmptyNoteCount = notes.filter(
     (note) =>
       note.content.trim().length > 0 &&
-      (visibleAnnotationIds.has(note.annotationId) || noteAnchorIds.has(note.annotationId)),
+      (visibleAnnotationIds.has(note.annotationId) ||
+        noteAnchorIds.has(note.annotationId)),
   ).length;
-
-  return (
-    <main className={`app-layout ${isSidebarCollapsed ? 'is-sidebar-collapsed' : ''}`}>
-      <Toolbar
-        onOpenFile={openDocument}
-        onZoomIn={zoomIn}
-        onZoomOut={zoomOut}
-        onFitWidth={() => {
-          beginZoomOperation();
-          setFitMode('width');
-        }}
-        onFitPage={() => {
-          beginZoomOperation();
-          setFitMode('page');
-        }}
-        onApplyZoom={applyZoom}
-        onGoToPage={navigateToPage}
-        onOpenSearch={() => viewerRef.current?.openSearch()}
-        openFileRequestId={openFileRequestId}
-        onOpenLibrary={openLibrary}
-        onExportAnnotatedPdf={() => {
-          setAnnotatedPdfError(null);
-          setAnnotatedPdfProgress(null);
-          setIsAnnotatedPdfDialogOpen(true);
-        }}
-        isAnnotatedPdfExporting={isAnnotatedPdfExporting}
-        hasDocument={Boolean(file)}
-        pageCount={pageCount}
-        currentPage={currentPage}
-        documentTitle={documentDisplayTitle ?? file?.name ?? 'No document opened'}
-        effectiveZoom={effectiveZoom}
-        isAiOpen={isAiOpen}
-        aiStatus={aiStatus}
-        onToggleAi={() => setIsAiOpen((open) => !open)}
+  const homeContent =
+    homeSection === 'home' ? (
+      <HomeLandingPage
+        onOpenCollections={() => setHomeSection('collections')}
+        onOpenDrive={openDriveManagement}
+        onOpenLibrary={() => setHomeSection('library')}
+        onOpenOfficeConverter={() =>
+          setOfficeConversionRequest({ requestId: Date.now() })
+        }
       />
-      <WebLocalDataNotice />
-      <div className="app-content">
-        <Sidebar
-          isCollapsed={isSidebarCollapsed}
-          onToggle={() => setIsSidebarCollapsed((isCollapsed) => !isCollapsed)}
-          width={sidebarWidth}
-          onWidthChange={setSidebarWidth}
-          pdfDocument={pdfDocument}
-          currentPage={currentPage}
-          onGoToPage={navigateToPage}
-          annotations={annotations}
-          notedAnnotationIds={notes.map((note) => note.annotationId)}
-          annotationFilter={annotationFilter}
-          onAnnotationFilterChange={setAnnotationFilter}
-        />
-        <Viewer
-          ref={viewerRef}
-          file={file}
-          fitMode={fitMode}
-          zoom={zoom}
-          onOpenFile={openDocument}
-          onPageCountChange={setPageCount}
-          onCurrentPageChange={setCurrentPage}
-          onEffectiveZoomChange={setEffectiveZoom}
-          onDocumentReady={hydrateDocument}
-          documentId={documentIdentity?.documentId ?? null}
-          annotations={annotations}
-          noteAnchors={noteAnchors}
-          notes={notes}
-          glossaryEntries={glossaryEntries}
-          onAddGlossaryEntry={addGlossaryEntry}
-          onCreateHighlights={createHighlights}
-          onCreateUnderlines={createUnderlines}
-          onRemoveAnnotation={removeAnnotation}
-          notedAnnotationIds={notes.map((note) => note.annotationId)}
-          onAddNote={addNoteFromSelection}
-          onAnnotationTap={addNoteFromMarkedSource}
-          onCreateAnnotationFromSource={createAnnotationFromNoteSource}
-          zoomOperationId={zoomOperationId}
-          annotationFilter={annotationFilter}
-          onPdfDocumentChange={setPdfDocument}
-          onTextSelectionChange={setSelectedPdfText}
-          onExplicitNavigation={handleExplicitNavigation}
-          onAnnotationNavigationApplied={handleInitialAnnotationNavigationApplied}
-        />
-        {isAiOpen && file ? (
-          <Suspense
-            fallback={<aside className="ai-assistant-panel ai-panel-loading" role="status">Opening AI Assistant...</aside>}
-          >
-            <AssistantPanel
-              isOpen={isAiOpen}
-              document={pdfDocument}
-              documentId={documentIdentity?.documentId ?? null}
-              documentTitle={documentDisplayTitle ?? file.name}
-              currentPage={currentPage}
-              selectedText={selectedPdfText}
-              onClose={() => setIsAiOpen(false)}
-              onNavigateToPage={navigateToPage}
-              onAddToNote={addAiOutputToNote}
-              onSendToPrintDraft={sendAiOutputToPrintDraft}
-              onStatusChange={setAiStatus}
-            />
-          </Suspense>
-        ) : null}
-        <NotesPanel
-          notes={notes}
-          glossaryEntries={glossaryEntries}
-          annotationCount={annotations.length}
-          isOpen={isNotesDrawerOpen}
-          draggedNoteId={noteDragPreview?.noteId ?? null}
-          isExporting={isPdfExporting}
-          onToggle={() => setIsNotesDrawerOpen((isOpen) => !isOpen)}
-          focusedNoteId={focusedNoteId}
-          onFocusComplete={() => setFocusedNoteId(null)}
-          onFocusedNoteReady={handleFocusedNoteReady}
-          onNavigate={navigateToNote}
-          onUpdate={updateNote}
-          onUpdateDisplayNumber={updateNoteDisplayNumber}
-          onDelete={deleteNote}
-          onNavigateGlossary={navigateToGlossaryEntry}
-          onRemoveGlossary={removeGlossaryEntry}
-          onExportNotes={exportCurrentNotes}
-          onEditBeforePrinting={(layout) => {
-            if (!documentIdentity || !isDocumentHydrated) return;
-            setPrintComposerLayout(layout);
-            setIsPrintComposerOpen(true);
-          }}
-          onBeginNoteDrag={beginNoteDrag}
-          onOpenLargeEditor={openLargeEditor}
-        />
-      </div>
-      {isLibraryOpen ? (
-        <Suspense
-          fallback={
-            <div className="library-loading" role="status">
-              Opening Library…
-            </div>
-          }
-        >
+    ) : homeSection === 'library' ? (
+      <div className="home-library-page">
+        <Suspense fallback={<div role="status">Opening Library…</div>}>
           <LibraryPanel
-            isOpen={isLibraryOpen}
-            refreshToken={libraryRefreshToken}
-            onClose={() => setIsLibraryOpen(false)}
-            onForget={forgetDocument}
-            onOpenFile={openDocument}
-            onOpenStoredPdf={openStoredDocument}
-            onOpenLibraryNote={openLibraryNote}
-            onSelectPdfForLibraryNote={selectPdfForLibraryNote}
-            onRenameDocument={renameLibraryDocument}
-            onRemovePdfCopy={removeLibraryPdfCopy}
             focusSearchRequestId={librarySearchFocusRequestId}
-            onPinDocument={updateLibraryOrganization}
+            isOpen
+            presentation="embedded"
+            refreshToken={libraryRefreshToken}
+            onClose={() => setApplicationView('reader')}
+            onForget={forgetDocument}
             onForgetMany={forgetLibraryDocuments}
+            onOpenFile={openDocument}
+            onOpenLibraryNote={openLibraryNote}
+            onOpenStoredDocument={openStoredDocument}
+            onPinDocument={updateLibraryOrganization}
+            onRemoveSourceCopy={removeLibrarySourceCopy}
+            onRenameDocument={renameLibraryDocument}
+            onSelectSourceForLibraryNote={selectPdfForLibraryNote}
             onUpdateOrganization={(documentId, update) =>
               updateDocumentOrganization([documentId], update)
             }
           />
         </Suspense>
+      </div>
+    ) : homeSection === 'collections' ? (
+      <CollectionsHomePage />
+    ) : homeSection === 'tags' ? (
+      <TagsHomePage />
+    ) : homeSection === 'theme' ? (
+      <ThemeHomePage />
+    ) : homeSection === 'ai' ? (
+      <Suspense fallback={<div role="status">Opening AI configuration…</div>}>
+        <AiConfigurationPage />
+      </Suspense>
+    ) : homeSection === 'drive' ? (
+      <Suspense fallback={<div role="status">Opening Google Drive…</div>}>
+        <PaperSyncHomePage
+          updateReviewRequest={paperUpdateReviewRequest}
+          onUpdateReviewOpened={markDriveUpdateReviewOpened}
+        />
+      </Suspense>
+    ) : (
+      <SettingsHomePage />
+    );
+
+  return (
+    <main className={`app-layout ${isSidebarCollapsed ? 'is-sidebar-collapsed' : ''}`}>
+      <div
+        aria-hidden={applicationView === 'home' ? true : undefined}
+        className={`reader-workspace ${applicationView === 'home' ? 'is-home-covered' : ''}`}
+      >
+        <Toolbar
+          onOpenFile={openDocument}
+          onZoomIn={zoomIn}
+          onZoomOut={zoomOut}
+          onFitWidth={() => {
+            beginZoomOperation();
+            setFitMode('width');
+          }}
+          onFitPage={() => {
+            beginZoomOperation();
+            setFitMode('page');
+          }}
+          onApplyZoom={applyZoom}
+          onGoToPage={navigateToPage}
+          onOpenSearch={() => viewerRef.current?.openSearch()}
+          openFileRequestId={openFileRequestId}
+          onExportAnnotatedPdf={() => {
+            setAnnotatedPdfError(null);
+            setAnnotatedPdfProgress(null);
+            setIsAnnotatedPdfDialogOpen(true);
+          }}
+          isAnnotatedPdfExporting={isAnnotatedPdfExporting}
+          hasDocument={Boolean(file)}
+          documentType={activeDocumentType}
+          pageCount={pageCount}
+          currentPage={currentPage}
+          documentTitle={documentDisplayTitle ?? file?.name ?? 'No document opened'}
+          effectiveZoom={effectiveZoom}
+          isAiOpen={isAiOpen}
+          aiStatus={aiStatus}
+          onToggleAi={() => setIsAiOpen((open) => !open)}
+        />
+        <WebLocalDataNotice />
+        <div className="app-content">
+          <Sidebar
+            isCollapsed={isSidebarCollapsed}
+            onToggle={() => setIsSidebarCollapsed((isCollapsed) => !isCollapsed)}
+            width={sidebarWidth}
+            onWidthChange={setSidebarWidth}
+            pdfDocument={pdfDocument}
+            currentPage={currentPage}
+            onGoToPage={navigateToPage}
+            annotations={annotations}
+            notedAnnotationIds={notedAnnotationIds}
+            annotationFilter={annotationFilter}
+            onAnnotationFilterChange={setAnnotationFilter}
+          />
+          <Viewer
+            ref={viewerRef}
+            file={activeDocumentType === 'pdf' ? file : null}
+            fitMode={fitMode}
+            zoom={zoom}
+            onOpenFile={openDocument}
+            onPageCountChange={setPageCount}
+            onCurrentPageChange={setCurrentPage}
+            onEffectiveZoomChange={updateEffectiveZoom}
+            onDocumentReady={hydrateDocument}
+            documentId={documentIdentity?.documentId ?? null}
+            annotations={annotations}
+            noteAnchors={noteAnchors}
+            notes={notes}
+            glossaryEntries={glossaryEntries}
+            draggedNoteId={noteDragPreview?.noteId ?? null}
+            onAddGlossaryEntry={addGlossaryEntry}
+            onRemoveGlossaryEntry={removeGlossaryEntry}
+            onCreateHighlights={createHighlights}
+            onCreateUnderlines={createUnderlines}
+            notedAnnotationIds={notedAnnotationIds}
+            onAddNoteToAnnotation={addNoteToMarkedAnnotation}
+            onUpdateNote={updateNote}
+            onDeleteNote={deleteNote}
+            onBeginNoteDrag={beginNoteDrag}
+            onOpenLargeEditor={openLargeEditor}
+            onDeleteAnnotation={removeMarkedAnnotation}
+            onCreateAnnotationFromSource={createAnnotationFromNoteSource}
+            zoomOperationId={zoomOperationId}
+            onFitWidthLayoutChange={beginZoomOperation}
+            annotationFilter={annotationFilter}
+            onPdfDocumentChange={setPdfDocument}
+            onTextSelectionChange={setSelectedPdfText}
+            onExplicitNavigation={handleExplicitNavigation}
+            onAnnotationNavigationApplied={handleInitialAnnotationNavigationApplied}
+          />
+          {isAiOpen && file && activeDocumentType ? (
+            <Suspense
+              fallback={
+                <aside className="ai-assistant-panel ai-panel-loading" role="status">
+                  Opening AI Assistant...
+                </aside>
+              }
+            >
+              <AssistantPanel
+                isOpen={isAiOpen}
+                document={pdfDocument}
+                documentTextSource={null}
+                documentId={documentIdentity?.documentId ?? null}
+                documentTitle={documentDisplayTitle ?? file.name}
+                currentPage={currentPage}
+                selectedText={selectedPdfText}
+                onClose={() => setIsAiOpen(false)}
+                onNavigateToPage={navigateToPage}
+                onAddToNote={addAiOutputToNote}
+                onSendToPrintDraft={sendAiOutputToPrintDraft}
+                onStatusChange={setAiStatus}
+                onOpenConfiguration={() => openHomeSection('ai')}
+              />
+            </Suspense>
+          ) : null}
+          {activeDocumentType === 'pdf' ? (
+            <NotesPanel
+              notes={notes}
+              glossaryEntries={glossaryEntries}
+              annotationCount={annotations.length}
+              isOpen={isNotesDrawerOpen}
+              draggedNoteId={noteDragPreview?.noteId ?? null}
+              isExporting={isPdfExporting}
+              onToggle={() => setIsNotesDrawerOpen((isOpen) => !isOpen)}
+              focusedNoteId={focusedNoteId}
+              onFocusComplete={() => setFocusedNoteId(null)}
+              onFocusedNoteReady={handleFocusedNoteReady}
+              onNavigate={navigateToNote}
+              onUpdate={updateNote}
+              onUpdateDisplayNumber={updateNoteDisplayNumber}
+              onDelete={deleteNote}
+              onNavigateGlossary={navigateToGlossaryEntry}
+              onRemoveGlossary={removeGlossaryEntry}
+              onExportNotes={exportCurrentNotes}
+              onEditBeforePrinting={(layout) => {
+                if (!documentIdentity || !isDocumentHydrated) return;
+                setPrintComposerLayout(layout);
+                setIsPrintComposerOpen(true);
+              }}
+              onBeginNoteDrag={beginNoteDrag}
+              onOpenLargeEditor={openLargeEditor}
+            />
+          ) : null}
+        </div>
+      </div>
+      <HomeWorkspace
+        activeSection={homeSection}
+        isOpen={applicationView === 'home'}
+        onReturnToReader={() => setApplicationView('reader')}
+        onSectionChange={setHomeSection}
+      >
+        {homeContent}
+      </HomeWorkspace>
+      {officeConversionRequest ? (
+        <Suspense
+          fallback={
+            <div className="office-converter-overlay" role="status">
+              Loading the local converter…
+            </div>
+          }
+        >
+          <OfficePdfConverterDialog
+            key={officeConversionRequest.requestId}
+            initialFile={officeConversionRequest.file}
+            onClose={() => setOfficeConversionRequest(null)}
+            onImportPdf={openDocument}
+          />
+        </Suspense>
       ) : null}
+      {applicationView === 'reader' ? (
+        <>
+          <HomeFloatingButton onClick={() => openHomeSection('home')} />
+          <Suspense fallback={null}>
+            <PaperReaderSyncStatus
+              onOpenDrive={(affectedDocumentIds) =>
+                affectedDocumentIds?.length
+                  ? openDriveUpdateReview(affectedDocumentIds)
+                  : openDriveManagement()
+              }
+            />
+          </Suspense>
+        </>
+      ) : null}
+      <Suspense fallback={null}>
+        <PaperRemoteUpdateLayer
+          isReaderActive={applicationView === 'reader'}
+          onReviewUpdates={openDriveUpdateReview}
+        />
+      </Suspense>
       {noteDragPreview && draggedNote ? (
         <div className="note-drop-overlay" aria-hidden="true">
           <div ref={noteDropTargetRef} className="note-drop-target">
@@ -1953,8 +2376,9 @@ export function AppLayout() {
           documentTitle={documentDisplayTitle ?? file?.name ?? '39Note'}
           onClose={() => {
             setLargeEditorNoteId(null);
-            setFocusedNoteId(largeEditorNote.id);
-            setIsNotesDrawerOpen(true);
+            if (isNotesDrawerOpen) {
+              setFocusedNoteId(largeEditorNote.id);
+            }
           }}
           onUpdate={updateNote}
           onUpdateDisplayNumber={updateNoteDisplayNumber}
@@ -1962,7 +2386,11 @@ export function AppLayout() {
       ) : null}
       {isPrintComposerOpen && documentIdentity ? (
         <Suspense
-          fallback={<div className="print-composer-overlay" role="status">Opening Print Composer…</div>}
+          fallback={
+            <div className="print-composer-overlay" role="status">
+              Opening Print Composer…
+            </div>
+          }
         >
           <PrintComposer
             documentId={documentIdentity.documentId}
@@ -2009,6 +2437,29 @@ export function AppLayout() {
       ) : null}
     </main>
   );
+}
+
+function prepareSupportedDocumentFile(
+  file: File,
+): { file: File; documentType: DocumentType } | null {
+  const declaredType = getDocumentTypeForMimeType(file.type);
+  if (declaredType) {
+    return hasDocumentFileExtension(file.name, declaredType)
+      ? { file, documentType: declaredType }
+      : null;
+  }
+  if (file.type && file.type !== 'application/octet-stream') return null;
+  const inferredType = (Object.keys(DOCUMENT_MIME_TYPES) as DocumentType[]).find(
+    (candidate) => hasDocumentFileExtension(file.name, candidate),
+  );
+  if (!inferredType) return null;
+  return {
+    documentType: inferredType,
+    file: new File([file], file.name, {
+      type: DOCUMENT_MIME_TYPES[inferredType],
+      lastModified: file.lastModified,
+    }),
+  };
 }
 
 function isEditableElement(target: EventTarget | null): boolean {

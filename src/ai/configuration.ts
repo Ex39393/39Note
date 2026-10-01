@@ -10,6 +10,12 @@ import type {
   AiProviderId,
   QwenRegion,
 } from './types';
+import { notifyPersistentChange } from '../services/persistentChange.ts';
+import {
+  currentTemporaryStorageSuffix,
+  isStorageKeyOwnedByActiveWorkspace,
+  scopedLocalStorageKey,
+} from '../services/temporaryWorkspace.ts';
 
 const CONFIG_KEY = '39note.ai.provider.v1';
 const SESSION_KEY = '39note.ai.api-key.session.v1';
@@ -69,7 +75,9 @@ export const BUILT_IN_PROMPTS: AiPromptProfile[] = [
 
 export function loadAiConfiguration(): AiProviderConfig | null {
   try {
-    const value = JSON.parse(localStorage.getItem(CONFIG_KEY) ?? 'null') as unknown;
+    const value = JSON.parse(
+      localStorage.getItem(workspaceKey(CONFIG_KEY)) ?? 'null',
+    ) as unknown;
     if (!isRecord(value)) return null;
     return sanitizeConfiguration(value);
   } catch {
@@ -79,14 +87,31 @@ export function loadAiConfiguration(): AiProviderConfig | null {
 
 export function saveAiConfiguration(config: AiProviderConfig, apiKey: string): void {
   const sanitized = sanitizeConfiguration(config);
-  localStorage.setItem(CONFIG_KEY, JSON.stringify(sanitized));
+  localStorage.setItem(workspaceKey(CONFIG_KEY), JSON.stringify(sanitized));
   const profileId = getCredentialProfileId(sanitized);
-  const sessionKey = `${SESSION_KEY_PREFIX}${profileId}`;
-  const rememberedKey = `${REMEMBERED_KEY_PREFIX}${profileId}`;
+  const sessionKey = workspaceKey(`${SESSION_KEY_PREFIX}${profileId}`);
+  const rememberedKey = workspaceKey(`${REMEMBERED_KEY_PREFIX}${profileId}`);
   if (apiKey) sessionStorage.setItem(sessionKey, apiKey);
   else sessionStorage.removeItem(sessionKey);
   if (sanitized.rememberApiKey && apiKey) localStorage.setItem(rememberedKey, apiKey);
   else localStorage.removeItem(rememberedKey);
+  notifyPersistentChange({ kind: 'ai-settings' });
+}
+
+export function saveAiConfigurationWithoutCredentials(
+  config: AiProviderConfig,
+  notifyChange = true,
+): void {
+  const existing = loadAiConfiguration();
+  localStorage.setItem(
+    workspaceKey(CONFIG_KEY),
+    JSON.stringify({
+      ...sanitizeConfiguration(config),
+      customHeaders: existing?.customHeaders ?? {},
+      rememberApiKey: existing?.rememberApiKey ?? false,
+    }),
+  );
+  if (notifyChange) notifyPersistentChange({ kind: 'ai-settings' });
 }
 
 export function loadApiKey(
@@ -94,23 +119,29 @@ export function loadApiKey(
 ): string {
   const profileId = getCredentialProfileId(config);
   const namespaced =
-    sessionStorage.getItem(`${SESSION_KEY_PREFIX}${profileId}`) ??
-    localStorage.getItem(`${REMEMBERED_KEY_PREFIX}${profileId}`);
+    sessionStorage.getItem(workspaceKey(`${SESSION_KEY_PREFIX}${profileId}`)) ??
+    localStorage.getItem(workspaceKey(`${REMEMBERED_KEY_PREFIX}${profileId}`));
   if (namespaced !== null) return namespaced;
 
   // Copy the legacy credential once into the profile inferred from the legacy config.
   // The old slots remain intact until the user explicitly clears AI configuration.
-  if (localStorage.getItem(KEY_MIGRATION_MARKER) === null) {
-    const legacySession = sessionStorage.getItem(SESSION_KEY);
-    const legacyRemembered = localStorage.getItem(REMEMBERED_KEY);
+  if (localStorage.getItem(workspaceKey(KEY_MIGRATION_MARKER)) === null) {
+    const legacySession = sessionStorage.getItem(workspaceKey(SESSION_KEY));
+    const legacyRemembered = localStorage.getItem(workspaceKey(REMEMBERED_KEY));
     if (legacySession !== null) {
-      sessionStorage.setItem(`${SESSION_KEY_PREFIX}${profileId}`, legacySession);
+      sessionStorage.setItem(
+        workspaceKey(`${SESSION_KEY_PREFIX}${profileId}`),
+        legacySession,
+      );
     }
     if (legacyRemembered !== null) {
-      localStorage.setItem(`${REMEMBERED_KEY_PREFIX}${profileId}`, legacyRemembered);
+      localStorage.setItem(
+        workspaceKey(`${REMEMBERED_KEY_PREFIX}${profileId}`),
+        legacyRemembered,
+      );
     }
     if (legacySession !== null || legacyRemembered !== null) {
-      localStorage.setItem(KEY_MIGRATION_MARKER, profileId);
+      localStorage.setItem(workspaceKey(KEY_MIGRATION_MARKER), profileId);
       return legacySession ?? legacyRemembered ?? '';
     }
   }
@@ -121,21 +152,70 @@ export function clearApiKey(
   config: AiProviderConfig = loadAiConfiguration() ?? DEFAULT_AI_CONFIG,
 ): void {
   const profileId = getCredentialProfileId(config);
-  sessionStorage.removeItem(`${SESSION_KEY_PREFIX}${profileId}`);
-  localStorage.removeItem(`${REMEMBERED_KEY_PREFIX}${profileId}`);
+  sessionStorage.removeItem(workspaceKey(`${SESSION_KEY_PREFIX}${profileId}`));
+  localStorage.removeItem(workspaceKey(`${REMEMBERED_KEY_PREFIX}${profileId}`));
 }
 
 export function clearAiConfiguration(): void {
-  localStorage.removeItem(CONFIG_KEY);
+  localStorage.removeItem(workspaceKey(CONFIG_KEY));
   clearAllApiKeys();
+  notifyPersistentChange({ kind: 'ai-settings' });
+}
+
+export function clearAiConfigurationWithoutCredentials(notifyChange = true): void {
+  localStorage.removeItem(workspaceKey(CONFIG_KEY));
+  if (notifyChange) notifyPersistentChange({ kind: 'ai-settings' });
 }
 
 export function clearAllApiKeys(): void {
-  removeStorageKeysWithPrefix(sessionStorage, SESSION_KEY_PREFIX);
-  removeStorageKeysWithPrefix(localStorage, REMEMBERED_KEY_PREFIX);
-  sessionStorage.removeItem(SESSION_KEY);
-  localStorage.removeItem(REMEMBERED_KEY);
-  localStorage.removeItem(KEY_MIGRATION_MARKER);
+  removeCurrentWorkspaceKeysWithPrefix(sessionStorage, SESSION_KEY_PREFIX);
+  removeCurrentWorkspaceKeysWithPrefix(localStorage, REMEMBERED_KEY_PREFIX);
+  sessionStorage.removeItem(workspaceKey(SESSION_KEY));
+  localStorage.removeItem(workspaceKey(REMEMBERED_KEY));
+  localStorage.removeItem(workspaceKey(KEY_MIGRATION_MARKER));
+}
+
+export interface AiStorageFootprint {
+  localKeys: string[];
+  sessionKeys: string[];
+}
+
+/** Returns key names only; credential values are never exposed to sync or diagnostics. */
+export function inspectAiStorageFootprint(): AiStorageFootprint {
+  const knownLocal = new Set(
+    [
+      CONFIG_KEY,
+      REMEMBERED_KEY,
+      KEY_MIGRATION_MARKER,
+      PROMPTS_KEY,
+      DEFAULT_PROMPT_KEY,
+    ].map(workspaceKey),
+  );
+  const knownSession = new Set([workspaceKey(SESSION_KEY)]);
+  return {
+    localKeys: storageKeys(localStorage).filter(
+      (key) =>
+        knownLocal.has(key) || isCurrentWorkspacePrefixKey(key, REMEMBERED_KEY_PREFIX),
+    ),
+    sessionKeys: storageKeys(sessionStorage).filter(
+      (key) =>
+        knownSession.has(key) || isCurrentWorkspacePrefixKey(key, SESSION_KEY_PREFIX),
+    ),
+  };
+}
+
+/** Exact AI slots owned by the active temporary workspace; personal keys are untouched. */
+export function clearTemporaryAiStorage(): void {
+  const suffix = currentTemporaryStorageSuffix();
+  if (!suffix) return;
+  for (const key of storageKeys(localStorage)) {
+    if (key.startsWith('39note.ai.') && key.endsWith(suffix))
+      localStorage.removeItem(key);
+  }
+  for (const key of storageKeys(sessionStorage)) {
+    if (key.startsWith('39note.ai.') && key.endsWith(suffix))
+      sessionStorage.removeItem(key);
+  }
 }
 
 export function getCredentialProfileId(config: AiProviderConfig): string {
@@ -152,7 +232,9 @@ export function getCredentialProfileId(config: AiProviderConfig): string {
 
 export function loadPromptProfiles(): AiPromptProfile[] {
   try {
-    const stored = JSON.parse(localStorage.getItem(PROMPTS_KEY) ?? '[]') as unknown;
+    const stored = JSON.parse(
+      localStorage.getItem(workspaceKey(PROMPTS_KEY)) ?? '[]',
+    ) as unknown;
     const custom = Array.isArray(stored)
       ? stored.flatMap((profile) => {
           if (
@@ -179,19 +261,29 @@ export function loadPromptProfiles(): AiPromptProfile[] {
   }
 }
 
-export function saveCustomPromptProfiles(profiles: readonly AiPromptProfile[]): void {
+export function saveCustomPromptProfiles(
+  profiles: readonly AiPromptProfile[],
+  notifyChange = true,
+): void {
   localStorage.setItem(
-    PROMPTS_KEY,
+    workspaceKey(PROMPTS_KEY),
     JSON.stringify(profiles.filter((profile) => !profile.builtIn)),
   );
+  if (notifyChange) notifyPersistentChange({ kind: 'ai-settings' });
 }
 
 export function loadDefaultPromptProfileId(): string {
-  return localStorage.getItem(DEFAULT_PROMPT_KEY) || BUILT_IN_PROMPTS[0].id;
+  return (
+    localStorage.getItem(workspaceKey(DEFAULT_PROMPT_KEY)) || BUILT_IN_PROMPTS[0].id
+  );
 }
 
-export function saveDefaultPromptProfileId(profileId: string): void {
-  localStorage.setItem(DEFAULT_PROMPT_KEY, profileId.slice(0, 128));
+export function saveDefaultPromptProfileId(
+  profileId: string,
+  notifyChange = true,
+): void {
+  localStorage.setItem(workspaceKey(DEFAULT_PROMPT_KEY), profileId.slice(0, 128));
+  if (notifyChange) notifyPersistentChange({ kind: 'ai-settings' });
 }
 
 export function sanitizeConfiguration(
@@ -295,13 +387,30 @@ function isQwenRegion(value: unknown): value is QwenRegion {
   );
 }
 
-function removeStorageKeysWithPrefix(storage: Storage, prefix: string): void {
+function workspaceKey(key: string): string {
+  return scopedLocalStorageKey(key);
+}
+
+function isCurrentWorkspacePrefixKey(key: string, prefix: string): boolean {
+  return isStorageKeyOwnedByActiveWorkspace(key, prefix);
+}
+
+function removeCurrentWorkspaceKeysWithPrefix(storage: Storage, prefix: string): void {
   const keys: string[] = [];
   for (let index = 0; index < storage.length; index += 1) {
     const key = storage.key(index);
-    if (key?.startsWith(prefix)) keys.push(key);
+    if (key && isCurrentWorkspacePrefixKey(key, prefix)) keys.push(key);
   }
   for (const key of keys) storage.removeItem(key);
+}
+
+function storageKeys(storage: Storage): string[] {
+  const keys: string[] = [];
+  for (let index = 0; index < storage.length; index += 1) {
+    const key = storage.key(index);
+    if (key) keys.push(key);
+  }
+  return keys;
 }
 
 function boundedNumber(

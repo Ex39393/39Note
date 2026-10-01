@@ -1,4 +1,5 @@
 import type { NormalizedHighlightRectangle } from './highlight';
+import type { DocxSemanticAnchor, PptxSemanticAnchor } from '../documents/anchors';
 
 export type DictionaryProvider = 'wordnet' | 'wiktionary' | 'mesh';
 
@@ -34,9 +35,7 @@ export interface MeshSourceAttribution {
 }
 
 export type DictionarySourceAttribution =
-  | WordNetSourceAttribution
-  | WiktionarySourceAttribution
-  | MeshSourceAttribution;
+  WordNetSourceAttribution | WiktionarySourceAttribution | MeshSourceAttribution;
 
 export type DictionaryPartOfSpeech = 'noun' | 'verb' | 'adjective' | 'adverb';
 
@@ -52,19 +51,43 @@ export interface DictionaryLookupResult {
   definitions: DictionaryDefinition[];
 }
 
-export interface GlossaryEntry {
+interface GlossaryEntryBase {
   glossaryEntryId: string;
   documentId: string;
   displayedWord: string;
   normalizedLookupWord: string;
   definition: string;
+  createdAt: number;
+  source: DictionarySourceAttribution;
+}
+
+/** Existing PDF entries intentionally retain their persisted shape. */
+export interface PdfGlossaryEntry extends GlossaryEntryBase {
+  locationKind?: 'pdf';
   pageNumber: number;
   sourceRects: NormalizedHighlightRectangle[];
   startOffset: number;
   endOffset: number;
-  createdAt: number;
-  source: DictionarySourceAttribution;
   markerAnnotationId: string;
+}
+
+/** Office locations are semantic and never masquerade as PDF pages. */
+export interface SemanticGlossaryEntry extends GlossaryEntryBase {
+  locationKind: 'semantic';
+  anchor: PptxSemanticAnchor | DocxSemanticAnchor;
+  locationLabel: string;
+}
+
+export type GlossaryEntry = PdfGlossaryEntry | SemanticGlossaryEntry;
+
+export function isPdfGlossaryEntry(entry: GlossaryEntry): entry is PdfGlossaryEntry {
+  return entry.locationKind !== 'semantic';
+}
+
+export function isSemanticGlossaryEntry(
+  entry: GlossaryEntry,
+): entry is SemanticGlossaryEntry {
+  return entry.locationKind === 'semantic';
 }
 
 export type DefinitionBubbleStatus = 'loading' | 'ready' | 'not-found' | 'error';

@@ -7,15 +7,14 @@ import {
   type CSSProperties,
   type PointerEvent as ReactPointerEvent,
 } from 'react';
-import {
-  TextLayer,
-  type PDFDocumentProxy,
-  type PDFPageProxy,
-} from 'pdfjs-dist';
+import { TextLayer, type PDFDocumentProxy, type PDFPageProxy } from 'pdfjs-dist';
 import type { ElementSize } from '../../hooks/useElementSize';
 import type { PdfSearchResult } from '../../types/pdfSearch';
 import type { NoteAnchor } from '../../types/noteAnchor';
-import type { DefinitionBubble as DefinitionBubbleModel, GlossaryEntry } from '../../types/glossary';
+import type {
+  DefinitionBubble as DefinitionBubbleModel,
+  PdfGlossaryEntry,
+} from '../../types/glossary';
 import {
   highlightColors,
   underlineColors,
@@ -27,13 +26,18 @@ import {
   attachPdfTextSourceMap,
   detachPdfTextSourceMap,
 } from '../../utils/pdfTextSourceMap';
-import { getHighlightRenderGroups, normalizeAnnotationVisualGeometry } from '../../utils/highlights';
-import { findAnnotationsAtNormalizedPoint } from '../../utils/annotationOverlap';
 import {
+  getHighlightRenderGroups,
+  normalizeAnnotationVisualGeometry,
+} from '../../utils/highlights';
+import {
+  findAnnotationsAtClientPoint,
+  findPdfGlossaryEntriesAtClientPoint,
   isAnnotationTapInteractiveTarget,
   isSimpleAnnotationTap,
   type AnnotationPointerStart,
 } from '../../utils/annotationInteraction';
+import { calculatePdfPageScale } from '../../utils/pdfPageScale';
 import { DefinitionBubble } from './DefinitionBubble';
 
 type FitMode = 'width' | 'page' | null;
@@ -63,7 +67,7 @@ interface PdfPageProps {
   zoom: number;
   annotations: PdfAnnotation[];
   noteAnchors: NoteAnchor[];
-  glossaryEntries: GlossaryEntry[];
+  glossaryEntries: PdfGlossaryEntry[];
   definitionBubbles: DefinitionBubbleModel[];
   activeAnnotationId: string | null;
   activeGlossaryEntryId: string | null;
@@ -71,12 +75,18 @@ interface PdfPageProps {
   onScaleChange: (pageNumber: number, scale: number) => void;
   onGoToPage: (pageNumber: number) => void;
   onAddBubbleToGlossary: (bubbleId: string) => void;
+  onRemoveBubbleFromGlossary: (glossaryEntryId: string) => void;
   onCloseDefinitionBubble: (bubbleId: string) => void;
   onMoveDefinitionUp: (bubbleId: string, definitionId: string) => void;
   onToggleDefinitionsExpanded: (bubbleId: string) => void;
   onPageLayoutChange: (pageNumber: number) => void;
   onTextLayerReady: (pageNumber: number) => void;
-  onAnnotationTap: (annotations: PdfAnnotation[]) => void;
+  onOpenReaderContext: (
+    annotations: PdfAnnotation[],
+    glossaryEntries: PdfGlossaryEntry[],
+    position: { clientX: number; clientY: number },
+  ) => void;
+  onDismissReaderContext: () => void;
   searchResults: PdfSearchResult[];
   activeSearchResultId: string | null;
 }
@@ -98,12 +108,14 @@ export function PdfPage({
   onScaleChange,
   onGoToPage,
   onAddBubbleToGlossary,
+  onRemoveBubbleFromGlossary,
   onCloseDefinitionBubble,
   onMoveDefinitionUp,
   onToggleDefinitionsExpanded,
   onPageLayoutChange,
   onTextLayerReady,
-  onAnnotationTap,
+  onOpenReaderContext,
+  onDismissReaderContext,
   searchResults,
   activeSearchResultId,
 }: PdfPageProps) {
@@ -142,24 +154,17 @@ export function PdfPage({
     if (!baseDimensions) {
       return 1;
     }
-
-    if (fitMode === 'width') {
-      return Math.max((containerSize.width - 64) / baseDimensions.width, 0.25);
-    }
-
-    if (fitMode === 'page') {
-      const widthScale = (containerSize.width - 64) / baseDimensions.width;
-      const heightScale = (containerSize.height - 64) / baseDimensions.height;
-      return Math.max(Math.min(widthScale, heightScale), 0.25);
-    }
-
-    return zoom;
+    return calculatePdfPageScale({
+      fitMode,
+      zoom,
+      containerWidth: containerSize.width,
+      containerHeight: containerSize.height,
+      pageWidth: baseDimensions.width,
+      pageHeight: baseDimensions.height,
+    });
   }, [baseDimensions, containerSize.height, containerSize.width, fitMode, zoom]);
 
-  const viewport = useMemo(
-    () => page?.getViewport({ scale }),
-    [page, scale],
-  );
+  const viewport = useMemo(() => page?.getViewport({ scale }), [page, scale]);
 
   const dimensions = useMemo<PageDimensions | null>(() => {
     if (!viewport) {
@@ -242,10 +247,12 @@ export function PdfPage({
       })
       .catch((error: unknown) => {
         if (
-          !isDisposed
-          && (!(error instanceof Error) || error.name !== 'RenderingCancelledException')
+          !isDisposed &&
+          (!(error instanceof Error) || error.name !== 'RenderingCancelledException')
         ) {
-          setRenderWarning(`Page ${pageNumber} could not render completely. Some images may be missing.`);
+          setRenderWarning(
+            `Page ${pageNumber} could not render completely. Some images may be missing.`,
+          );
         }
       });
 
@@ -284,11 +291,13 @@ export function PdfPage({
       disableNormalization: true,
     });
     const textLayerRenderPromise = textLayer.render();
-    void Promise.all([textLayerRenderPromise, textContentPromise]).then(([, textContent]) => {
-      if (!isDisposed) {
-        attachPdfTextSourceMap(container, pageNumber, textContent);
-      }
-    }).catch(() => undefined);
+    void Promise.all([textLayerRenderPromise, textContentPromise])
+      .then(([, textContent]) => {
+        if (!isDisposed) {
+          attachPdfTextSourceMap(container, pageNumber, textContent);
+        }
+      })
+      .catch(() => undefined);
 
     void textLayerRenderPromise
       .then(() => {
@@ -327,8 +336,13 @@ export function PdfPage({
           return [];
         }
 
-        const [firstX, firstY, secondX, secondY] = viewport.convertToViewportRectangle(
-          annotation.rect,
+        const [firstX, firstY] = viewport.convertToViewportPoint(
+          annotation.rect[0],
+          annotation.rect[1],
+        );
+        const [secondX, secondY] = viewport.convertToViewportPoint(
+          annotation.rect[2],
+          annotation.rect[3],
         );
         const width = Math.abs(secondX - firstX);
         const height = Math.abs(secondY - firstY);
@@ -340,16 +354,18 @@ export function PdfPage({
         const destination = annotation.dest as unknown;
         const isExternal = typeof annotation.url === 'string';
 
-        return [{
-          id: annotation.id,
-          href: isExternal ? annotation.url : `#page-${pageNumber}`,
-          left: Math.min(firstX, secondX),
-          top: Math.min(firstY, secondY),
-          width,
-          height,
-          external: isExternal,
-          destination,
-        }];
+        return [
+          {
+            id: annotation.id,
+            href: isExternal ? annotation.url : `#page-${pageNumber}`,
+            left: Math.min(firstX, secondX),
+            top: Math.min(firstY, secondY),
+            width,
+            height,
+            external: isExternal,
+            destination,
+          },
+        ];
       });
 
       setLinks(resolvedLinks);
@@ -374,10 +390,9 @@ export function PdfPage({
     const targetPage =
       typeof pageReference === 'number'
         ? pageReference + 1
-        :
-            (await document.getPageIndex(
-              pageReference as Parameters<PDFDocumentProxy['getPageIndex']>[0],
-            )) + 1;
+        : (await document.getPageIndex(
+            pageReference as Parameters<PDFDocumentProxy['getPageIndex']>[0],
+          )) + 1;
 
     onGoToPage(targetPage);
   };
@@ -389,8 +404,12 @@ export function PdfPage({
         '--total-scale-factor': scale,
       } as CSSProperties)
     : undefined;
-  const highlights = annotations.filter((annotation) => annotation.type === 'highlight');
-  const underlines = annotations.filter((annotation) => annotation.type === 'underline');
+  const highlights = annotations.filter(
+    (annotation) => annotation.type === 'highlight',
+  );
+  const underlines = annotations.filter(
+    (annotation) => annotation.type === 'underline',
+  );
   const activeAnnotation = [...annotations, ...noteAnchors].find(
     (annotation) => annotation.id === activeAnnotationId,
   );
@@ -410,17 +429,24 @@ export function PdfPage({
     if (isAnnotationTapInteractiveTarget(event.target)) return;
     const hasMeaningfulSelection = Boolean(window.getSelection()?.toString().trim());
     if (!isSimpleAnnotationTap(start, event, hasMeaningfulSelection)) return;
-    const pageRectangle = event.currentTarget.getBoundingClientRect();
-    if (pageRectangle.width <= 0 || pageRectangle.height <= 0) return;
-    const hits = findAnnotationsAtNormalizedPoint(
+    const bounds = event.currentTarget.getBoundingClientRect();
+    const annotationHits = findAnnotationsAtClientPoint(
       pageNumber,
-      {
-        x: (event.clientX - pageRectangle.left) / pageRectangle.width,
-        y: (event.clientY - pageRectangle.top) / pageRectangle.height,
-      },
+      bounds,
+      event,
       annotations,
     );
-    if (hits.length > 0) onAnnotationTap(hits);
+    const glossaryHits = findPdfGlossaryEntriesAtClientPoint(
+      pageNumber,
+      bounds,
+      event,
+      glossaryEntries,
+    );
+    if (annotationHits.length > 0 || glossaryHits.length > 0) {
+      onOpenReaderContext(annotationHits, glossaryHits, event);
+    } else {
+      onDismissReaderContext();
+    }
   };
 
   return (
@@ -438,6 +464,25 @@ export function PdfPage({
         }}
         onPointerDown={beginAnnotationTap}
         onPointerUp={completeAnnotationTap}
+        onContextMenu={(event) => {
+          if (isAnnotationTapInteractiveTarget(event.target)) return;
+          const bounds = event.currentTarget.getBoundingClientRect();
+          const annotationHits = findAnnotationsAtClientPoint(
+            pageNumber,
+            bounds,
+            event,
+            annotations,
+          );
+          if (annotationHits.length === 0) return;
+          const glossaryHits = findPdfGlossaryEntriesAtClientPoint(
+            pageNumber,
+            bounds,
+            event,
+            glossaryEntries,
+          );
+          event.preventDefault();
+          onOpenReaderContext(annotationHits, glossaryHits, event);
+        }}
       >
         <canvas ref={canvasRef} />
         {renderWarning ? (
@@ -446,57 +491,91 @@ export function PdfPage({
           </p>
         ) : null}
         {dimensions ? (
-          <svg className="highlight-layer" aria-hidden="true" viewBox={`0 0 ${dimensions.width} ${dimensions.height}`}>
-            {getHighlightRenderGroups(highlights, dimensions.width, dimensions.height).flatMap((group) =>
+          <svg
+            className="highlight-layer"
+            aria-hidden="true"
+            viewBox={`0 0 ${dimensions.width} ${dimensions.height}`}
+          >
+            {getHighlightRenderGroups(
+              highlights,
+              dimensions.width,
+              dimensions.height,
+            ).flatMap((group) =>
               group.rects.map((rectangle, index) => {
-                const visualRectangle = getHighlightVisualRectangle(rectangle, dimensions.width, dimensions.height);
-                return <rect className="highlight-rectangle" fill={highlightColors[group.color].cssValue} key={`${group.color}-${index}`} rx="2" {...visualRectangle} />;
+                const visualRectangle = getHighlightVisualRectangle(
+                  rectangle,
+                  dimensions.width,
+                  dimensions.height,
+                );
+                return (
+                  <rect
+                    className="highlight-rectangle"
+                    fill={highlightColors[group.color].cssValue}
+                    key={`${group.color}-${index}`}
+                    rx="2"
+                    {...visualRectangle}
+                  />
+                );
               }),
             )}
-            {underlines.flatMap((underline) => normalizeAnnotationVisualGeometry(underline.rects, dimensions.width, dimensions.height).map((rectangle, index) => {
-              const metrics = getUnderlineMetrics(rectangle, dimensions.height);
-              return (
-                <line
-                  className="underline-rectangle"
-                  data-underline-color={underline.color}
-                  key={`${underline.id}-${index}`}
-                  stroke={underlineColors[underline.color].cssValue}
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                  strokeWidth={UNDERLINE_STROKE_WIDTH}
-                  vectorEffect="non-scaling-stroke"
-                  x1={snapToDevicePixel(rectangle.x * dimensions.width)}
-                  x2={snapToDevicePixel((rectangle.x + rectangle.width) * dimensions.width)}
-                  y1={metrics.y}
-                  y2={metrics.y}
-                />
-              );
-            }))}
-            {glossaryEntries.flatMap((entry) => entry.sourceRects.map((rectangle, index) => {
-              const metrics = getUnderlineMetrics(rectangle, dimensions.height);
-              const overlapsOrdinaryUnderline = underlines.some((underline) =>
-                underline.rects.some((candidate) => rectanglesOverlap(candidate, rectangle)),
-              );
-              const y = clamp(
-                metrics.y - (overlapsOrdinaryUnderline ? 3 : 0),
-                0,
-                dimensions.height - GLOSSARY_UNDERLINE_STROKE_WIDTH,
-              );
-              return (
-                <line
-                  className={`glossary-underline ${entry.glossaryEntryId === activeGlossaryEntryId ? 'is-active' : ''}`}
-                  data-glossary-entry-id={entry.glossaryEntryId}
-                  key={`${entry.markerAnnotationId}-${index}`}
-                  strokeLinecap="round"
-                  strokeWidth={GLOSSARY_UNDERLINE_STROKE_WIDTH}
-                  vectorEffect="non-scaling-stroke"
-                  x1={snapToDevicePixel(rectangle.x * dimensions.width)}
-                  x2={snapToDevicePixel((rectangle.x + rectangle.width) * dimensions.width)}
-                  y1={y}
-                  y2={y}
-                />
-              );
-            }))}
+            {underlines.flatMap((underline) =>
+              normalizeAnnotationVisualGeometry(
+                underline.rects,
+                dimensions.width,
+                dimensions.height,
+              ).map((rectangle, index) => {
+                const metrics = getUnderlineMetrics(rectangle, dimensions.height);
+                return (
+                  <line
+                    className="underline-rectangle"
+                    data-underline-color={underline.color}
+                    key={`${underline.id}-${index}`}
+                    stroke={underlineColors[underline.color].cssValue}
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    strokeWidth={UNDERLINE_STROKE_WIDTH}
+                    vectorEffect="non-scaling-stroke"
+                    x1={snapToDevicePixel(rectangle.x * dimensions.width)}
+                    x2={snapToDevicePixel(
+                      (rectangle.x + rectangle.width) * dimensions.width,
+                    )}
+                    y1={metrics.y}
+                    y2={metrics.y}
+                  />
+                );
+              }),
+            )}
+            {glossaryEntries.flatMap((entry) =>
+              entry.sourceRects.map((rectangle, index) => {
+                const metrics = getUnderlineMetrics(rectangle, dimensions.height);
+                const overlapsOrdinaryUnderline = underlines.some((underline) =>
+                  underline.rects.some((candidate) =>
+                    rectanglesOverlap(candidate, rectangle),
+                  ),
+                );
+                const y = clamp(
+                  metrics.y - (overlapsOrdinaryUnderline ? 3 : 0),
+                  0,
+                  dimensions.height - GLOSSARY_UNDERLINE_STROKE_WIDTH,
+                );
+                return (
+                  <line
+                    className={`glossary-underline ${entry.glossaryEntryId === activeGlossaryEntryId ? 'is-active' : ''}`}
+                    data-glossary-entry-id={entry.glossaryEntryId}
+                    key={`${entry.markerAnnotationId}-${index}`}
+                    strokeLinecap="round"
+                    strokeWidth={GLOSSARY_UNDERLINE_STROKE_WIDTH}
+                    vectorEffect="non-scaling-stroke"
+                    x1={snapToDevicePixel(rectangle.x * dimensions.width)}
+                    x2={snapToDevicePixel(
+                      (rectangle.x + rectangle.width) * dimensions.width,
+                    )}
+                    y1={y}
+                    y2={y}
+                  />
+                );
+              }),
+            )}
             {activeAnnotation?.rects.map((rectangle, index) => (
               <rect
                 className="active-highlight-indicator"
@@ -511,20 +590,22 @@ export function PdfPage({
           </svg>
         ) : null}
         <div className="pdf-search-layer" aria-hidden="true">
-          {searchResults.flatMap((result) => result.rects.map((rectangle, index) => (
-            <span
-              className={`pdf-search-rectangle ${result.id === activeSearchResultId ? 'is-active' : ''}`}
-              data-search-result-id={result.id}
-              data-search-rect-index={index}
-              key={`${result.id}-${index}`}
-              style={{
-                left: `${rectangle.x * 100}%`,
-                top: `${rectangle.y * 100}%`,
-                width: `${rectangle.width * 100}%`,
-                height: `${rectangle.height * 100}%`,
-              }}
-            />
-          )))}
+          {searchResults.flatMap((result) =>
+            result.rects.map((rectangle, index) => (
+              <span
+                className={`pdf-search-rectangle ${result.id === activeSearchResultId ? 'is-active' : ''}`}
+                data-search-result-id={result.id}
+                data-search-rect-index={index}
+                key={`${result.id}-${index}`}
+                style={{
+                  left: `${rectangle.x * 100}%`,
+                  top: `${rectangle.y * 100}%`,
+                  width: `${rectangle.width * 100}%`,
+                  height: `${rectangle.height * 100}%`,
+                }}
+              />
+            )),
+          )}
         </div>
         <div
           ref={textLayerRef}
@@ -538,7 +619,12 @@ export function PdfPage({
             key={link.id}
             aria-label="Open PDF link"
             href={link.href}
-            style={{ left: link.left, top: link.top, width: link.width, height: link.height }}
+            style={{
+              left: link.left,
+              top: link.top,
+              width: link.width,
+              height: link.height,
+            }}
             target={link.external ? '_blank' : undefined}
             rel={link.external ? 'noreferrer' : undefined}
             onClick={(event) => {
@@ -558,6 +644,7 @@ export function PdfPage({
                 pageHeight={dimensions.height}
                 pageWidth={dimensions.width}
                 onAddToGlossary={onAddBubbleToGlossary}
+                onRemoveFromGlossary={onRemoveBubbleFromGlossary}
                 onActivate={setActiveDefinitionBubbleId}
                 onClose={onCloseDefinitionBubble}
                 onMoveDefinitionUp={onMoveDefinitionUp}
@@ -607,10 +694,17 @@ function getHighlightVisualRectangle(
 ): { x: number; y: number; width: number; height: number } {
   const expansion = Math.min(1.5, Math.max(0.75, rectangle.height * pageHeight * 0.06));
   const left = snapToDevicePixel(Math.max(0, rectangle.x * pageWidth - expansion));
-  const right = snapToDevicePixel(Math.min(pageWidth, (rectangle.x + rectangle.width) * pageWidth + expansion));
+  const right = snapToDevicePixel(
+    Math.min(pageWidth, (rectangle.x + rectangle.width) * pageWidth + expansion),
+  );
   const top = snapToDevicePixel(rectangle.y * pageHeight);
   const bottom = snapToDevicePixel((rectangle.y + rectangle.height) * pageHeight);
-  return { x: left, y: top, width: Math.max(0, right - left), height: Math.max(0, bottom - top) };
+  return {
+    x: left,
+    y: top,
+    width: Math.max(0, right - left),
+    height: Math.max(0, bottom - top),
+  };
 }
 
 function snapToDevicePixel(value: number): number {

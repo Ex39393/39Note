@@ -47,6 +47,10 @@ jobs:
         env:
           VITE_BASE_PATH: ${{ github.event.repository.name == format('{0}.github.io', github.repository_owner) && '/' || format('/{0}/', github.event.repository.name) }}
           VITE_WEB_DEPLOYMENT: 'true'
+          VITE_39NOTE_SYNC_AUTH_URL: ${{ vars.VITE_39NOTE_SYNC_AUTH_URL }}
+
+      - name: Verify bundled Office converter
+        run: npm run office-worker:verify-built
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v5

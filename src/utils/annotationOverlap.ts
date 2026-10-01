@@ -1,7 +1,4 @@
-import type {
-  NormalizedHighlightRectangle,
-  PdfAnnotation,
-} from '../types/highlight';
+import type { NormalizedHighlightRectangle, PdfAnnotation } from '../types/highlight';
 import type { Note } from '../types/note';
 import type { NoteAnchor } from '../types/noteAnchor';
 import type { PdfTextSelection } from '../types/textSelection';
@@ -41,7 +38,8 @@ export function findOverlappingAnnotations(
       }
       return (
         overlap.firstCoverage >= TEXT_MATCH_MIN_COVERAGE &&
-        normalizePdfSourceText(selection.text) === normalizePdfSourceText(annotation.text)
+        normalizePdfSourceText(selection.text) ===
+          normalizePdfSourceText(annotation.text)
       );
     }),
   );
@@ -71,7 +69,8 @@ export function findMatchingNote(
     );
     const overlap = getRectangleSetOverlap(selectionRects, source.rects);
     const textMatches =
-      normalizePdfSourceText(matchingSelection.text) === normalizePdfSourceText(source.text);
+      normalizePdfSourceText(matchingSelection.text) ===
+      normalizePdfSourceText(source.text);
     if (
       overlap.firstCoverage >= 0.72 &&
       overlap.secondCoverage >= 0.72 &&
@@ -92,12 +91,15 @@ export function findMatchingNoteForSources(
   const sourcesById = new Map<string, PdfSourceGeometry>(
     [...annotations, ...noteAnchors].map((source) => [source.id, source]),
   );
-  return notes.find((note) => {
-    const noteSource = sourcesById.get(note.annotationId);
-    return Boolean(
-      noteSource && targetSources.some((target) => isSameLogicalPdfSource(target, noteSource)),
-    );
-  }) ?? null;
+  return (
+    notes.find((note) => {
+      const noteSource = sourcesById.get(note.annotationId);
+      return Boolean(
+        noteSource &&
+        targetSources.some((target) => isSameLogicalPdfSource(target, noteSource)),
+      );
+    }) ?? null
+  );
 }
 
 export function findAnnotationsAtNormalizedPoint(
@@ -105,16 +107,17 @@ export function findAnnotationsAtNormalizedPoint(
   point: { x: number; y: number },
   annotations: readonly PdfAnnotation[],
 ): PdfAnnotation[] {
-  const hits = annotations.filter((annotation) =>
-    annotation.pageNumber === pageNumber && annotation.rects.some((rectangle) =>
-      point.x >= rectangle.x &&
-      point.x <= rectangle.x + rectangle.width &&
-      point.y >= rectangle.y &&
-      point.y <= rectangle.y + rectangle.height,
-    ),
+  return annotations.filter(
+    (annotation) =>
+      annotation.pageNumber === pageNumber &&
+      annotation.rects.some(
+        (rectangle) =>
+          point.x >= rectangle.x &&
+          point.x <= rectangle.x + rectangle.width &&
+          point.y >= rectangle.y &&
+          point.y <= rectangle.y + rectangle.height,
+      ),
   );
-  const first = hits[0];
-  return first ? hits.filter((annotation) => isSameLogicalPdfSource(first, annotation)) : [];
 }
 
 export function createNoteAnchorFromSelection(
@@ -167,12 +170,14 @@ function normalizeRectangles(
   if (pageWidth <= 0 || pageHeight <= 0) return [];
   return rectangles.flatMap((rectangle) =>
     rectangle.width > 0.75 && rectangle.height > 0.75
-      ? [{
-          x: rectangle.left / pageWidth,
-          y: rectangle.top / pageHeight,
-          width: rectangle.width / pageWidth,
-          height: rectangle.height / pageHeight,
-        }]
+      ? [
+          {
+            x: rectangle.left / pageWidth,
+            y: rectangle.top / pageHeight,
+            width: rectangle.width / pageWidth,
+            height: rectangle.height / pageHeight,
+          },
+        ]
       : [],
   );
 }
