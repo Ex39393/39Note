@@ -14,6 +14,7 @@ import {
   GoogleAuthorizationCancelledError,
   PersistentGoogleAuthSession,
   SyncBackendUnavailableError,
+  SyncOriginNotAllowedError,
   SyncServiceRateLimitedError,
 } from '../src/sync/googleIdentity.ts';
 import { LocalSyncPersistenceError } from '../src/sync/storage.ts';
@@ -85,6 +86,23 @@ test('sign-in service errors distinguish initial connection from session retry',
   assert.deepEqual(existing.actions, ['retry-now']);
   assert.equal(limited.code, 'sync-service-rate-limited');
   assert.notEqual(limited.code, 'google-authorization-required');
+});
+
+test('an explicit unsupported Origin remains distinct from approval and transport failures', () => {
+  const issue = classifySyncError(new SyncOriginNotAllowedError(), {
+    online: true,
+    area: 'authentication',
+    hasDeviceSession: false,
+  });
+
+  assert.equal(issue.code, 'sync-origin-not-allowed');
+  assert.equal(issue.state, 'disconnected');
+  assert.equal(issue.retrySafe, false);
+  assert.equal(issue.blocksOrdinarySync, true);
+  assert.deepEqual(issue.actions, ['details']);
+  assert.equal(issue.diagnostic.causeCode, 'origin-not-allowed');
+  assert.match(issue.message, /app address is not configured/iu);
+  assert.doesNotMatch(issue.message, /developer approval|approved account/iu);
 });
 
 test('the OAuth broker exposes a stable rate-limit error', async () => {
@@ -278,7 +296,11 @@ test('dirty notifications consume reported persistence failures', () => {
   const coordinator = source('../src/sync/coordinator.ts');
   assert.match(
     coordinator,
-    /subscribeToPersistentChanges\(\s*\(\) => void this\.markDirty\(\)\.catch\(\(\) => undefined\)/u,
+    /subscribeToPersistentChanges\(\s*\(_detail, workspaceLease\) =>\s*this\.markDirty\(workspaceLease\)\.catch\(\(\) => undefined\)/u,
+  );
+  assert.match(
+    coordinator,
+    /private async markDirty\(workspaceLease\?: WorkspaceRestoreLease\): Promise<void> \{[\s\S]*?await this\.persistState\(state, workspaceLease\);/u,
   );
   assert.match(coordinator, /async retryNow\(\): Promise<void>/u);
   assert.doesNotMatch(

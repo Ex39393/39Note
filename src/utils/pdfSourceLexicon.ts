@@ -175,9 +175,7 @@ export function preloadPdfSourceLexicon(): Promise<void> {
 }
 
 export function installPdfSourceLexicon(value: ArrayBuffer | Uint8Array): void {
-  const bytes = value instanceof Uint8Array
-    ? value
-    : new Uint8Array(value);
+  const bytes = value instanceof Uint8Array ? value : new Uint8Array(value);
   if (bytes.byteLength < HEADER_BYTES) {
     throw new Error('PDF source lexicon is truncated.');
   }
@@ -213,9 +211,8 @@ export function getPdfSourceLexiconEntryCount(): number {
 function bloomContains(lexicon: BloomLexicon, value: string): boolean {
   const [firstHash, secondHash] = getBloomHashes(value);
   for (let index = 0; index < lexicon.hashCount; index += 1) {
-    const bitIndex = (
-      firstHash + Math.imul(index, secondHash)
-    ) & (lexicon.bitCount - 1);
+    const bitIndex =
+      (firstHash + Math.imul(index, secondHash)) & (lexicon.bitCount - 1);
     if ((lexicon.bits[bitIndex >>> 3] & (1 << (bitIndex & 7))) === 0) {
       return false;
     }

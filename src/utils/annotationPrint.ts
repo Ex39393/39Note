@@ -72,7 +72,8 @@ export function createPrintSourceGroups(
           first.id.localeCompare(second.id),
       ),
       notes: [...group.notes].sort(
-        (first, second) => first.createdAt - second.createdAt || first.id.localeCompare(second.id),
+        (first, second) =>
+          first.createdAt - second.createdAt || first.id.localeCompare(second.id),
       ),
     }))
     .sort(comparePrintSourceGroups);
@@ -103,8 +104,9 @@ export function getNotesInPrintOrder(
   notes: readonly Note[],
   noteAnchors: readonly NoteAnchor[] = [],
 ): Note[] {
-  return createPrintSourceGroups(annotations, notes, noteAnchors)
-    .flatMap((group) => group.notes);
+  return createPrintSourceGroups(annotations, notes, noteAnchors).flatMap(
+    (group) => group.notes,
+  );
 }
 
 function findOrCreateGroup(
@@ -137,7 +139,10 @@ function findOrCreateGroup(
   return group;
 }
 
-function comparePrintSourceGroups(first: PrintSourceGroup, second: PrintSourceGroup): number {
+function comparePrintSourceGroups(
+  first: PrintSourceGroup,
+  second: PrintSourceGroup,
+): number {
   return comparePdfSourcePosition(
     {
       id: first.id,
@@ -166,7 +171,10 @@ function chooseSourceText(first: string, second: string): string {
   return secondDisplay.length > firstDisplay.length ? second : first;
 }
 
-function minimumOptional(first: number | undefined, second: number | undefined): number | undefined {
+function minimumOptional(
+  first: number | undefined,
+  second: number | undefined,
+): number | undefined {
   if (first === undefined) return second;
   if (second === undefined) return first;
   return Math.min(first, second);

@@ -12,6 +12,7 @@ import {
 import {
   createGlossaryEntryFromBubble,
   createSemanticGlossaryEntry,
+  findMatchingPdfGlossaryEntry,
   getDefaultPrintLayout,
   getPrintContentItems,
   markDefinitionBubbleAdded,
@@ -192,8 +193,43 @@ test('adding to Glossary stores only the currently first-ranked definition', () 
   assert.equal(entry.sourceRects[0].x, 0.1);
 });
 
+test('an open definition bubble reconciles exact Glossary state after undo and redo', () => {
+  const bubble = {
+    id: 'bubble-reconcile',
+    documentId: 'document-1',
+    pageNumber: 2,
+    displayedWord: 'Evidence',
+    normalizedLookupWord: 'evidence',
+    rects: [{ x: 0.1, y: 0.1, width: 0.3, height: 0.05 }],
+    startOffset: 5,
+    endOffset: 13,
+    definitions,
+    status: 'ready' as const,
+    isExpanded: false,
+  };
+  const entry = createGlossaryEntryFromBubble(
+    bubble.documentId,
+    bubble,
+    definitions[0],
+    10,
+    'glossary-reconcile',
+    'marker-reconcile',
+  );
+
+  assert.equal(
+    findMatchingPdfGlossaryEntry(bubble, [entry])?.glossaryEntryId,
+    'glossary-reconcile',
+  );
+  assert.equal(findMatchingPdfGlossaryEntry(bubble, []), null);
+  assert.equal(
+    findMatchingPdfGlossaryEntry({ ...bubble, endOffset: 14 }, [entry]),
+    null,
+  );
+});
+
 test('adding to Glossary leaves a closed or open drawer unchanged', () => {
-  assert.match(addGlossaryFlowSource, /setGlossaryEntries/);
+  assert.match(addGlossaryFlowSource, /recordReaderMutation\('Add Glossary entry'/);
+  assert.match(addGlossaryFlowSource, /glossaryEntries:/);
   assert.doesNotMatch(addGlossaryFlowSource, /setIsNotesDrawerOpen/);
 });
 
@@ -442,12 +478,13 @@ test('Reader removal UI uses exact identity and clears transient presentation st
     appLayoutSource,
     /documentStateRef\.current = \{[\s\S]*?glossaryEntries: result\.entries/,
   );
-  assert.match(viewerSource, /glossaryEntryId: undefined/);
+  assert.match(viewerSource, /findMatchingPdfGlossaryEntry\(bubble, glossaryEntries\)/);
+  assert.match(viewerSource, /glossaryEntryId: matchingId/);
   assert.match(viewerSource, /addedConfirmationToken: undefined/);
   assert.match(pdfPageSource, /glossaryEntries\.flatMap\(\(entry\) =>/);
 });
 
-test('all seven themes expose a visible semantic marker colour', () => {
+test('all ten themes expose a visible semantic marker colour', () => {
   const colors = readingThemes.map(getGlossaryUnderlineColor);
   assert.deepEqual(readingThemes, [
     'original',
@@ -457,13 +494,16 @@ test('all seven themes expose a visible semantic marker colour', () => {
     'midnight',
     'twilight',
     'dawn',
+    'sea',
+    'bay',
+    'bright',
   ]);
-  assert.equal(colors.length, 7);
-  assert.equal(new Set(colors).size, 7);
+  assert.equal(colors.length, 10);
+  assert.equal(new Set(colors).size, 10);
   assert.ok(colors.every((color) => /^#[0-9a-f]{6}$/i.test(color)));
 });
 
-test('Dawn, Twilight, and Mint expose complete differentiated semantic palettes', () => {
+test('semantic themes expose complete differentiated palettes', () => {
   const expectedSemanticKeys = [
     'accentActive',
     'accentBorderColor',
@@ -495,7 +535,7 @@ test('Dawn, Twilight, and Mint expose complete differentiated semantic palettes'
     'toolbarBackground',
   ];
 
-  for (const id of ['dawn', 'twilight', 'mint'] as const) {
+  for (const id of ['dawn', 'twilight', 'mint', 'sea', 'bay', 'bright'] as const) {
     const theme = themes[id];
     const semantic = theme.semanticPalette;
     assert.ok(semantic, `${theme.label} should define its full semantic palette`);
@@ -521,17 +561,38 @@ test('Dawn, Twilight, and Mint expose complete differentiated semantic palettes'
   );
   assert.ok(relativeLuminance(themes.dawn.appBackground) > 0.035);
   assert.ok(relativeLuminance(themes.twilight.appBackground) > 0.03);
+  assert.equal(themes.sea.pageBackground, '#10263F');
+  assert.equal(themes.sea.pageTextColor, '#D7E8F5');
+  assert.equal(themes.sea.canvasFilter, 'none');
+  assert.equal(themes.bay.canvasFilter, 'none');
+  assert.equal(themes.bright.canvasFilter, 'none');
+  assert.match(themes.sea.shellBackground ?? '', /linear-gradient/u);
+  assert.equal(themes.bay.shellBackground, '#BCEBFA');
+  assert.equal(themes.bay.navigationBackground, '#DFF3F7');
+  assert.match(themes.bright.shellBackground ?? '', /#F2A3B6/iu);
+  assert.equal(themes.bright.noteColor.toUpperCase(), '#EEA0B2');
+  assert.equal(themes.bright.noteTextColor, themes.bright.accentColor);
+  assert.equal(themes.bay.accentColor.toUpperCase(), '#F59A3A');
+  assert.equal(themes.bay.accentTextColor?.toUpperCase(), '#A8440D');
+  assert.equal(themes.bay.noteTextColor?.toUpperCase(), '#A8440D');
 });
 
 test('semantic tokens drive app-owned UI without recolouring PDF or print output', () => {
   for (const token of [
     '--theme-card',
+    '--theme-app-background',
     '--theme-drawer',
     '--theme-dictionary',
     '--theme-selection-toolbar',
     '--theme-navigation-focus',
     '--theme-link',
     '--theme-divider',
+    '--theme-accent-text',
+    '--theme-note-text',
+    '--theme-paper',
+    '--theme-paper-text',
+    '--theme-shell-background',
+    '--theme-navigation-background',
   ]) {
     assert.match(themeProviderSource, new RegExp(token));
     assert.match(themeCssSource, new RegExp(token));
@@ -539,8 +600,8 @@ test('semantic tokens drive app-owned UI without recolouring PDF or print output
   assert.doesNotMatch(noteExportSource, /data-reading-theme|--theme-/);
 });
 
-test('rebalanced themes retain practical reading and control contrast', () => {
-  for (const id of ['dawn', 'twilight', 'mint'] as const) {
+test('rebalanced and new themes retain practical reading and control contrast', () => {
+  for (const id of ['dawn', 'twilight', 'mint', 'sea', 'bay', 'bright'] as const) {
     const theme = themes[id];
     const semantic = theme.semanticPalette;
     assert.ok(semantic);
@@ -557,9 +618,54 @@ test('rebalanced themes retain practical reading and control contrast', () => {
       contrastRatio(semantic.faintTextColor, semantic.cardBackground) >= 4.5,
       `${theme.label} faint text should remain readable on cards`,
     );
-    assert.ok(contrastRatio(semantic.chipSelectedText, theme.accentColor) >= 4.5);
+    assert.ok(
+      contrastRatio(semantic.chipSelectedText, semantic.chipSelectedBackground) >= 4.5,
+      `${theme.label} selected-chip text should remain readable on its actual fill`,
+    );
+    if (id === 'sea' || id === 'bay' || id === 'bright') {
+      assert.ok(
+        contrastRatio(
+          theme.accentTextColor ?? theme.accentColor,
+          semantic.cardBackground,
+        ) >= 4.5,
+        `${theme.label} semantic accent text should remain readable on raised cards`,
+      );
+      assert.ok(
+        contrastRatio(
+          theme.noteTextColor ?? theme.noteColor,
+          semantic.cardBackground,
+        ) >= 4.5,
+        `${theme.label} semantic Note text should remain readable on raised cards`,
+      );
+      assert.ok(
+        contrastRatio(semantic.destructiveColor, semantic.cardBackground) >= 4.5,
+        `${theme.label} destructive text should remain readable on raised cards`,
+      );
+    }
     assert.ok(contrastRatio(theme.glossaryUnderlineColor, theme.pageBackground) >= 4.5);
+    assert.ok(
+      contrastRatio(theme.pageTextColor ?? theme.textColor, theme.pageBackground) >=
+        4.5,
+      `${theme.label} tutorial paper text should remain readable on paper`,
+    );
   }
+  assert.match(
+    themeCssSource,
+    /\.library-error\s*\{[^}]*color:\s*var\(--destructive-text\)/su,
+  );
+});
+
+test('Twilight keeps its warm palette while separating workspace and raised cards', () => {
+  const twilight = themes.twilight;
+  const semantic = twilight.semanticPalette;
+  assert.ok(semantic);
+  assert.equal(semantic.cardBackground, twilight.surfaceBackground);
+  assert.ok(
+    contrastRatio(semantic.sectionBackground, semantic.cardBackground) >= 1.35,
+    'Twilight raised cards should be visibly distinct from grouped workspace surfaces',
+  );
+  assert.ok(contrastRatio(twilight.textColor, semantic.cardBackground) >= 4.5);
+  assert.ok(contrastRatio(semantic.secondaryTextColor, semantic.cardBackground) >= 4.5);
 });
 
 test('print layouts are explicit and Standard remains the default', () => {

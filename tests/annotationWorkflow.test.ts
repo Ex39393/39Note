@@ -281,7 +281,7 @@ test('Note deletion preserves its mark while confirmed mark deletion removes the
 });
 
 test('persistence, Backup/Restore, Package Selected, and export carry semantic anchors safely', () => {
-  assert.match(persistenceSource, /PERSISTENCE_SCHEMA_VERSION = 8/);
+  assert.match(persistenceSource, /PERSISTENCE_SCHEMA_VERSION =\s*9/);
   assert.match(persistenceSource, /NOTE_ANCHOR_PREVIOUS_SCHEMA_VERSION = 6/);
   assert.match(persistenceSource, /noteAnchors: NoteAnchor\[\]/);
   assert.match(persistenceSource, /sanitizeNoteAnchors/);

@@ -1,4 +1,12 @@
-import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react';
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useReducer,
+  useRef,
+  useState,
+  type KeyboardEvent as ReactKeyboardEvent,
+} from 'react';
 import { $generateHtmlFromNodes } from '@lexical/html';
 import type { LexicalEditor } from 'lexical';
 import type { Note } from '../types/note';
@@ -56,6 +64,7 @@ interface PrintComposerProps {
   noteAnchors: readonly NoteAnchor[];
   glossaryEntries: readonly GlossaryEntry[];
   initialLayout: NotesPrintLayout;
+  returnFocusTarget?: HTMLElement | null;
   onClose: () => void;
 }
 
@@ -67,6 +76,7 @@ export function PrintComposer({
   noteAnchors,
   glossaryEntries,
   initialLayout,
+  returnFocusTarget,
   onClose,
 }: PrintComposerProps) {
   const sourceFingerprint = useMemo(
@@ -102,7 +112,71 @@ export function PrintComposer({
   const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const statusTimerRef = useRef<number | null>(null);
   const pendingDraftRef = useRef<PrintDraftRecord | null>(null);
+  const draftPersistenceQueueRef = useRef<Promise<void>>(Promise.resolve());
   const printCleanupRef = useRef<(() => void) | null>(null);
+  const dialogRef = useRef<HTMLDivElement | null>(null);
+  const returnFocusRef = useRef<HTMLElement | null>(null);
+
+  useEffect(() => {
+    returnFocusRef.current =
+      returnFocusTarget ??
+      (window.document.activeElement instanceof HTMLElement
+        ? window.document.activeElement
+        : null);
+    return () => {
+      const returnFocus = returnFocusRef.current;
+      window.requestAnimationFrame(() => {
+        if (returnFocus?.isConnected) returnFocus.focus({ preventScroll: true });
+      });
+    };
+  }, [returnFocusTarget]);
+
+  useEffect(() => {
+    const focusFrame = window.requestAnimationFrame(() => {
+      const dialog = dialogRef.current;
+      if (!dialog) return;
+      const preferredTarget = dialog.querySelector<HTMLElement>(
+        '.print-composer-close, button:not(:disabled), input:not(:disabled), [tabindex]:not([tabindex="-1"])',
+      );
+      (preferredTarget ?? dialog).focus({ preventScroll: true });
+    });
+    return () => window.cancelAnimationFrame(focusFrame);
+  }, [decision, isLoading]);
+
+  const handleDialogKeyDown = (event: ReactKeyboardEvent<HTMLDivElement>) => {
+    if (event.key === 'Escape') {
+      event.preventDefault();
+      event.stopPropagation();
+      if (uiState.blocksDrawerOpen || uiState.formattingDrawerOpen) {
+        dispatchUiState({ type: 'close-drawers' });
+      } else {
+        onClose();
+      }
+      return;
+    }
+    if (event.key !== 'Tab') return;
+    const dialog = dialogRef.current;
+    if (!dialog) return;
+    const focusable = Array.from(
+      dialog.querySelectorAll<HTMLElement>(
+        'button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled), a[href], [contenteditable="true"], [tabindex]:not([tabindex="-1"])',
+      ),
+    ).filter((element) => element.getClientRects().length > 0);
+    if (!focusable.length) {
+      event.preventDefault();
+      dialog.focus({ preventScroll: true });
+      return;
+    }
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+    if (event.shiftKey && window.document.activeElement === first) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && window.document.activeElement === last) {
+      event.preventDefault();
+      first.focus();
+    }
+  };
 
   const showStatus = useCallback((message: string, transient = false) => {
     if (statusTimerRef.current) window.clearTimeout(statusTimerRef.current);
@@ -163,21 +237,37 @@ export function PrintComposer({
     };
   }, [draft, renderedPrintPdf, sourceFingerprint]);
 
-  const savePendingDraft = useCallback(async () => {
+  const savePendingDraft = useCallback((): Promise<boolean> => {
     if (saveTimerRef.current) window.clearTimeout(saveTimerRef.current);
     saveTimerRef.current = null;
-    const nextDraft = pendingDraftRef.current;
-    if (!nextDraft) return false;
-    pendingDraftRef.current = null;
-    const savedAt = Date.now();
-    const saved = await savePrintDraft({
-      ...nextDraft,
-      lastSavedAt: savedAt,
-      updatedAt: savedAt,
-    });
-    if (saved) setLastSavedAt(savedAt);
-    else showStatus('Draft could not be saved locally.');
-    return saved;
+    const save = async () => {
+      const nextDraft = pendingDraftRef.current;
+      if (!nextDraft) return true;
+      pendingDraftRef.current = null;
+      const savedAt = Date.now();
+      try {
+        const saved = await savePrintDraft({
+          ...nextDraft,
+          lastSavedAt: savedAt,
+          updatedAt: savedAt,
+        });
+        if (saved) setLastSavedAt(savedAt);
+        else {
+          if (pendingDraftRef.current === null) pendingDraftRef.current = nextDraft;
+          showStatus('Draft could not be saved locally.');
+        }
+        return saved;
+      } catch (error) {
+        if (pendingDraftRef.current === null) pendingDraftRef.current = nextDraft;
+        throw error;
+      }
+    };
+    const result = draftPersistenceQueueRef.current.then(save, save);
+    draftPersistenceQueueRef.current = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    return result;
   }, [showStatus]);
 
   useEffect(
@@ -391,10 +481,13 @@ export function PrintComposer({
   if (isLoading || !draft) {
     return (
       <div
+        ref={dialogRef}
         className="print-composer-overlay"
         role="dialog"
         aria-modal="true"
         aria-label="Print Composer"
+        tabIndex={-1}
+        onKeyDown={handleDialogKeyDown}
       >
         <p className="print-composer-loading" role="status">
           Opening Print Composer…
@@ -418,10 +511,13 @@ export function PrintComposer({
   if (decision === 'existing') {
     return (
       <div
+        ref={dialogRef}
         className="print-composer-overlay"
         role="dialog"
         aria-modal="true"
         aria-labelledby="print-draft-found-title"
+        tabIndex={-1}
+        onKeyDown={handleDialogKeyDown}
       >
         <section className="print-draft-decision">
           <h2 id="print-draft-found-title">Saved print draft found</h2>
@@ -454,10 +550,13 @@ export function PrintComposer({
 
   return (
     <div
+      ref={dialogRef}
       className="print-composer-overlay"
       role="dialog"
       aria-modal="true"
       aria-labelledby="print-composer-title"
+      tabIndex={-1}
+      onKeyDown={handleDialogKeyDown}
     >
       <section className={`print-composer ${getPrintTemplateClassName(draft)}`}>
         <header className="print-composer-header">

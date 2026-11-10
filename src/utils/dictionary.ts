@@ -134,9 +134,7 @@ export function getDictionaryProvider(
   return source.provider ?? 'wordnet';
 }
 
-export function getDictionarySourceLabel(
-  source: DictionarySourceAttribution,
-): string {
+export function getDictionarySourceLabel(source: DictionarySourceAttribution): string {
   const provider = getDictionaryProvider(source);
   if (provider === 'wiktionary') return 'English Wiktionary';
   if (provider === 'mesh') return `NLM MeSH ${source.version}`;

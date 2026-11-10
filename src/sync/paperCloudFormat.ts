@@ -11,6 +11,7 @@ import { assertNoSecretsInSyncPayload } from './secrets.ts';
 import {
   LEGACY_PAPER_MANIFEST_STORAGE,
   LEGACY_PAPER_PACKAGE_LAYOUT_VERSION,
+  LEGACY_PAPER_SYNC_PROTOCOL_VERSION,
   PAPER_MANIFEST_STORAGE,
   PAPER_PACKAGE_LAYOUT_VERSION,
   PAPER_PAYLOAD_STORAGE,
@@ -19,6 +20,7 @@ import {
   type PaperCloudManifestV2,
   type PaperCloudManifestV3,
   type PaperManifestGeneration,
+  type SupportedPaperSyncProtocolVersion,
 } from './paperTypes.ts';
 import {
   SYNC_SCHEMA_VERSION,
@@ -38,7 +40,7 @@ export interface PaperPayloadPartitions {
 
 export interface PaperConflictPayload {
   app: '39Note';
-  paperSyncProtocolVersion: typeof PAPER_SYNC_PROTOCOL_VERSION;
+  paperSyncProtocolVersion: SupportedPaperSyncProtocolVersion;
   documentId: string;
   conflicts: SyncConflict[];
 }
@@ -52,6 +54,7 @@ const GLOBAL_KINDS = new Set<SyncEntityKind>([
 const ENTITY_KINDS = new Set<SyncEntityKind>([
   'document',
   'annotation',
+  'link-number-high-water',
   'note-anchor',
   'note',
   'glossary',
@@ -241,11 +244,15 @@ export async function parsePaperPayloadBlob(
   expectedHash: string,
   logicalType: 'document-state' | 'productivity-data',
   documentId: string,
+  sourceProtocolVersion: SupportedPaperSyncProtocolVersion = PAPER_SYNC_PROTOCOL_VERSION,
 ): Promise<CloudEntityPayload> {
   return parseCloudPayloadBlob(
     blob,
     expectedHash,
-    paperPayloadContext(logicalType, { documentId }),
+    paperPayloadContext(logicalType, {
+      documentId,
+      paperSyncProtocolVersion: sourceProtocolVersion,
+    }),
   );
 }
 
@@ -271,6 +278,7 @@ export async function parsePaperConflictPayloadBlob(
   blob: Blob,
   expectedHash: string,
   documentId: string,
+  sourceProtocolVersion?: SupportedPaperSyncProtocolVersion,
 ): Promise<PaperConflictPayload> {
   if (!isSha256(expectedHash) || (await sha256Hex(blob)) !== expectedHash) {
     throw new Error('A paper conflict journal failed integrity verification.');
@@ -282,6 +290,12 @@ export async function parsePaperConflictPayloadBlob(
     throw new Error('A paper conflict journal contains malformed JSON.');
   }
   assertPaperConflictPayload(value, documentId);
+  if (
+    sourceProtocolVersion !== undefined &&
+    value.paperSyncProtocolVersion !== sourceProtocolVersion
+  ) {
+    throw new Error('A paper conflict journal crosses a protocol boundary.');
+  }
   assertNoSecretsInSyncPayload(value);
   return value;
 }
@@ -331,7 +345,7 @@ function assertPaperManifest(value: unknown): asserts value is PaperCloudManifes
   if (
     value.app !== '39Note' ||
     (!isLayout2 && !isLayout3) ||
-    value.paperSyncProtocolVersion !== PAPER_SYNC_PROTOCOL_VERSION ||
+    !isSupportedPaperSyncProtocolVersion(value.paperSyncProtocolVersion) ||
     value.payloadStorage !== PAPER_PAYLOAD_STORAGE ||
     !isValidDocumentId(value.documentId) ||
     !isSafeDriveId(value.paperFolderId) ||
@@ -370,7 +384,7 @@ function assertPaperConflictPayload(
   if (
     !isRecord(value) ||
     value.app !== '39Note' ||
-    value.paperSyncProtocolVersion !== PAPER_SYNC_PROTOCOL_VERSION ||
+    !isSupportedPaperSyncProtocolVersion(value.paperSyncProtocolVersion) ||
     value.documentId !== documentId ||
     !Array.isArray(value.conflicts) ||
     value.conflicts.some(
@@ -407,7 +421,10 @@ function assertPayloadContext(
 
 function paperPayloadContext(
   logicalType: 'document-state' | 'productivity-data',
-  paper: { documentId: string },
+  paper: {
+    documentId: string;
+    paperSyncProtocolVersion?: SupportedPaperSyncProtocolVersion;
+  },
 ): CloudPayloadContext {
   return {
     logicalType,
@@ -417,8 +434,18 @@ function paperPayloadContext(
         : `papers/${paper.documentId}/productivity.json`,
     documentId: paper.documentId,
     partitionModel: 'paper-v2',
-    sourceProtocolVersion: PAPER_SYNC_PROTOCOL_VERSION,
+    sourceProtocolVersion:
+      paper.paperSyncProtocolVersion ?? PAPER_SYNC_PROTOCOL_VERSION,
   };
+}
+
+function isSupportedPaperSyncProtocolVersion(
+  value: unknown,
+): value is SupportedPaperSyncProtocolVersion {
+  return (
+    value === LEGACY_PAPER_SYNC_PROTOCOL_VERSION ||
+    value === PAPER_SYNC_PROTOCOL_VERSION
+  );
 }
 
 function emptyPayload(): CloudEntityPayload {

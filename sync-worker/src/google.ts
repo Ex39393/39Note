@@ -162,10 +162,10 @@ async function requestToken(
   }
   const scopes =
     typeof value.scope === 'string'
-      ? value.scope.split(/\s+/u).filter(Boolean)
-      : [GOOGLE_DRIVE_SCOPE];
-  if (!scopes.includes(GOOGLE_DRIVE_SCOPE)) {
-    throw new GoogleServiceError('authorization_rejected', 401);
+      ? [...new Set(value.scope.split(/\s+/u).filter(Boolean))].sort()
+      : [];
+  if (scopes.length !== 1 || scopes[0] !== GOOGLE_DRIVE_SCOPE) {
+    throw new GoogleServiceError(rejectionCode, 401);
   }
   return {
     accessToken: value.access_token,
@@ -173,6 +173,6 @@ async function requestToken(
     ...(typeof value.refresh_token === 'string' && value.refresh_token
       ? { refreshToken: value.refresh_token }
       : {}),
-    grantedScopes: JSON.stringify([...new Set(scopes)].sort()),
+    grantedScopes: JSON.stringify(scopes),
   };
 }

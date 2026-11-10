@@ -6,7 +6,10 @@ import type {
   UnderlineAnnotation,
   UnderlineColor,
 } from '../types/highlight';
-import type { PdfTextSelection, PdfTextSelectionRectangle } from '../types/textSelection';
+import type {
+  PdfTextSelection,
+  PdfTextSelectionRectangle,
+} from '../types/textSelection';
 import type { NoteAnchor } from '../types/noteAnchor';
 import { isSameLogicalPdfSource } from './pdfSourceGeometry.ts';
 
@@ -55,9 +58,10 @@ export function addAnnotationFromSourceIfMissing(
   annotations: readonly PdfAnnotation[],
   nextAnnotation: PdfAnnotation,
 ): PdfAnnotation[] {
-  return annotations.some((annotation) =>
-    annotation.type === nextAnnotation.type &&
-    isSameLogicalPdfSource(annotation, nextAnnotation),
+  return annotations.some(
+    (annotation) =>
+      annotation.type === nextAnnotation.type &&
+      isSameLogicalPdfSource(annotation, nextAnnotation),
   )
     ? [...annotations]
     : [...annotations, nextAnnotation];
@@ -89,16 +93,18 @@ function createAnnotationsFromSelections<TType extends PdfAnnotation['type']>(
 
     const timestamp = Date.now();
 
-    return [{
-      id: crypto.randomUUID(),
-      type,
-      pageNumber: selection.pageNumber,
-      text: selection.text,
-      rects,
-      color,
-      createdAt: timestamp,
-      updatedAt: timestamp,
-    }] as Extract<PdfAnnotation, { type: TType }>[];
+    return [
+      {
+        id: crypto.randomUUID(),
+        type,
+        pageNumber: selection.pageNumber,
+        text: selection.text,
+        rects,
+        color,
+        createdAt: timestamp,
+        updatedAt: timestamp,
+      },
+    ] as Extract<PdfAnnotation, { type: TType }>[];
   });
 }
 
@@ -133,28 +139,32 @@ export function upsertAnnotations(
   currentAnnotations: PdfAnnotation[],
   nextAnnotations: PdfAnnotation[],
 ): PdfAnnotation[] {
-  return nextAnnotations.reduce<PdfAnnotation[]>((updatedAnnotations, nextAnnotation) => {
-    const duplicateIndex = updatedAnnotations.findIndex((existingAnnotation) =>
-      existingAnnotation.type === nextAnnotation.type &&
-      isSubstantiallySameHighlight(existingAnnotation, nextAnnotation),
-    );
+  return nextAnnotations.reduce<PdfAnnotation[]>(
+    (updatedAnnotations, nextAnnotation) => {
+      const duplicateIndex = updatedAnnotations.findIndex(
+        (existingAnnotation) =>
+          existingAnnotation.type === nextAnnotation.type &&
+          isSubstantiallySameHighlight(existingAnnotation, nextAnnotation),
+      );
 
-    if (duplicateIndex === -1) {
-      return [...updatedAnnotations, nextAnnotation];
-    }
+      if (duplicateIndex === -1) {
+        return [...updatedAnnotations, nextAnnotation];
+      }
 
-    return updatedAnnotations.map((existingAnnotation, index) =>
-      index === duplicateIndex
-        ? {
-            ...existingAnnotation,
-            text: nextAnnotation.text,
-            rects: nextAnnotation.rects,
-            color: nextAnnotation.color,
-            updatedAt: Date.now(),
-          } as PdfAnnotation
-        : existingAnnotation,
-    );
-  }, currentAnnotations);
+      return updatedAnnotations.map((existingAnnotation, index) =>
+        index === duplicateIndex
+          ? ({
+              ...existingAnnotation,
+              text: nextAnnotation.text,
+              rects: nextAnnotation.rects,
+              color: nextAnnotation.color,
+              updatedAt: Date.now(),
+            } as PdfAnnotation)
+          : existingAnnotation,
+      );
+    },
+    currentAnnotations,
+  );
 }
 
 export function getHighlightRenderGroups(
@@ -192,14 +202,20 @@ function simplifySelectionRectangles(
   rectangles: PdfTextSelectionRectangle[],
 ): PdfTextSelectionRectangle[] {
   const ordered = rectangles
-    .filter((rectangle) => rectangle.width > RECTANGLE_EPSILON && rectangle.height > RECTANGLE_EPSILON)
+    .filter(
+      (rectangle) =>
+        rectangle.width > RECTANGLE_EPSILON && rectangle.height > RECTANGLE_EPSILON,
+    )
     .sort((first, second) => first.top - second.top || first.left - second.left);
   const unique = ordered.filter(
     (rectangle, index) =>
-      !ordered.slice(0, index).some((existing) =>
-        areNearlyEqual(existing, rectangle) ||
-        rectangleCoverage(rectangle, existing) >= 0.94,
-      ),
+      !ordered
+        .slice(0, index)
+        .some(
+          (existing) =>
+            areNearlyEqual(existing, rectangle) ||
+            rectangleCoverage(rectangle, existing) >= 0.94,
+        ),
   );
 
   return mergeLineRectangles(unique);
@@ -208,33 +224,117 @@ function simplifySelectionRectangles(
 function mergeLineRectangles(
   rectangles: PdfTextSelectionRectangle[],
 ): PdfTextSelectionRectangle[] {
-  return rectangles.reduce<PdfTextSelectionRectangle[]>((merged, rectangle) => {
-    const previous = merged.at(-1);
+  return groupRectanglesByVisualLine(rectangles).flatMap((line) =>
+    line.rectangles
+      .sort((first, second) => first.left - second.left)
+      .reduce<PdfTextSelectionRectangle[]>((merged, rectangle) => {
+        const previous = merged.at(-1);
+        if (!previous || !hasMergeableHorizontalGap(previous, rectangle)) {
+          merged.push({ ...rectangle });
+          return merged;
+        }
 
-    if (!previous || !belongsToSameVisualLine(previous, rectangle)) {
-      merged.push({ ...rectangle });
-      return merged;
-    }
-
-    const right = Math.max(previous.left + previous.width, rectangle.left + rectangle.width);
-    previous.width = right - previous.left;
-    previous.height = Math.max(previous.height, rectangle.height);
-    return merged;
-  }, []);
+        const right = Math.max(
+          previous.left + previous.width,
+          rectangle.left + rectangle.width,
+        );
+        const bottom = Math.max(
+          previous.top + previous.height,
+          rectangle.top + rectangle.height,
+        );
+        previous.top = Math.min(previous.top, rectangle.top);
+        previous.width = right - previous.left;
+        previous.height = bottom - previous.top;
+        return merged;
+      }, []),
+  );
 }
 
-function belongsToSameVisualLine(
+function hasMergeableHorizontalGap(
   first: PdfTextSelectionRectangle,
   second: PdfTextSelectionRectangle,
 ): boolean {
-  const lineTolerance = Math.max(1.5, Math.min(first.height, second.height) * 0.3);
   const horizontalGap = second.left - (first.left + first.width);
+  const overlapTolerance = Math.max(1.5, Math.min(first.height, second.height) * 0.3);
+  const mergeGap = Math.max(3, Math.max(first.height, second.height) * 0.6);
+
+  return horizontalGap >= -overlapTolerance && horizontalGap <= mergeGap;
+}
+
+interface VisualRectangleLine {
+  rectangles: PdfTextSelectionRectangle[];
+  center: number;
+  averageHeight: number;
+  top: number;
+  bottom: number;
+}
+
+function groupRectanglesByVisualLine(
+  rectangles: readonly PdfTextSelectionRectangle[],
+): VisualRectangleLine[] {
+  const lines: VisualRectangleLine[] = [];
+  const ordered = [...rectangles].sort(
+    (first, second) =>
+      first.top + first.height / 2 - (second.top + second.height / 2) ||
+      first.left - second.left,
+  );
+
+  for (const rectangle of ordered) {
+    const rectangleCenter = rectangle.top + rectangle.height / 2;
+    const matchingLine = lines
+      .filter((line) => belongsToVisualLine(line, rectangle))
+      .sort(
+        (first, second) =>
+          Math.abs(first.center - rectangleCenter) -
+          Math.abs(second.center - rectangleCenter),
+      )[0];
+
+    if (!matchingLine) {
+      lines.push({
+        rectangles: [{ ...rectangle }],
+        center: rectangleCenter,
+        averageHeight: rectangle.height,
+        top: rectangle.top,
+        bottom: rectangle.top + rectangle.height,
+      });
+      continue;
+    }
+
+    const count = matchingLine.rectangles.length;
+    matchingLine.rectangles.push({ ...rectangle });
+    matchingLine.center = (matchingLine.center * count + rectangleCenter) / (count + 1);
+    matchingLine.averageHeight =
+      (matchingLine.averageHeight * count + rectangle.height) / (count + 1);
+    matchingLine.top = Math.min(matchingLine.top, rectangle.top);
+    matchingLine.bottom = Math.max(
+      matchingLine.bottom,
+      rectangle.top + rectangle.height,
+    );
+  }
+
+  return lines.sort((first, second) => first.center - second.center);
+}
+
+function belongsToVisualLine(
+  line: VisualRectangleLine,
+  rectangle: PdfTextSelectionRectangle,
+): boolean {
+  const rectangleCenter = rectangle.top + rectangle.height / 2;
+  const minimumHeight = Math.max(
+    RECTANGLE_EPSILON,
+    Math.min(line.averageHeight, rectangle.height),
+  );
+  const verticalOverlap =
+    Math.min(line.bottom, rectangle.top + rectangle.height) -
+    Math.max(line.top, rectangle.top);
+  const centerTolerance = Math.max(
+    1.5,
+    Math.max(line.averageHeight, rectangle.height) * 0.48,
+  );
 
   return (
-    Math.abs(first.top - second.top) <= lineTolerance &&
-    Math.abs(first.height - second.height) <= lineTolerance &&
-    horizontalGap >= -lineTolerance &&
-    horizontalGap <= Math.max(3, first.height * 0.35)
+    verticalOverlap / minimumHeight >= 0.35 &&
+    Math.abs(line.center - rectangleCenter) <= centerTolerance
   );
 }
 
@@ -260,7 +360,8 @@ function isSubstantiallySameHighlight(
   }
 
   const coverage = highlightCoverage(existingHighlight.rects, nextHighlight.rects);
-  const textMatches = normalizeText(existingHighlight.text) === normalizeText(nextHighlight.text);
+  const textMatches =
+    normalizeText(existingHighlight.text) === normalizeText(nextHighlight.text);
 
   return coverage >= 0.9 || (textMatches && coverage >= 0.75);
 }
@@ -282,7 +383,12 @@ function highlightCoverage(
 
   const intersection = first.reduce(
     (total, firstRectangle) =>
-      total + second.reduce((sum, secondRectangle) => sum + intersectionArea(firstRectangle, secondRectangle), 0),
+      total +
+      second.reduce(
+        (sum, secondRectangle) =>
+          sum + intersectionArea(firstRectangle, secondRectangle),
+        0,
+      ),
     0,
   );
 
@@ -294,44 +400,23 @@ function mergeNormalizedRectangles(
   pageWidth: number,
   pageHeight: number,
 ): NormalizedHighlightRectangle[] {
-  const ordered = rectangles
-    .filter((rectangle) => rectangle.width > 0 && rectangle.height > 0)
-    .sort((first, second) => first.y - second.y || first.x - second.x);
-
-  return ordered.reduce<NormalizedHighlightRectangle[]>((merged, rectangle) => {
-    const previous = merged.at(-1);
-
-    if (!previous || !belongsToSameNormalizedLine(previous, rectangle, pageWidth, pageHeight)) {
-      merged.push({ ...rectangle });
-      return merged;
-    }
-
-    const right = Math.max(previous.x + previous.width, rectangle.x + rectangle.width);
-    const bottom = Math.max(previous.y + previous.height, rectangle.y + rectangle.height);
-    previous.width = right - previous.x;
-    previous.height = bottom - previous.y;
-    return merged;
-  }, []);
-}
-
-function belongsToSameNormalizedLine(
-  first: NormalizedHighlightRectangle,
-  second: NormalizedHighlightRectangle,
-  pageWidth: number,
-  pageHeight: number,
-): boolean {
-  const lineTolerance = Math.max(0.002, Math.min(first.height, second.height) * 0.3);
-  const horizontalGap = second.x - (first.x + first.width);
-  const lineHeightInPixels = Math.min(first.height, second.height) * pageHeight;
-  const mergeGapInPixels = Math.min(7, Math.max(1.75, lineHeightInPixels * 0.3));
-  const mergeGap = mergeGapInPixels / Math.max(pageWidth, 1);
-
-  return (
-    Math.abs(first.y - second.y) <= lineTolerance &&
-    Math.abs(first.height - second.height) <= lineTolerance &&
-    horizontalGap >= -lineTolerance &&
-    horizontalGap <= mergeGap
-  );
+  const safeWidth = Math.max(pageWidth, 1);
+  const safeHeight = Math.max(pageHeight, 1);
+  return mergeLineRectangles(
+    rectangles
+      .filter((rectangle) => rectangle.width > 0 && rectangle.height > 0)
+      .map((rectangle) => ({
+        left: rectangle.x * safeWidth,
+        top: rectangle.y * safeHeight,
+        width: rectangle.width * safeWidth,
+        height: rectangle.height * safeHeight,
+      })),
+  ).map((rectangle) => ({
+    x: rectangle.left / safeWidth,
+    y: rectangle.top / safeHeight,
+    width: rectangle.width / safeWidth,
+    height: rectangle.height / safeHeight,
+  }));
 }
 
 function areNearlyEqual(
@@ -359,7 +444,10 @@ function rectangleCoverage(
 }
 
 function totalArea(rectangles: NormalizedHighlightRectangle[]): number {
-  return rectangles.reduce((total, rectangle) => total + rectangle.width * rectangle.height, 0);
+  return rectangles.reduce(
+    (total, rectangle) => total + rectangle.width * rectangle.height,
+    0,
+  );
 }
 
 function intersectionArea(
@@ -370,8 +458,15 @@ function intersectionArea(
   const firstY = 'top' in first ? first.top : first.y;
   const secondX = 'left' in second ? second.left : second.x;
   const secondY = 'top' in second ? second.top : second.y;
-  const width = Math.max(0, Math.min(firstX + first.width, secondX + second.width) - Math.max(firstX, secondX));
-  const height = Math.max(0, Math.min(firstY + first.height, secondY + second.height) - Math.max(firstY, secondY));
+  const width = Math.max(
+    0,
+    Math.min(firstX + first.width, secondX + second.width) - Math.max(firstX, secondX),
+  );
+  const height = Math.max(
+    0,
+    Math.min(firstY + first.height, secondY + second.height) -
+      Math.max(firstY, secondY),
+  );
 
   return width * height;
 }

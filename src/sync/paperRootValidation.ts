@@ -1,7 +1,12 @@
 import type { DriveFileMetadata } from './driveClient.ts';
 import { isSha256 } from './hash.ts';
 import { PAPER_PRESENCE_PROTOCOL_VERSION } from './paperPresence.ts';
-import { PAPER_SYNC_PROTOCOL_VERSION, SYNC_LAYOUT_VERSION } from './paperTypes.ts';
+import {
+  LEGACY_PAPER_SYNC_PROTOCOL_VERSION,
+  PAPER_SYNC_PROTOCOL_VERSION,
+  SYNC_LAYOUT_VERSION,
+  type SupportedPaperSyncProtocolVersion,
+} from './paperTypes.ts';
 
 const FOLDER_MIME = 'application/vnd.google-apps.folder';
 
@@ -9,20 +14,35 @@ export function isRecognizedPaperRootMetadata(root: DriveFileMetadata): boolean 
   if (!isOwnedManagedPaperRootMetadata(root)) return false;
   return (
     isPaperV3RootMetadata(root) ||
+    isPaperV3Protocol2RootMetadata(root) ||
     isPaperV2RootMetadata(root) ||
     isLegacyPaperRootMetadata(root)
   );
 }
 
 export function isPaperV3RootMetadata(root: DriveFileMetadata): boolean {
+  return isPaperV3RootMetadataForProtocol(root, PAPER_SYNC_PROTOCOL_VERSION);
+}
+
+export function isPaperV3Protocol2RootMetadata(root: DriveFileMetadata): boolean {
+  return isPaperV3RootMetadataForProtocol(root, LEGACY_PAPER_SYNC_PROTOCOL_VERSION);
+}
+
+export function isPaperV3RootMetadataForProtocol(
+  root: DriveFileMetadata,
+  protocolVersion: SupportedPaperSyncProtocolVersion,
+): boolean {
   if (!isOwnedManagedPaperRootMetadata(root)) return false;
   const properties = root.appProperties!;
   return (
     properties.layoutVersion === String(SYNC_LAYOUT_VERSION) &&
-    properties.paperProtocolVersion === String(PAPER_SYNC_PROTOCOL_VERSION) &&
+    properties.paperProtocolVersion === String(protocolVersion) &&
     properties.presenceProtocolVersion === String(PAPER_PRESENCE_PROTOCOL_VERSION) &&
     isSafeDriveId(properties.controlFolderId) &&
-    isSha256(properties.migrationCompletionId)
+    isSha256(properties.migrationCompletionId) &&
+    (protocolVersion !== PAPER_SYNC_PROTOCOL_VERSION ||
+      properties.protocolMigrationCompletionId === undefined ||
+      isSha256(properties.protocolMigrationCompletionId))
   );
 }
 
@@ -31,8 +51,16 @@ export function isPaperV2RootMetadata(root: DriveFileMetadata): boolean {
   const properties = root.appProperties!;
   return (
     properties.layoutVersion === '2' &&
-    properties.paperProtocolVersion === String(PAPER_SYNC_PROTOCOL_VERSION)
+    (properties.paperProtocolVersion === String(LEGACY_PAPER_SYNC_PROTOCOL_VERSION) ||
+      properties.paperProtocolVersion === String(PAPER_SYNC_PROTOCOL_VERSION))
   );
+}
+
+export function paperRootProtocolVersion(root: DriveFileMetadata): number | undefined {
+  const raw = root.appProperties?.paperProtocolVersion;
+  if (raw === undefined) return undefined;
+  if (!/^\d+$/u.test(raw)) return Number.NaN;
+  return Number(raw);
 }
 
 export function isLegacyPaperRootMetadata(root: DriveFileMetadata): boolean {

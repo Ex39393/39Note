@@ -42,10 +42,7 @@ export async function runProgressiveDictionaryLookup({
     }
   }
 
-  if (
-    specialistLookup &&
-    shouldQuerySpecialistDictionary(combinedDefinitions)
-  ) {
+  if (specialistLookup && shouldQuerySpecialistDictionary(combinedDefinitions)) {
     const definitions = await runProviderLookup(specialistLookup, signal);
     if (signal.aborted) return;
     if (definitions.length > 0) callbacks.onRemoteResult(definitions);
@@ -58,7 +55,9 @@ export async function runProgressiveDictionaryLookup({
 export function shouldQuerySpecialistDictionary(
   definitions: readonly DictionaryDefinition[],
 ): boolean {
-  return definitions.filter((definition) => definition.text.trim().length > 0).length === 0;
+  return (
+    definitions.filter((definition) => definition.text.trim().length > 0).length === 0
+  );
 }
 
 async function runProviderLookup(

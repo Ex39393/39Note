@@ -13,6 +13,7 @@ export const GOOGLE_DRIVE_SCOPE = 'https://www.googleapis.com/auth/drive.file';
 export type SyncEntityKind =
   | 'document'
   | 'annotation'
+  | 'link-number-high-water'
   | 'note-anchor'
   | 'note'
   | 'glossary'

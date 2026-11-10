@@ -607,6 +607,7 @@ test('malformed and ambiguous scoped summaries remain blocking and paper-local',
     ]),
     [malformed, ambiguous],
     [],
+    testWorkspaceLease,
   );
 
   assert.equal(stateFor(coordinator, 'doc-malformed').status, 'needs-attention');
@@ -632,6 +633,12 @@ function configuredCoordinator(
   const states = documentIds.map((documentId) => paperState(documentId));
   const papers = documentIds.map((documentId) => cloudPaper(documentId));
   Reflect.set(coordinator, 'profile', profile());
+  Reflect.set(coordinator, 'requireWorkspaceLease', () => testWorkspaceLease);
+  Reflect.set(
+    coordinator,
+    'runWorkspaceMutation',
+    async (task: (lease: unknown) => unknown) => task(testWorkspaceLease),
+  );
   Reflect.set(
     coordinator,
     'paperStates',
@@ -640,6 +647,8 @@ function configuredCoordinator(
   Reflect.set(coordinator, 'view', viewState({ papers, paperStates: states }));
   return coordinator;
 }
+
+const testWorkspaceLease = Object.freeze({ kind: 'test-workspace-lease' });
 
 function stateFor(
   coordinator: PaperGoogleDriveSyncCoordinatorType,
@@ -782,6 +791,7 @@ function viewState(overrides: Partial<PaperSyncViewState> = {}): PaperSyncViewSt
     connection: 'connected' as PaperConnectionStatus,
     backendConfigured: true,
     deviceMode: 'personal',
+    deviceModeChoiceConfirmed: true,
     autoSync: true,
     papers: [],
     paperStates: [],

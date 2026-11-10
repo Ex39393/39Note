@@ -18,18 +18,16 @@ import { createSelectedTextContext } from '../src/ai/selectedTextContext.ts';
 import type { PdfTextSelection } from '../src/types/textSelection.ts';
 
 before(async () => {
-  const bytes = await readFile(new URL(
-    '../public/dictionary/pdf-source-lexicon.bin',
-    import.meta.url,
-  ));
+  const bytes = await readFile(
+    new URL('../public/dictionary/pdf-source-lexicon.bin', import.meta.url),
+  );
   installPdfSourceLexicon(bytes);
 });
 
 test('loads a compact local WordNet membership asset', async () => {
-  const bytes = await readFile(new URL(
-    '../public/dictionary/pdf-source-lexicon.bin',
-    import.meta.url,
-  ));
+  const bytes = await readFile(
+    new URL('../public/dictionary/pdf-source-lexicon.bin', import.meta.url),
+  );
   assert.equal(isPdfSourceLexiconReady(), true);
   assert.equal(getPdfSourceLexiconEntryCount(), 82_537);
   assert.ok(bytes.byteLength <= 300 * 1024);
@@ -171,7 +169,10 @@ test('removes only genuine U+00AD soft hyphens from source presentation', () => 
   const source = 'signifi\u00adcant - ‐ ‑ – — evidence-based';
   const displayed = formatPdfSourceTextForDisplay(source);
   assert.equal(displayed, 'significant - ‐ ‑ – — evidence-based');
-  assert.equal([...displayed].some((character) => character.codePointAt(0) === 0x00ad), false);
+  assert.equal(
+    [...displayed].some((character) => character.codePointAt(0) === 0x00ad),
+    false,
+  );
   assert.equal(
     reconstructPdfSelectionText([
       fragment('signifi\u00adcant', rectangle(0, 0, 70, 14), 0),
@@ -261,9 +262,7 @@ test('partial first and final fragment slicing does not leak unselected text', (
       selectionEnd,
     );
     sourceOffset += text.length;
-    return slice
-      ? [fragment(slice.text, rectangle(order * 80, 0, 60, 14), order)]
-      : [];
+    return slice ? [fragment(slice.text, rectangle(order * 80, 0, 60, 14), order)] : [];
   });
 
   assert.equal(reconstructPdfSelectionText(fragments), 'was no difference today');
@@ -391,11 +390,13 @@ function fragment(
     text,
     rectangle: value,
     order,
-    ...(hasEOL ? {
-      sourceItem: { hasEOL: true },
-      startsSourceItem: true,
-      endsSourceItem: true,
-    } : {}),
+    ...(hasEOL
+      ? {
+          sourceItem: { hasEOL: true },
+          startsSourceItem: true,
+          endsSourceItem: true,
+        }
+      : {}),
   };
 }
 

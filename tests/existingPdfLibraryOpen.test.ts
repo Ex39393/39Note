@@ -82,6 +82,18 @@ interface HashModule {
   sha256Hex(value: Blob | ArrayBuffer | string): Promise<string>;
 }
 
+interface DocumentIdentityModule {
+  createDocumentInstanceIdentity(
+    identity: { documentId: string; documentName: string },
+    instanceId: string,
+  ): { documentId: string; documentName: string };
+  getDocumentSourceIdentityId(documentId: string): string | null;
+  preserveRequestedDocumentInstanceIdentity(
+    identity: { documentId: string; documentName: string },
+    requestedDocumentId?: string,
+  ): { documentId: string; documentName: string };
+}
+
 const harness: PersistenceHarness = {
   documentStates: new Map(),
   sourceFiles: new Map(),
@@ -94,6 +106,7 @@ let persistence: PersistenceModule;
 let documentTypes: DocumentTypesModule;
 let registry: DocumentRegistryModule;
 let hash: HashModule;
+let documentIdentity: DocumentIdentityModule;
 
 before(async () => {
   Object.defineProperty(globalThis, IDB_HARNESS_SYMBOL, {
@@ -166,7 +179,7 @@ before(async () => {
     server: { middlewareMode: true },
   });
 
-  [persistence, documentTypes, registry, hash] = await Promise.all([
+  [persistence, documentTypes, registry, hash, documentIdentity] = await Promise.all([
     server.ssrLoadModule(
       '/src/services/annotationPersistence.ts',
     ) as Promise<PersistenceModule>,
@@ -175,6 +188,9 @@ before(async () => {
       '/src/documents/registry.ts',
     ) as Promise<DocumentRegistryModule>,
     server.ssrLoadModule('/src/sync/hash.ts') as Promise<HashModule>,
+    server.ssrLoadModule(
+      '/src/utils/documentIdentity.ts',
+    ) as Promise<DocumentIdentityModule>,
   ]);
 });
 
@@ -364,6 +380,76 @@ test('a mismatched historical SHA remains visible as metadata but fails the full
   await assertRawRecordUnchanged(fixture);
 });
 
+test('explicit new-paper identities stay unique while preserving the PDF source fingerprint', () => {
+  const sourceIdentity = {
+    documentId: 'pdfjs:synthetic-source-fingerprint',
+    documentName: 'same-paper.pdf',
+  };
+  const first = documentIdentity.createDocumentInstanceIdentity(
+    sourceIdentity,
+    '11111111-1111-4111-8111-111111111111',
+  );
+  const second = documentIdentity.createDocumentInstanceIdentity(
+    sourceIdentity,
+    '22222222-2222-4222-8222-222222222222',
+  );
+
+  assert.notEqual(first.documentId, second.documentId);
+  assert.equal(first.documentName, sourceIdentity.documentName);
+  assert.equal(
+    documentIdentity.getDocumentSourceIdentityId(first.documentId),
+    sourceIdentity.documentId,
+  );
+  assert.equal(
+    documentIdentity.getDocumentSourceIdentityId(second.documentId),
+    sourceIdentity.documentId,
+  );
+  assert.equal(
+    documentIdentity.getDocumentSourceIdentityId(sourceIdentity.documentId),
+    sourceIdentity.documentId,
+  );
+  assert.deepEqual(
+    documentIdentity.preserveRequestedDocumentInstanceIdentity(
+      sourceIdentity,
+      first.documentId,
+    ),
+    first,
+  );
+  assert.deepEqual(
+    documentIdentity.preserveRequestedDocumentInstanceIdentity(
+      sourceIdentity,
+      'unrelated-paper:instance:11111111-1111-4111-8111-111111111111',
+    ),
+    sourceIdentity,
+  );
+  assert.throws(
+    () => documentIdentity.createDocumentInstanceIdentity(sourceIdentity, 'not-a-uuid'),
+    /could not be created safely/u,
+  );
+});
+
+test('explicit new-paper identity generation honors the released 256-character sync boundary', () => {
+  const instanceId = '11111111-1111-4111-8111-111111111111';
+  const atBoundary = documentIdentity.createDocumentInstanceIdentity(
+    { documentId: 's'.repeat(210), documentName: 'boundary.pdf' },
+    instanceId,
+  );
+
+  assert.equal(atBoundary.documentId.length, 256);
+  assert.equal(
+    documentIdentity.getDocumentSourceIdentityId(atBoundary.documentId),
+    's'.repeat(210),
+  );
+  assert.throws(
+    () =>
+      documentIdentity.createDocumentInstanceIdentity(
+        { documentId: 's'.repeat(211), documentName: 'too-long.pdf' },
+        instanceId,
+      ),
+    /too long to create a separate cloud-compatible paper/u,
+  );
+});
+
 type SourceShape = 'legacy-local' | 'legacy-cloud' | 'current';
 
 interface ExistingPdfFixture {
@@ -399,6 +485,8 @@ async function seedExistingPdf(options: {
     nextNoteNumber: 1,
     updatedAt: 10,
     collectionIds: [],
+    // Schema 7/8 records may still carry the retired organizational field.
+    // Reads must tolerate it without exposing it in the current state model.
     tagIds: [],
     isPinned: false,
     ...(options.stateSchemaVersion === 8
@@ -446,6 +534,11 @@ async function assertLibraryMetadataThenOpen(
   assert.equal(listed.hasStoredSource, true);
   assert.equal(listed.hasStoredPdf, true);
   assert.equal(listed.sourceSize, fixture.bytes.byteLength);
+
+  const normalizedState = await persistence.loadDocumentState(fixture.documentId);
+  assert.ok(normalizedState);
+  assert.equal(normalizedState.schemaVersion, 9);
+  assert.equal('tagIds' in normalizedState, false);
 
   const loaded = await persistence.loadStoredDocumentSource(fixture.documentId);
   assert.ok(loaded, 'the full source read must agree with Library metadata');

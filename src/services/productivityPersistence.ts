@@ -1,4 +1,4 @@
-import { openDB, type DBSchema, type IDBPDatabase } from 'idb';
+import { type DBSchema, type IDBPDatabase } from 'idb';
 import type {
   AiChatMessage,
   AiConversationRecord,
@@ -12,7 +12,7 @@ import {
   PRINT_TEMPLATE_VERSION,
 } from '../print/printTemplates.ts';
 import { isValidDocumentId } from '../utils/documentId';
-import { notifyPersistentChange } from './persistentChange.ts';
+import { dispatchPersistentChange } from './persistentChange.ts';
 import {
   PERSONAL_PRODUCTIVITY_DATABASE_NAME,
   scopedDatabaseName,
@@ -21,9 +21,18 @@ import {
   replaceAndVerifyStoredRenderedPrintPdf,
   validateStoredRenderedPrintPdf,
 } from '../print/renderedPrintPdf.ts';
+import { openDatabaseWithLifecycleSafety } from './indexedDbLifecycle.ts';
+import {
+  RESTORE_ACTION_STORE,
+  RESTORE_SNAPSHOT_STORE,
+  type RestoreAppliedAction,
+  type RestoreSnapshotEnvelope,
+} from './restoreSafety.ts';
+import { withWorkspaceMutation } from './annotationPersistence.ts';
+import type { WorkspaceRestoreLease } from './workspaceRestoreLock.ts';
 
 const DATABASE_NAME = PERSONAL_PRODUCTIVITY_DATABASE_NAME;
-const DATABASE_VERSION = 2;
+export const PRODUCTIVITY_DATABASE_VERSION = 3;
 const PRINT_DRAFT_STORE = 'print-drafts';
 const RENDERED_PRINT_PDF_STORE = 'rendered-print-pdfs';
 const AI_CONVERSATION_STORE = 'ai-conversations';
@@ -41,6 +50,14 @@ interface ProductivityDatabase extends DBSchema {
     key: string;
     value: AiConversationRecord;
     indexes: { 'by-document': string };
+  };
+  [RESTORE_SNAPSHOT_STORE]: {
+    key: string;
+    value: RestoreSnapshotEnvelope;
+  };
+  [RESTORE_ACTION_STORE]: {
+    key: string;
+    value: RestoreAppliedAction;
   };
 }
 
@@ -68,34 +85,46 @@ export async function loadPrintDraft(
   }
 }
 
-export async function savePrintDraft(draft: PrintDraftRecord): Promise<boolean> {
+export async function savePrintDraft(
+  draft: PrintDraftRecord,
+  workspaceLease?: WorkspaceRestoreLease,
+): Promise<boolean> {
   const sanitized = sanitizePrintDraft(draft, draft.documentId);
   if (!sanitized) return false;
   try {
-    const database = await getDatabase();
-    await database.put(PRINT_DRAFT_STORE, sanitized);
-    notifyPersistentChange({
-      kind: 'productivity',
-      documentId: sanitized.documentId,
-      categories: ['print-draft'],
-    });
-    return true;
+    return await withWorkspaceMutation(async (lease) => {
+      const database = await getDatabase();
+      await database.put(PRINT_DRAFT_STORE, sanitized);
+      await dispatchPersistentChange(
+        {
+          kind: 'productivity',
+          documentId: sanitized.documentId,
+          categories: ['print-draft'],
+        },
+        lease,
+      );
+      return true;
+    }, workspaceLease);
   } catch {
     return false;
   }
 }
 
-export async function clearPrintDraft(documentId: string): Promise<boolean> {
+export async function clearPrintDraft(
+  documentId: string,
+  workspaceLease?: WorkspaceRestoreLease,
+): Promise<boolean> {
   if (!isValidDocumentId(documentId)) return false;
   try {
-    const database = await getDatabase();
-    await database.delete(PRINT_DRAFT_STORE, documentId);
-    notifyPersistentChange({
-      kind: 'productivity',
-      documentId,
-      categories: ['print-draft'],
-    });
-    return true;
+    return await withWorkspaceMutation(async (lease) => {
+      const database = await getDatabase();
+      await database.delete(PRINT_DRAFT_STORE, documentId);
+      await dispatchPersistentChange(
+        { kind: 'productivity', documentId, categories: ['print-draft'] },
+        lease,
+      );
+      return true;
+    }, workspaceLease);
   } catch {
     return false;
   }
@@ -119,20 +148,26 @@ export async function loadRenderedPrintPdf(
 export async function saveRenderedPrintPdf(
   artifact: StoredRenderedPrintPdf,
   notifyChange = true,
+  workspaceLease?: WorkspaceRestoreLease,
 ): Promise<boolean> {
   const validated = await validateStoredRenderedPrintPdf(artifact, artifact.documentId);
   if (!validated) return false;
   try {
-    const database = await getDatabase();
-    await database.put(RENDERED_PRINT_PDF_STORE, validated);
-    if (notifyChange) {
-      notifyPersistentChange({
-        kind: 'productivity',
-        documentId: validated.documentId,
-        categories: ['rendered-print-pdf'],
-      });
-    }
-    return true;
+    return await withWorkspaceMutation(async (lease) => {
+      const database = await getDatabase();
+      await database.put(RENDERED_PRINT_PDF_STORE, validated);
+      if (notifyChange) {
+        await dispatchPersistentChange(
+          {
+            kind: 'productivity',
+            documentId: validated.documentId,
+            categories: ['rendered-print-pdf'],
+          },
+          lease,
+        );
+      }
+      return true;
+    }, workspaceLease);
   } catch {
     return false;
   }
@@ -140,37 +175,41 @@ export async function saveRenderedPrintPdf(
 
 export async function replaceRenderedPrintPdf(
   artifact: StoredRenderedPrintPdf,
+  workspaceLease?: WorkspaceRestoreLease,
 ): Promise<StoredRenderedPrintPdf> {
-  const documentId = artifact.documentId;
-  const persisted = await replaceAndVerifyStoredRenderedPrintPdf(artifact, {
-    load: () => loadRenderedPrintPdfStrict(documentId),
-    save: (next) => saveRenderedPrintPdfStrict(next),
-    remove: () => removeRenderedPrintPdfStrict(documentId),
-  });
-  notifyPersistentChange({
-    kind: 'productivity',
-    documentId,
-    categories: ['rendered-print-pdf'],
-  });
-  return persisted;
+  return withWorkspaceMutation(async (lease) => {
+    const documentId = artifact.documentId;
+    const persisted = await replaceAndVerifyStoredRenderedPrintPdf(artifact, {
+      load: () => loadRenderedPrintPdfStrict(documentId),
+      save: (next) => saveRenderedPrintPdfStrict(next),
+      remove: () => removeRenderedPrintPdfStrict(documentId),
+    });
+    await dispatchPersistentChange(
+      { kind: 'productivity', documentId, categories: ['rendered-print-pdf'] },
+      lease,
+    );
+    return persisted;
+  }, workspaceLease);
 }
 
 export async function removeRenderedPrintPdf(
   documentId: string,
   notifyChange = true,
+  workspaceLease?: WorkspaceRestoreLease,
 ): Promise<boolean> {
   if (!isValidDocumentId(documentId)) return false;
   try {
-    const database = await getDatabase();
-    await database.delete(RENDERED_PRINT_PDF_STORE, documentId);
-    if (notifyChange) {
-      notifyPersistentChange({
-        kind: 'productivity',
-        documentId,
-        categories: ['rendered-print-pdf'],
-      });
-    }
-    return true;
+    return await withWorkspaceMutation(async (lease) => {
+      const database = await getDatabase();
+      await database.delete(RENDERED_PRINT_PDF_STORE, documentId);
+      if (notifyChange) {
+        await dispatchPersistentChange(
+          { kind: 'productivity', documentId, categories: ['rendered-print-pdf'] },
+          lease,
+        );
+      }
+      return true;
+    }, workspaceLease);
   } catch {
     return false;
   }
@@ -321,6 +360,7 @@ export async function restoreRenderedPrintPdf(
   artifact: StoredRenderedPrintPdf | null,
   notifyChange = false,
   signal?: AbortSignal,
+  workspaceLease?: WorkspaceRestoreLease,
 ): Promise<void> {
   if (!isValidDocumentId(documentId)) {
     throw new Error('A Print PDF has an invalid document identifier.');
@@ -332,18 +372,19 @@ export async function restoreRenderedPrintPdf(
   if (artifact && !validated) {
     throw new Error('A Print PDF failed local integrity validation.');
   }
-  const database = await getDatabase();
-  signal?.throwIfAborted();
-  if (validated) await database.put(RENDERED_PRINT_PDF_STORE, validated);
-  else await database.delete(RENDERED_PRINT_PDF_STORE, documentId);
-  signal?.throwIfAborted();
-  if (notifyChange) {
-    notifyPersistentChange({
-      kind: 'productivity',
-      documentId,
-      categories: ['rendered-print-pdf'],
-    });
-  }
+  await withWorkspaceMutation(async (lease) => {
+    const database = await getDatabase();
+    signal?.throwIfAborted();
+    if (validated) await database.put(RENDERED_PRINT_PDF_STORE, validated);
+    else await database.delete(RENDERED_PRINT_PDF_STORE, documentId);
+    signal?.throwIfAborted();
+    if (notifyChange) {
+      await dispatchPersistentChange(
+        { kind: 'productivity', documentId, categories: ['rendered-print-pdf'] },
+        lease,
+      );
+    }
+  }, workspaceLease);
 }
 
 /**
@@ -356,6 +397,7 @@ export async function restoreRenderedPrintPdfIfUnchanged(
   artifact: StoredRenderedPrintPdf | null,
   notifyChange = false,
   signal?: AbortSignal,
+  workspaceLease?: WorkspaceRestoreLease,
 ): Promise<boolean> {
   if (!isValidDocumentId(documentId)) {
     throw new Error('A Print PDF has an invalid document identifier.');
@@ -367,53 +409,61 @@ export async function restoreRenderedPrintPdfIfUnchanged(
   if (artifact && !validated) {
     throw new Error('A Print PDF failed local integrity validation.');
   }
-  const database = await getDatabase();
-  const transaction = database.transaction(RENDERED_PRINT_PDF_STORE, 'readwrite');
-  const releaseAbort = abortTransactionOnSignal(transaction, signal);
-  try {
-    const currentValue = await transaction.store.get(documentId);
-    const currentMatches =
-      expectedCurrent?.kind === 'rendered-print-pdf-storage-identity'
-        ? sameStoredRenderedPrintPdfIdentity(
-            storedRenderedPrintPdfIdentity(currentValue),
-            expectedCurrent.value,
-          )
-        : sameStoredRenderedPrintPdfMetadata(currentValue, expectedCurrent);
-    if (!currentMatches) {
+  return withWorkspaceMutation(async (lease) => {
+    const database = await getDatabase();
+    const transaction = database.transaction(RENDERED_PRINT_PDF_STORE, 'readwrite');
+    const releaseAbort = abortTransactionOnSignal(transaction, signal);
+    try {
+      const currentValue = await transaction.store.get(documentId);
+      const currentMatches =
+        expectedCurrent?.kind === 'rendered-print-pdf-storage-identity'
+          ? sameStoredRenderedPrintPdfIdentity(
+              storedRenderedPrintPdfIdentity(currentValue),
+              expectedCurrent.value,
+            )
+          : sameStoredRenderedPrintPdfMetadata(currentValue, expectedCurrent);
+      if (!currentMatches) {
+        await transaction.done;
+        return false;
+      }
+      signal?.throwIfAborted();
+      if (validated) await transaction.store.put(validated);
+      else await transaction.store.delete(documentId);
       await transaction.done;
-      return false;
+    } finally {
+      releaseAbort();
     }
-    signal?.throwIfAborted();
-    if (validated) await transaction.store.put(validated);
-    else await transaction.store.delete(documentId);
-    await transaction.done;
-  } finally {
-    releaseAbort();
-  }
-  if (notifyChange) {
-    notifyPersistentChange({
-      kind: 'productivity',
-      documentId,
-      categories: ['rendered-print-pdf'],
-    });
-  }
-  return true;
+    if (notifyChange) {
+      await dispatchPersistentChange(
+        { kind: 'productivity', documentId, categories: ['rendered-print-pdf'] },
+        lease,
+      );
+    }
+    return true;
+  }, workspaceLease);
 }
 
 export async function appendPrintDraftAddition(
   documentId: string,
   addition: PrintDraftAddition,
+  workspaceLease?: WorkspaceRestoreLease,
 ): Promise<boolean> {
-  if (!isValidDocumentId(documentId)) return false;
-  const existing = await loadPrintDraft(documentId);
-  if (!existing) return false;
-  return savePrintDraft({
-    ...existing,
-    pendingAdditions: [...existing.pendingAdditions, sanitizeAddition(addition)].slice(
-      -50,
-    ),
-    updatedAt: Date.now(),
-  });
+  return withWorkspaceMutation(async (lease) => {
+    if (!isValidDocumentId(documentId)) return false;
+    const existing = await loadPrintDraft(documentId);
+    if (!existing) return false;
+    return savePrintDraft(
+      {
+        ...existing,
+        pendingAdditions: [
+          ...existing.pendingAdditions,
+          sanitizeAddition(addition),
+        ].slice(-50),
+        updatedAt: Date.now(),
+      },
+      lease,
+    );
+  }, workspaceLease);
 }
 
 export async function listAiConversations(
@@ -440,35 +490,49 @@ export async function listAiConversations(
 
 export async function saveAiConversation(
   conversation: AiConversationRecord,
+  workspaceLease?: WorkspaceRestoreLease,
 ): Promise<boolean> {
   const sanitized = sanitizeConversation(conversation, conversation.documentId);
   if (!sanitized) return false;
   try {
-    const database = await getDatabase();
-    await database.put(AI_CONVERSATION_STORE, sanitized);
-    notifyPersistentChange({
-      kind: 'productivity',
-      documentId: sanitized.documentId,
-      categories: ['ai-conversation'],
-    });
-    return true;
+    return await withWorkspaceMutation(async (lease) => {
+      const database = await getDatabase();
+      await database.put(AI_CONVERSATION_STORE, sanitized);
+      await dispatchPersistentChange(
+        {
+          kind: 'productivity',
+          documentId: sanitized.documentId,
+          categories: ['ai-conversation'],
+        },
+        lease,
+      );
+      return true;
+    }, workspaceLease);
   } catch {
     return false;
   }
 }
 
-export async function deleteAiConversation(conversationId: string): Promise<boolean> {
+export async function deleteAiConversation(
+  conversationId: string,
+  workspaceLease?: WorkspaceRestoreLease,
+): Promise<boolean> {
   if (!isSafeId(conversationId)) return false;
   try {
-    const database = await getDatabase();
-    const existing = await database.get(AI_CONVERSATION_STORE, conversationId);
-    await database.delete(AI_CONVERSATION_STORE, conversationId);
-    notifyPersistentChange({
-      kind: 'productivity',
-      documentId: existing?.documentId,
-      categories: ['ai-conversation'],
-    });
-    return true;
+    return await withWorkspaceMutation(async (lease) => {
+      const database = await getDatabase();
+      const existing = await database.get(AI_CONVERSATION_STORE, conversationId);
+      await database.delete(AI_CONVERSATION_STORE, conversationId);
+      await dispatchPersistentChange(
+        {
+          kind: 'productivity',
+          documentId: existing?.documentId,
+          categories: ['ai-conversation'],
+        },
+        lease,
+      );
+      return true;
+    }, workspaceLease);
   } catch {
     return false;
   }
@@ -614,6 +678,7 @@ export async function restoreProductivityBackupData(
   records: readonly ProductivityBackupDocument[],
   notifyChange = true,
   signal?: AbortSignal,
+  workspaceLease?: WorkspaceRestoreLease,
 ): Promise<void> {
   signal?.throwIfAborted();
   const sanitizedRecords = records.map((record) =>
@@ -622,90 +687,102 @@ export async function restoreProductivityBackupData(
   if (sanitizedRecords.some((record) => !record)) {
     throw new Error('Cloud productivity data failed validation.');
   }
-  const database = await getDatabase();
-  const transaction = database.transaction(
-    [PRINT_DRAFT_STORE, AI_CONVERSATION_STORE],
-    'readwrite',
-  );
-  const releaseAbort = abortTransactionOnSignal(transaction, signal);
-  try {
-    for (const record of sanitizedRecords) {
-      signal?.throwIfAborted();
-      if (!record) throw new Error('Cloud productivity data failed validation.');
-      const draftStore = transaction.objectStore(PRINT_DRAFT_STORE);
-      const conversationStore = transaction.objectStore(AI_CONVERSATION_STORE);
-      await draftStore.delete(record.documentId);
-      const oldConversationIds = await conversationStore
-        .index('by-document')
-        .getAllKeys(record.documentId);
-      await Promise.all(oldConversationIds.map((id) => conversationStore.delete(id)));
-      if (record.printDraft) await draftStore.put(record.printDraft);
-      for (const conversation of record.aiConversations) {
+  await withWorkspaceMutation(async (lease) => {
+    const database = await getDatabase();
+    const transaction = database.transaction(
+      [PRINT_DRAFT_STORE, AI_CONVERSATION_STORE],
+      'readwrite',
+    );
+    const releaseAbort = abortTransactionOnSignal(transaction, signal);
+    try {
+      for (const record of sanitizedRecords) {
         signal?.throwIfAborted();
-        await conversationStore.put(conversation);
+        if (!record) throw new Error('Cloud productivity data failed validation.');
+        const draftStore = transaction.objectStore(PRINT_DRAFT_STORE);
+        const conversationStore = transaction.objectStore(AI_CONVERSATION_STORE);
+        await draftStore.delete(record.documentId);
+        const oldConversationIds = await conversationStore
+          .index('by-document')
+          .getAllKeys(record.documentId);
+        await Promise.all(oldConversationIds.map((id) => conversationStore.delete(id)));
+        if (record.printDraft) await draftStore.put(record.printDraft);
+        for (const conversation of record.aiConversations) {
+          signal?.throwIfAborted();
+          await conversationStore.put(conversation);
+        }
+      }
+      await transaction.done;
+    } finally {
+      releaseAbort();
+    }
+    if (notifyChange) {
+      for (const record of records) {
+        await dispatchPersistentChange(
+          { kind: 'productivity', documentId: record.documentId },
+          lease,
+        );
       }
     }
-    await transaction.done;
-  } finally {
-    releaseAbort();
-  }
-  if (notifyChange) {
-    for (const record of records) {
-      notifyPersistentChange({ kind: 'productivity', documentId: record.documentId });
-    }
-  }
+  }, workspaceLease);
 }
 
 export async function restoreAiConversations(
   conversations: readonly AiConversationRecord[],
+  workspaceLease?: WorkspaceRestoreLease,
 ): Promise<void> {
-  const database = await getDatabase();
-  const transaction = database.transaction(AI_CONVERSATION_STORE, 'readwrite');
-  for (const conversation of conversations) {
-    const sanitized = sanitizeConversation(conversation, conversation.documentId);
-    if (sanitized) await transaction.store.put(sanitized);
-  }
-  await transaction.done;
-  for (const conversation of conversations) {
-    notifyPersistentChange({
-      kind: 'productivity',
-      documentId: conversation.documentId,
-    });
-  }
+  await withWorkspaceMutation(async (lease) => {
+    const database = await getDatabase();
+    const transaction = database.transaction(AI_CONVERSATION_STORE, 'readwrite');
+    for (const conversation of conversations) {
+      const sanitized = sanitizeConversation(conversation, conversation.documentId);
+      if (sanitized) await transaction.store.put(sanitized);
+    }
+    await transaction.done;
+    for (const conversation of conversations) {
+      await dispatchPersistentChange(
+        { kind: 'productivity', documentId: conversation.documentId },
+        lease,
+      );
+    }
+  }, workspaceLease);
 }
 
 export async function deleteProductivityDocumentData(
   documentId: string,
   notifyChange = true,
   signal?: AbortSignal,
+  workspaceLease?: WorkspaceRestoreLease,
 ): Promise<void> {
   if (!isValidDocumentId(documentId)) return;
   signal?.throwIfAborted();
   try {
-    const database = await getDatabase();
-    const transaction = database.transaction(
-      [PRINT_DRAFT_STORE, RENDERED_PRINT_PDF_STORE, AI_CONVERSATION_STORE],
-      'readwrite',
-    );
-    const releaseAbort = abortTransactionOnSignal(transaction, signal);
-    try {
-      await transaction.objectStore(PRINT_DRAFT_STORE).delete(documentId);
-      await transaction.objectStore(RENDERED_PRINT_PDF_STORE).delete(documentId);
-      const conversationIds = await transaction
-        .objectStore(AI_CONVERSATION_STORE)
-        .index('by-document')
-        .getAllKeys(documentId);
-      signal?.throwIfAborted();
-      await Promise.all(
-        conversationIds.map((id) =>
-          transaction.objectStore(AI_CONVERSATION_STORE).delete(id),
-        ),
+    await withWorkspaceMutation(async (lease) => {
+      const database = await getDatabase();
+      const transaction = database.transaction(
+        [PRINT_DRAFT_STORE, RENDERED_PRINT_PDF_STORE, AI_CONVERSATION_STORE],
+        'readwrite',
       );
-      await transaction.done;
-    } finally {
-      releaseAbort();
-    }
-    if (notifyChange) notifyPersistentChange({ kind: 'productivity', documentId });
+      const releaseAbort = abortTransactionOnSignal(transaction, signal);
+      try {
+        await transaction.objectStore(PRINT_DRAFT_STORE).delete(documentId);
+        await transaction.objectStore(RENDERED_PRINT_PDF_STORE).delete(documentId);
+        const conversationIds = await transaction
+          .objectStore(AI_CONVERSATION_STORE)
+          .index('by-document')
+          .getAllKeys(documentId);
+        signal?.throwIfAborted();
+        await Promise.all(
+          conversationIds.map((id) =>
+            transaction.objectStore(AI_CONVERSATION_STORE).delete(id),
+          ),
+        );
+        await transaction.done;
+      } finally {
+        releaseAbort();
+      }
+      if (notifyChange)
+        await dispatchPersistentChange({ kind: 'productivity', documentId }, lease);
+    }, workspaceLease);
   } catch (error) {
     if (signal?.aborted) throw signal.reason ?? error;
     // Document deletion remains successful even if optional productivity data is unavailable.
@@ -715,34 +792,66 @@ export async function deleteProductivityDocumentData(
 export async function deleteProductivityDocumentDataStrict(
   documentId: string,
   signal?: AbortSignal,
+  workspaceLease?: WorkspaceRestoreLease,
 ): Promise<void> {
   if (!isValidDocumentId(documentId)) {
     throw new Error('A temporary paper has an invalid identifier.');
   }
-  signal?.throwIfAborted();
-  const database = await getDatabase();
-  const transaction = database.transaction(
-    [PRINT_DRAFT_STORE, RENDERED_PRINT_PDF_STORE, AI_CONVERSATION_STORE],
-    'readwrite',
-  );
-  const releaseAbort = abortTransactionOnSignal(transaction, signal);
-  try {
-    await transaction.objectStore(PRINT_DRAFT_STORE).delete(documentId);
-    await transaction.objectStore(RENDERED_PRINT_PDF_STORE).delete(documentId);
-    const conversationStore = transaction.objectStore(AI_CONVERSATION_STORE);
-    const ids = await conversationStore.index('by-document').getAllKeys(documentId);
-    for (const id of ids) await conversationStore.delete(id);
-    await transaction.done;
-  } finally {
-    releaseAbort();
+  await withWorkspaceMutation(async () => {
+    signal?.throwIfAborted();
+    const database = await getDatabase();
+    const transaction = database.transaction(
+      [PRINT_DRAFT_STORE, RENDERED_PRINT_PDF_STORE, AI_CONVERSATION_STORE],
+      'readwrite',
+    );
+    const releaseAbort = abortTransactionOnSignal(transaction, signal);
+    try {
+      await transaction.objectStore(PRINT_DRAFT_STORE).delete(documentId);
+      await transaction.objectStore(RENDERED_PRINT_PDF_STORE).delete(documentId);
+      const conversationStore = transaction.objectStore(AI_CONVERSATION_STORE);
+      const ids = await conversationStore.index('by-document').getAllKeys(documentId);
+      for (const id of ids) await conversationStore.delete(id);
+      await transaction.done;
+    } finally {
+      releaseAbort();
+    }
+    const [draft, renderedPrintPdf, remaining] = await Promise.all([
+      database.get(PRINT_DRAFT_STORE, documentId),
+      database.get(RENDERED_PRINT_PDF_STORE, documentId),
+      database.getAllFromIndex(AI_CONVERSATION_STORE, 'by-document', documentId),
+    ]);
+    if (draft !== undefined || renderedPrintPdf !== undefined || remaining.length > 0) {
+      throw new Error('39Note could not clear temporary productivity data.');
+    }
+  }, workspaceLease);
+}
+
+export async function prepareProductivityPersistenceStartup(): Promise<void> {
+  await getDatabase();
+}
+
+export function upgradeProductivityDatabaseSchema(
+  database: IDBPDatabase<ProductivityDatabase>,
+): void {
+  if (!database.objectStoreNames.contains(PRINT_DRAFT_STORE)) {
+    database.createObjectStore(PRINT_DRAFT_STORE, { keyPath: 'documentId' });
   }
-  const [draft, renderedPrintPdf, remaining] = await Promise.all([
-    database.get(PRINT_DRAFT_STORE, documentId),
-    database.get(RENDERED_PRINT_PDF_STORE, documentId),
-    database.getAllFromIndex(AI_CONVERSATION_STORE, 'by-document', documentId),
-  ]);
-  if (draft !== undefined || renderedPrintPdf !== undefined || remaining.length > 0) {
-    throw new Error('39Note could not clear temporary productivity data.');
+  if (!database.objectStoreNames.contains(RENDERED_PRINT_PDF_STORE)) {
+    database.createObjectStore(RENDERED_PRINT_PDF_STORE, {
+      keyPath: 'documentId',
+    });
+  }
+  if (!database.objectStoreNames.contains(AI_CONVERSATION_STORE)) {
+    const store = database.createObjectStore(AI_CONVERSATION_STORE, {
+      keyPath: 'id',
+    });
+    store.createIndex('by-document', 'documentId');
+  }
+  if (!database.objectStoreNames.contains(RESTORE_SNAPSHOT_STORE)) {
+    database.createObjectStore(RESTORE_SNAPSHOT_STORE, { keyPath: 'id' });
+  }
+  if (!database.objectStoreNames.contains(RESTORE_ACTION_STORE)) {
+    database.createObjectStore(RESTORE_ACTION_STORE, { keyPath: 'id' });
   }
 }
 
@@ -755,24 +864,17 @@ async function getDatabase(): Promise<IDBPDatabase<ProductivityDatabase>> {
   }
   if (!databasePromise) {
     openedDatabaseName = databaseName;
-    databasePromise = openDB<ProductivityDatabase>(databaseName, DATABASE_VERSION, {
-      upgrade(database) {
-        if (!database.objectStoreNames.contains(PRINT_DRAFT_STORE)) {
-          database.createObjectStore(PRINT_DRAFT_STORE, { keyPath: 'documentId' });
-        }
-        if (!database.objectStoreNames.contains(RENDERED_PRINT_PDF_STORE)) {
-          database.createObjectStore(RENDERED_PRINT_PDF_STORE, {
-            keyPath: 'documentId',
-          });
-        }
-        if (!database.objectStoreNames.contains(AI_CONVERSATION_STORE)) {
-          const store = database.createObjectStore(AI_CONVERSATION_STORE, {
-            keyPath: 'id',
-          });
-          store.createIndex('by-document', 'documentId');
-        }
+    databasePromise = openDatabaseWithLifecycleSafety<ProductivityDatabase>(
+      databaseName,
+      PRODUCTIVITY_DATABASE_VERSION,
+      {
+        upgrade: upgradeProductivityDatabaseSchema,
+        onConnectionClosed() {
+          databasePromise = null;
+          openedDatabaseName = null;
+        },
       },
-    }).catch((error) => {
+    ).catch((error) => {
       databasePromise = null;
       openedDatabaseName = null;
       throw error;

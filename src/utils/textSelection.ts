@@ -66,14 +66,16 @@ function getPageTextSelection(
   const layerRectangle = textLayer.getBoundingClientRect();
 
   return {
-    text: reconstructPdfSelectionText(
-      getSelectedTextFragments(pageRange, textLayer),
-    ),
+    text: reconstructPdfSelectionText(getSelectedTextFragments(pageRange, textLayer)),
     pageNumber,
     pageWidth: layerRectangle.width,
     pageHeight: layerRectangle.height,
     boundingRectangles: getBoundingRectangles(pageRange, textLayer),
-    startOffset: getTextOffset(textLayer, pageRange.startContainer, pageRange.startOffset),
+    startOffset: getTextOffset(
+      textLayer,
+      pageRange.startContainer,
+      pageRange.startOffset,
+    ),
     endOffset: getTextOffset(textLayer, pageRange.endContainer, pageRange.endOffset),
   };
 }
@@ -204,11 +206,7 @@ function getBoundingRectangles(
     }));
 }
 
-function getTextOffset(
-  textLayer: HTMLElement,
-  node: Node,
-  offset: number,
-): number {
+function getTextOffset(textLayer: HTMLElement, node: Node, offset: number): number {
   const range = document.createRange();
   range.selectNodeContents(textLayer);
   range.setEnd(node, offset);

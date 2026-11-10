@@ -35,7 +35,7 @@ The provider is isolated behind a replaceable adapter because Wikimedia document
 structured definition endpoint as experimental. Returned markup is converted to plain
 text and rendered as untrusted React text; it is never inserted as HTML.
 Browser requests identify this client with the provider-specific
-`Api-User-Agent: 39Note/0.1.0 (https://github.com/Ex39393/39Note)` header, as
+`Api-User-Agent: 39Note/1.0.0 (https://github.com/Ex39393/39Note)` header, as
 recommended by Wikimedia for browser JavaScript. This header is not sent to other
 providers.
 

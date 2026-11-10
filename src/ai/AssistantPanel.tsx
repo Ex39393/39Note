@@ -140,6 +140,7 @@ export function AssistantPanel({
   } | null>(null);
   const conversationSaveTimerRef = useRef<number | null>(null);
   const pendingConversationRef = useRef<AiConversationRecord | null>(null);
+  const conversationPersistenceQueueRef = useRef<Promise<void>>(Promise.resolve());
   const skipNextConversationSaveRef = useRef(false);
 
   const activeProfile = useMemo(
@@ -204,15 +205,34 @@ export function AssistantPanel({
     };
   }, [documentId]);
 
-  const flushConversation = useCallback(async () => {
+  const flushConversation = useCallback((): Promise<boolean> => {
     if (conversationSaveTimerRef.current !== null) {
       window.clearTimeout(conversationSaveTimerRef.current);
       conversationSaveTimerRef.current = null;
     }
-    const pending = pendingConversationRef.current;
-    if (!pending) return false;
-    pendingConversationRef.current = null;
-    return saveAiConversation(pending);
+    const save = async () => {
+      const pending = pendingConversationRef.current;
+      if (!pending) return true;
+      pendingConversationRef.current = null;
+      try {
+        const saved = await saveAiConversation(pending);
+        if (!saved && pendingConversationRef.current === null) {
+          pendingConversationRef.current = pending;
+        }
+        return saved;
+      } catch (error) {
+        if (pendingConversationRef.current === null) {
+          pendingConversationRef.current = pending;
+        }
+        throw error;
+      }
+    };
+    const result = conversationPersistenceQueueRef.current.then(save, save);
+    conversationPersistenceQueueRef.current = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    return result;
   }, []);
 
   useEffect(() => {

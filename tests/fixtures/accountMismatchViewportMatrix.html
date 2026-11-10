@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>39Note account mismatch viewport matrix</title>
+    <style>
+      body {
+        margin: 0;
+      }
+      iframe {
+        border: 0;
+        display: block;
+        height: 900px;
+      }
+    </style>
+  </head>
+  <body>
+    <script>
+      for (const width of [390, 768, 1280, 1536]) {
+        const frame = document.createElement('iframe');
+        frame.dataset.viewportWidth = String(width);
+        frame.src = './accountMismatchBrowser.html?theme=midnight';
+        frame.style.width = `${width}px`;
+        document.body.append(frame);
+      }
+    </script>
+  </body>
+</html>

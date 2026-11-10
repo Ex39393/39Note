@@ -234,3 +234,14 @@ test('detects unsupported CJK and emoji while accepting English and WinAnsi punc
   assert.deepEqual(findUnsupportedAppendixCharacters('English – café €'), []);
   assert.deepEqual(findUnsupportedAppendixCharacters('中文🙂'), ['中', '文', '🙂']);
 });
+
+test('uses an embedded font character set when supplied and always permits layout controls', () => {
+  const supportedCodePoints = new Set(
+    Array.from('English 中文').map((character) => character.codePointAt(0) ?? 0),
+  );
+
+  assert.deepEqual(
+    findUnsupportedAppendixCharacters('English\n中\t文\r🙂🙂', supportedCodePoints),
+    ['🙂'],
+  );
+});

@@ -11,6 +11,7 @@ let PAPER_PRESENCE_PROTOCOL_VERSION: 1;
 let SYNC_LAYOUT_VERSION: 3;
 let PaperPresenceIntegrityError: typeof import('../src/sync/paperPresence.ts').PaperPresenceIntegrityError;
 let createPaperPresenceGeneration: typeof import('../src/sync/paperPresence.ts').createPaperPresenceGeneration;
+let inspectPaperPresenceAncestry: typeof import('../src/sync/paperPresence.ts').inspectPaperPresenceAncestry;
 let parsePaperPresenceGeneration: typeof import('../src/sync/paperPresence.ts').parsePaperPresenceGeneration;
 let resolvePaperPresence: typeof import('../src/sync/paperPresence.ts').resolvePaperPresence;
 let verifyPaperPresenceGeneration: typeof import('../src/sync/paperPresence.ts').verifyPaperPresenceGeneration;
@@ -41,6 +42,7 @@ before(async () => {
   SYNC_LAYOUT_VERSION = paperTypes.SYNC_LAYOUT_VERSION;
   PaperPresenceIntegrityError = presence.PaperPresenceIntegrityError;
   createPaperPresenceGeneration = presence.createPaperPresenceGeneration;
+  inspectPaperPresenceAncestry = presence.inspectPaperPresenceAncestry;
   parsePaperPresenceGeneration = presence.parsePaperPresenceGeneration;
   resolvePaperPresence = presence.resolvePaperPresence;
   verifyPaperPresenceGeneration = presence.verifyPaperPresenceGeneration;
@@ -266,4 +268,195 @@ test('display names are presentation only and never identity authority', async (
   assert.equal(resolved.documentId, 'pdfjs:paper-a');
   assert.equal(resolved.displayName, 'Renamed Paper.pdf');
   assert.equal(resolved.state, 'removed');
+});
+
+test('redacted ancestry inspection reports a valid chain without timestamp authority', async () => {
+  const present = await generation({}, [], 100);
+  const removed = await generation(
+    { state: 'removed', intent: 'remove' },
+    [present.generation.id],
+    1,
+  );
+
+  const inspection = await inspectPaperPresenceAncestry([removed, present]);
+  assert.equal(inspection.diagnostic.status, 'valid');
+  assert.equal(inspection.diagnostic.failureCode, 'none');
+  assert.equal(inspection.diagnostic.rootCount, 1);
+  assert.equal(inspection.diagnostic.structuralHeadCount, 1);
+  assert.equal(inspection.diagnostic.weakComponentCount, 1);
+  assert.equal(inspection.resolved?.state, 'removed');
+  const root = inspection.diagnostic.records.find(
+    ({ intent }) => intent === 'migration',
+  );
+  const child = inspection.diagnostic.records.find(({ intent }) => intent === 'remove');
+  assert.ok(root);
+  assert.ok(child);
+  assert.deepEqual(child.parentOrdinals, [root.ordinal]);
+});
+
+test('redacted ancestry inspection identifies a missing parent precisely', async () => {
+  const present = await generation();
+  const orphan = await generation(
+    { state: 'removed', intent: 'remove' },
+    ['0'.repeat(64)],
+    2,
+  );
+
+  const inspection = await inspectPaperPresenceAncestry([present, orphan]);
+  assert.equal(inspection.resolved, undefined);
+  assert.equal(inspection.diagnostic.status, 'invalid');
+  assert.equal(inspection.diagnostic.failureCode, 'presence-missing-parent');
+  assert.equal(inspection.diagnostic.recordCount, 2);
+  assert.equal(inspection.diagnostic.uniqueGenerationCount, 2);
+  assert.equal(inspection.diagnostic.rootCount, 1);
+  assert.equal(inspection.diagnostic.structuralHeadCount, 2);
+  assert.equal(inspection.diagnostic.weakComponentCount, 2);
+  assert.equal(inspection.diagnostic.missingParentReferenceCount, 1);
+  assert.equal(
+    inspection.diagnostic.records.find(({ intent }) => intent === 'remove')
+      ?.missingParentCount,
+    1,
+  );
+});
+
+test('redacted ancestry inspection distinguishes independent-root failures', async () => {
+  const rootA = await generation();
+  const sameFolderRoot = await generation(
+    { writer: { deviceId: 'device-bravo' } },
+    [],
+    2,
+  );
+  const sameFolder = await inspectPaperPresenceAncestry([rootA, sameFolderRoot]);
+  assert.equal(
+    sameFolder.diagnostic.failureCode,
+    'presence-ambiguous-initial-ancestry',
+  );
+  assert.equal(sameFolder.diagnostic.rootCount, 2);
+  assert.equal(sameFolder.diagnostic.structuralHeadCount, 2);
+  assert.equal(sameFolder.diagnostic.weakComponentCount, 2);
+
+  const otherFolderRoot = await generation(
+    {
+      paperFolderId: 'paper-folder-b',
+      writer: { deviceId: 'device-charlie' },
+    },
+    [],
+    3,
+  );
+  const differentFolders = await inspectPaperPresenceAncestry([rootA, otherFolderRoot]);
+  assert.equal(
+    differentFolders.diagnostic.failureCode,
+    'presence-present-folder-conflict',
+  );
+});
+
+test('redacted ancestry inspection reports invalid transition direction', async () => {
+  const present = await generation();
+  const invalidRestore = await generation(
+    {
+      state: 'present',
+      intent: 'restore',
+      paperFolderId: 'paper-folder-restored',
+    },
+    [present.generation.id],
+    2,
+  );
+
+  const inspection = await inspectPaperPresenceAncestry([present, invalidRestore]);
+  assert.equal(
+    inspection.diagnostic.failureCode,
+    'presence-restore-without-removed-parent',
+  );
+});
+
+test('redacted ancestry inspection groups duplicate artifacts by generation', async () => {
+  const present = await generation();
+  const inspection = await inspectPaperPresenceAncestry([present, present]);
+
+  assert.equal(inspection.diagnostic.status, 'valid');
+  assert.equal(inspection.diagnostic.recordCount, 2);
+  assert.equal(inspection.diagnostic.uniqueGenerationCount, 1);
+  assert.equal(inspection.diagnostic.rootCount, 1);
+  assert.equal(inspection.diagnostic.structuralHeadCount, 1);
+  assert.equal(inspection.diagnostic.weakComponentCount, 1);
+});
+
+test('a synthetic zero-head cycle fails immutable verification before cycle resolution', async () => {
+  const present = await generation();
+  const removed = await generation(
+    { state: 'removed', intent: 'remove' },
+    [present.generation.id],
+    2,
+  );
+  const restored = await generation(
+    {
+      state: 'present',
+      intent: 'restore',
+      paperFolderId: 'paper-folder-restored',
+    },
+    [removed.generation.id],
+    3,
+  );
+  const mutatedRemoved = structuredClone(removed);
+  mutatedRemoved.generation.parents = [restored.generation.id];
+
+  const inspection = await inspectPaperPresenceAncestry([mutatedRemoved, restored]);
+  assert.equal(inspection.diagnostic.failureCode, 'presence-record-integrity-failed');
+  assert.equal(inspection.diagnostic.rootCount, 0);
+  assert.equal(inspection.diagnostic.structuralHeadCount, 0);
+  assert.equal(inspection.diagnostic.weakComponentCount, 1);
+  assert.equal(await verifyPaperPresenceGeneration(mutatedRemoved), false);
+});
+
+test('redacted ancestry inspection fails safely for malformed runtime input', async () => {
+  const malformed = structuredClone(await generation()) as unknown as {
+    generation: { parents: unknown };
+  };
+  malformed.generation.parents = null;
+
+  const inspection = await inspectPaperPresenceAncestry([
+    malformed as PaperPresenceGeneration,
+  ]);
+  assert.equal(inspection.resolved, undefined);
+  assert.equal(inspection.diagnostic.status, 'invalid');
+  assert.equal(inspection.diagnostic.failureCode, 'presence-record-invalid');
+  assert.equal(inspection.diagnostic.recordCount, 1);
+  assert.deepEqual(inspection.diagnostic.records, []);
+});
+
+test('redacted ancestry inspection reports an unexpected resolver failure safely', async () => {
+  const hostileRecord = new Proxy(
+    {
+      documentId: 'synthetic-secret-document',
+      rootFolderId: 'synthetic-secret-root',
+      controlFolderId: 'synthetic-secret-control',
+    },
+    {
+      get(target, property, receiver) {
+        if (property === 'generation') {
+          throw new Error('synthetic resolver failure with secret identity');
+        }
+        return Reflect.get(target, property, receiver);
+      },
+    },
+  ) as unknown as PaperPresenceGeneration;
+
+  const inspection = await inspectPaperPresenceAncestry([hostileRecord]);
+  assert.equal(inspection.resolved, undefined);
+  assert.equal(inspection.diagnostic.status, 'invalid');
+  assert.equal(
+    inspection.diagnostic.failureCode,
+    'presence-unexpected-validation-error',
+  );
+  assert.equal(inspection.diagnostic.recordCount, 1);
+  assert.equal(inspection.diagnostic.uniqueGenerationCount, 0);
+  assert.equal(inspection.diagnostic.rootCount, 0);
+  assert.equal(inspection.diagnostic.structuralHeadCount, 0);
+  assert.equal(inspection.diagnostic.weakComponentCount, 0);
+  assert.equal(inspection.diagnostic.missingParentReferenceCount, 0);
+  assert.deepEqual(inspection.diagnostic.records, []);
+  assert.equal(
+    JSON.stringify(inspection.diagnostic).includes('synthetic-secret'),
+    false,
+  );
 });

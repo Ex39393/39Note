@@ -119,17 +119,6 @@ export function PrintComposerEditor({
   onChange,
   onReady,
 }: PrintComposerEditorProps) {
-  useEffect(() => {
-    if (!blocksDrawerOpen && !formattingDrawerOpen) return;
-    const closeOnEscape = (event: KeyboardEvent) => {
-      if (event.key !== 'Escape') return;
-      event.preventDefault();
-      onCloseDrawers();
-    };
-    window.addEventListener('keydown', closeOnEscape);
-    return () => window.removeEventListener('keydown', closeOnEscape);
-  }, [blocksDrawerOpen, formattingDrawerOpen, onCloseDrawers]);
-
   const initialConfig = {
     namespace: '39NotePrintComposer',
     nodes: [

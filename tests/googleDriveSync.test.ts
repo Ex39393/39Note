@@ -39,9 +39,12 @@ import {
 } from '../src/sync/driveRepository.ts';
 import { sha256Hex, stableStringify } from '../src/sync/hash.ts';
 import {
+  GoogleAuthorizationStartError,
   GoogleReauthorizationRequiredError,
   PersistentGoogleAuthSession,
   SyncBackendUnavailableError,
+  SyncOriginNotAllowedError,
+  validateAuthorizationNavigationUrl,
   validateSyncAuthUrl,
 } from '../src/sync/googleIdentity.ts';
 import { mergeSyncSnapshots } from '../src/sync/merge.ts';
@@ -66,16 +69,29 @@ import {
 
 const source = (path: string) => readFileSync(new URL(path, import.meta.url), 'utf8');
 const PENDING_EXCHANGE_STORAGE_KEY = '39note.google-drive.pending-exchange';
+const TEMPORARY_SESSION_STORAGE_KEY = '39note.google-drive.temporary-session';
+const ACTIVE_TEMPORARY_WORKSPACE_KEY = '39note.workspace.temporary.v1';
+
+const temporarySessionStorageKey = (workspaceId: string) =>
+  `${TEMPORARY_SESSION_STORAGE_KEY}.temporary-workspace.${workspaceId}`;
+const temporaryPendingExchangeStorageKey = (workspaceId: string) =>
+  `${PENDING_EXCHANGE_STORAGE_KEY}.temporary-workspace.${workspaceId}`;
 
 interface MockOAuthBrowser {
   location: { href: string; hash: string };
   storage: Storage;
+  assignedUrls: string[];
+  navigationStarted: Promise<string>;
+  readonly popupCalls: number;
 }
 
 async function withMockOAuthBrowser<T>(
   options: {
     fragment: string;
+    origin?: string;
+    navigationError?: Error;
     pendingExchange?: string | Record<string, unknown>;
+    initialStorage?: Readonly<Record<string, string>>;
     fetcher: typeof fetch;
   },
   run: (browser: MockOAuthBrowser) => Promise<T>,
@@ -87,6 +103,12 @@ async function withMockOAuthBrowser<T>(
     ]),
   );
   const values = new Map<string, string>();
+  const assignedUrls: string[] = [];
+  let popupCalls = 0;
+  let resolveNavigationStarted!: (url: string) => void;
+  const navigationStarted = new Promise<string>((resolve) => {
+    resolveNavigationStarted = resolve;
+  });
   if (options.pendingExchange !== undefined) {
     values.set(
       PENDING_EXCHANGE_STORAGE_KEY,
@@ -115,14 +137,31 @@ async function withMockOAuthBrowser<T>(
       values.set(key, String(value));
     },
   };
+  for (const [key, value] of Object.entries(options.initialStorage ?? {})) {
+    values.set(key, value);
+  }
+  const origin = options.origin ?? 'http://127.0.0.1:5173';
   const location = {
-    href: `http://127.0.0.1:5173/${options.fragment}`,
+    href: `${origin}/${options.fragment}`,
     hash: options.fragment,
   };
   Object.defineProperties(globalThis, {
     window: {
       configurable: true,
-      value: { location: { ...location, assign() {} } },
+      value: {
+        location: {
+          ...location,
+          assign(url: string) {
+            if (options.navigationError) throw options.navigationError;
+            assignedUrls.push(url);
+            resolveNavigationStarted(url);
+          },
+        },
+        open() {
+          popupCalls += 1;
+          return null;
+        },
+      },
     },
     history: {
       configurable: true,
@@ -144,7 +183,15 @@ async function withMockOAuthBrowser<T>(
   });
 
   try {
-    return await run({ location, storage });
+    return await run({
+      location,
+      storage,
+      assignedUrls,
+      navigationStarted,
+      get popupCalls() {
+        return popupCalls;
+      },
+    });
   } finally {
     for (const [name, descriptor] of descriptors) {
       if (descriptor) Object.defineProperty(globalThis, name, descriptor);
@@ -198,7 +245,6 @@ function validDocumentEntity(documentId = 'doc-1'): SyncEntityRecord {
       displayTitle: 'Paper',
       nextNoteNumber: 1,
       collectionIds: [],
-      tagIds: [],
       isPinned: false,
     },
     1,
@@ -1294,13 +1340,14 @@ async function writeExternalLegacyStateRevision(
   return { manifest: next, text, stateFile };
 }
 
-test('sync uses a separate versioned IndexedDB without changing the main schema', () => {
+test('sync keeps its own schema while the additive main database upgrade preserves dormant stores', () => {
   assert.equal(SYNC_SCHEMA_VERSION, 1);
   assert.equal(SYNC_DATABASE_NAME, '39note-sync');
   assert.equal(SYNC_DATABASE_VERSION, 2);
   const persistence = source('../src/services/annotationPersistence.ts');
-  assert.match(persistence, /const DATABASE_VERSION = 3/);
-  assert.match(persistence, /PERSISTENCE_SCHEMA_VERSION = 8/);
+  assert.match(persistence, /ANNOTATION_DATABASE_VERSION = 5/);
+  assert.match(persistence, /PERSISTENCE_SCHEMA_VERSION\s*=\s*9/);
+  assert.doesNotMatch(persistence, /deleteObjectStore/);
 });
 
 test('concurrent coordinator initialization reuses one in-flight device-state load', async () => {
@@ -2976,10 +3023,11 @@ test('exact pre-integrity schema-1 Drive data reads, validates, and upgrades wit
       fixture.pdf.documentId,
       legacyDocumentRecords,
     );
-    assert.equal(upgradedLegacyState.schemaVersion, 8);
+    assert.equal(upgradedLegacyState.schemaVersion, 9);
     assert.equal(upgradedLegacyState.documentType, 'pdf');
     assert.equal(upgradedLegacyState.annotations.length, 2);
     assert.equal(upgradedLegacyState.officeAnnotations.length, 0);
+    assert.equal('tagIds' in upgradedLegacyState, false);
     assert.deepEqual(
       upgradedLegacyState.readingPosition,
       legacyDocumentRecords.find((item) => item.kind === 'reading-position')?.value,
@@ -5127,6 +5175,397 @@ test('persisted device session silently restores an in-memory access token after
   }
 });
 
+test('a restored Personal session trusts only its persisted verified account binding', () => {
+  const sessionToken = 's'.repeat(43);
+  const restored = new PersistentGoogleAuthSession();
+  restored.configure(
+    'https://sync.example.test',
+    'device-account-restore',
+    sessionToken,
+    'personal',
+    'opaque-verified-account-a',
+  );
+  assert.equal(restored.hasDeviceSession, true);
+  assert.equal(restored.accountId, 'opaque-verified-account-a');
+
+  const missingVerifiedIdentity = new PersistentGoogleAuthSession();
+  missingVerifiedIdentity.configure(
+    'https://sync.example.test',
+    'device-account-restore',
+    sessionToken,
+    'personal',
+  );
+  assert.equal(missingVerifiedIdentity.hasDeviceSession, true);
+  assert.equal(missingVerifiedIdentity.accountId, null);
+
+  const identityWithoutSession = new PersistentGoogleAuthSession();
+  identityWithoutSession.configure(
+    'https://sync.example.test',
+    'device-account-restore',
+    undefined,
+    'personal',
+    'opaque-verified-account-a',
+  );
+  assert.equal(identityWithoutSession.hasDeviceSession, false);
+  assert.equal(identityWithoutSession.accountId, null);
+});
+
+test('access-token refresh cannot replace the verified workspace account identity', async () => {
+  const previousFetch = globalThis.fetch;
+  globalThis.fetch = (async () =>
+    Response.json({
+      accessToken: 'refreshed-memory-only-token',
+      expiresAt: Date.now() + 3_600_000,
+    })) as typeof fetch;
+  try {
+    const identity = new PersistentGoogleAuthSession();
+    identity.configure(
+      'https://sync.example.test',
+      'device-account-refresh',
+      's'.repeat(43),
+      'personal',
+      'opaque-verified-account-a',
+    );
+    await identity.ensureAccessToken(true);
+    assert.equal(identity.accountId, 'opaque-verified-account-a');
+  } finally {
+    globalThis.fetch = previousFetch;
+  }
+});
+
+test('OAuth pre-authorization obtains an URL and uses intentional same-tab navigation without a popup', async () => {
+  const backendUrl = 'https://sync.example.test';
+  const authorizationUrl =
+    'https://accounts.google.com/o/oauth2/v2/auth?client_id=synthetic';
+  let requestBody: Record<string, unknown> | undefined;
+  await withMockOAuthBrowser(
+    {
+      fragment: '',
+      fetcher: (async (input, init) => {
+        assert.equal(new URL(String(input)).pathname, '/api/oauth/start');
+        requestBody = JSON.parse(String(init?.body)) as Record<string, unknown>;
+        return Response.json({ authorizationUrl });
+      }) as typeof fetch,
+    },
+    async (browser) => {
+      const identity = new PersistentGoogleAuthSession();
+      identity.configure(backendUrl, 'device-oauth-start');
+
+      const pendingNavigation = identity.beginAuthorization();
+      assert.equal(await browser.navigationStarted, authorizationUrl);
+      assert.deepEqual(browser.assignedUrls, [authorizationUrl]);
+      assert.equal(browser.popupCalls, 0);
+      assert.equal(requestBody?.returnUrl, 'http://127.0.0.1:5173/');
+      assert.equal(requestBody?.forceConsent, false);
+      assert.equal(requestBody?.switchAccount, false);
+      assert.ok(browser.storage.getItem(PENDING_EXCHANGE_STORAGE_KEY));
+      void pendingNavigation;
+    },
+  );
+});
+
+test('OAuth navigation accepts only the Google endpoint or the exact loopback broker origin', () => {
+  const googleUrl = 'https://accounts.google.com/o/oauth2/v2/auth?client_id=synthetic';
+  assert.equal(
+    validateAuthorizationNavigationUrl(googleUrl, 'https://sync.example.test'),
+    googleUrl,
+  );
+  assert.equal(
+    validateAuthorizationNavigationUrl(
+      'http://127.0.0.1:5191/mock-google',
+      'http://127.0.0.1:5191',
+    ),
+    'http://127.0.0.1:5191/mock-google',
+  );
+  for (const invalidUrl of [
+    'https://example.test/oauth',
+    'https://user:pass@accounts.google.com/o/oauth2/v2/auth',
+    'https://accounts.google.com/o/oauth2/v2/auth#unexpected',
+    'http://127.0.0.1:5192/mock-google',
+    '/relative-oauth',
+  ]) {
+    assert.throws(
+      () =>
+        validateAuthorizationNavigationUrl(
+          invalidUrl,
+          invalidUrl.startsWith('http://127.0.0.1')
+            ? 'http://127.0.0.1:5191'
+            : 'https://sync.example.test',
+        ),
+      (error: unknown) =>
+        error instanceof GoogleAuthorizationStartError &&
+        error.reason === 'response-invalid',
+    );
+  }
+});
+
+test('an untrusted broker authorization URL is rejected before exchange state or navigation', async () => {
+  await withMockOAuthBrowser(
+    {
+      fragment: '',
+      fetcher: (async () =>
+        Response.json({
+          authorizationUrl: 'https://example.test/not-google',
+        })) as typeof fetch,
+    },
+    async (browser) => {
+      const identity = new PersistentGoogleAuthSession();
+      identity.configure('https://sync.example.test', 'device-untrusted-redirect');
+
+      await assert.rejects(
+        () => identity.beginAuthorization(),
+        (error: unknown) =>
+          error instanceof GoogleAuthorizationStartError &&
+          error.reason === 'response-invalid',
+      );
+      assert.equal(browser.storage.getItem(PENDING_EXCHANGE_STORAGE_KEY), null);
+      assert.deepEqual(browser.assignedUrls, []);
+      assert.equal(browser.popupCalls, 0);
+    },
+  );
+});
+
+test('OAuth navigation runs the temporary-workspace handoff hook before leaving the app', async () => {
+  const authorizationUrl =
+    'https://accounts.google.com/o/oauth2/v2/auth?client_id=synthetic';
+  const events: string[] = [];
+  await withMockOAuthBrowser(
+    {
+      fragment: '',
+      fetcher: (async () => {
+        events.push('authorization-url');
+        return Response.json({ authorizationUrl });
+      }) as typeof fetch,
+    },
+    async (browser) => {
+      const identity = new PersistentGoogleAuthSession();
+      identity.configure(
+        'https://sync.example.test',
+        'device-temporary-navigation',
+        undefined,
+        'temporary',
+      );
+
+      const pendingNavigation = identity.beginAuthorization({
+        beforeNavigation() {
+          assert.ok(browser.storage.getItem(PENDING_EXCHANGE_STORAGE_KEY));
+          assert.deepEqual(browser.assignedUrls, []);
+          events.push('workspace-handoff');
+        },
+      });
+      assert.equal(await browser.navigationStarted, authorizationUrl);
+      events.push('navigation');
+      assert.deepEqual(events, [
+        'authorization-url',
+        'workspace-handoff',
+        'navigation',
+      ]);
+      void pendingNavigation;
+    },
+  );
+});
+
+test('a failed temporary-workspace handoff clears exchange state and prevents OAuth navigation', async () => {
+  await withMockOAuthBrowser(
+    {
+      fragment: '',
+      fetcher: (async () =>
+        Response.json({
+          authorizationUrl:
+            'https://accounts.google.com/o/oauth2/v2/auth?client_id=synthetic',
+        })) as typeof fetch,
+    },
+    async (browser) => {
+      const identity = new PersistentGoogleAuthSession();
+      identity.configure(
+        'https://sync.example.test',
+        'device-failed-handoff',
+        undefined,
+        'temporary',
+      );
+      await assert.rejects(
+        () =>
+          identity.beginAuthorization({
+            beforeNavigation() {
+              throw new Error('Synthetic workspace ownership failure.');
+            },
+          }),
+        (error: unknown) =>
+          error instanceof GoogleAuthorizationStartError &&
+          error.reason === 'navigation-failed',
+      );
+      assert.equal(browser.storage.getItem(PENDING_EXCHANGE_STORAGE_KEY), null);
+      assert.deepEqual(browser.assignedUrls, []);
+    },
+  );
+});
+
+test('a failed same-tab navigation rolls back the temporary OAuth handoff', async () => {
+  let rollbackCalls = 0;
+  await withMockOAuthBrowser(
+    {
+      fragment: '',
+      navigationError: new Error('Synthetic navigation failure'),
+      fetcher: (async () =>
+        Response.json({
+          authorizationUrl:
+            'https://accounts.google.com/o/oauth2/v2/auth?client_id=synthetic',
+        })) as typeof fetch,
+    },
+    async (browser) => {
+      const identity = new PersistentGoogleAuthSession();
+      identity.configure(
+        'https://sync.example.test',
+        'device-failed-navigation',
+        undefined,
+        'temporary',
+      );
+      await assert.rejects(
+        () =>
+          identity.beginAuthorization({
+            beforeNavigation() {
+              assert.ok(browser.storage.getItem(PENDING_EXCHANGE_STORAGE_KEY));
+            },
+            onNavigationFailure() {
+              rollbackCalls += 1;
+            },
+          }),
+        (error: unknown) =>
+          error instanceof GoogleAuthorizationStartError &&
+          error.reason === 'navigation-failed',
+      );
+      assert.equal(rollbackCalls, 1);
+      assert.equal(browser.storage.getItem(PENDING_EXCHANGE_STORAGE_KEY), null);
+      assert.deepEqual(browser.assignedUrls, []);
+    },
+  );
+});
+
+test('a rejected port-5174 pre-authorization request leaves no pending exchange or stuck navigation', async () => {
+  await withMockOAuthBrowser(
+    {
+      fragment: '',
+      origin: 'http://127.0.0.1:5174',
+      fetcher: (async (_input, init) => {
+        const body = JSON.parse(String(init?.body)) as { returnUrl?: unknown };
+        assert.equal(body.returnUrl, 'http://127.0.0.1:5174/');
+        return Response.json({ error: 'origin_not_allowed' }, { status: 403 });
+      }) as typeof fetch,
+    },
+    async (browser) => {
+      const identity = new PersistentGoogleAuthSession();
+      identity.configure('https://sync.example.test', 'device-origin-rejected');
+
+      await assert.rejects(
+        () => identity.beginAuthorization(),
+        SyncOriginNotAllowedError,
+      );
+      assert.equal(browser.storage.getItem(PENDING_EXCHANGE_STORAGE_KEY), null);
+      assert.deepEqual(browser.assignedUrls, []);
+      assert.equal(browser.popupCalls, 0);
+    },
+  );
+});
+
+test('a pre-authorization network failure is recoverable and retains no callback secret state', async () => {
+  await withMockOAuthBrowser(
+    {
+      fragment: '',
+      fetcher: (async () => {
+        throw new TypeError('Synthetic disconnected request');
+      }) as typeof fetch,
+    },
+    async (browser) => {
+      const identity = new PersistentGoogleAuthSession();
+      identity.configure('https://sync.example.test', 'device-oauth-network');
+
+      await assert.rejects(
+        () => identity.beginAuthorization(),
+        SyncBackendUnavailableError,
+      );
+      assert.equal(browser.storage.getItem(PENDING_EXCHANGE_STORAGE_KEY), null);
+      assert.deepEqual(browser.assignedUrls, []);
+    },
+  );
+});
+
+test('a hung pre-authorization request times out deterministically and clears stale one-time state', async () => {
+  let fetchCalls = 0;
+  await withMockOAuthBrowser(
+    {
+      fragment: '',
+      pendingExchange: { stale: true },
+      fetcher: ((_input, init) => {
+        fetchCalls += 1;
+        return new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener(
+            'abort',
+            () => reject(new DOMException('Synthetic abort', 'AbortError')),
+            { once: true },
+          );
+        });
+      }) as typeof fetch,
+    },
+    async (browser) => {
+      const identity = new PersistentGoogleAuthSession();
+      identity.configure('https://sync.example.test', 'device-oauth-timeout');
+
+      await assert.rejects(
+        () => identity.beginAuthorization({ requestTimeoutMs: 1 }),
+        (error: unknown) =>
+          error instanceof GoogleAuthorizationStartError &&
+          error.reason === 'request-timed-out',
+      );
+      assert.equal(browser.storage.getItem(PENDING_EXCHANGE_STORAGE_KEY), null);
+      assert.deepEqual(browser.assignedUrls, []);
+
+      const lateGrant = 'g'.repeat(43);
+      const lateLocation = {
+        href: `http://127.0.0.1:5173/#sync_auth_grant=${lateGrant}`,
+        hash: `#sync_auth_grant=${lateGrant}`,
+      };
+      Object.assign(
+        (globalThis as { window: { location: object } }).window.location,
+        lateLocation,
+      );
+      await assert.rejects(
+        () => identity.completeAuthorizationIfPresent(),
+        GoogleReauthorizationRequiredError,
+      );
+      assert.equal(fetchCalls, 1);
+      assert.equal(identity.hasDeviceSession, false);
+    },
+  );
+});
+
+test('every broker request has a bounded transport and body deadline', async () => {
+  await withMockOAuthBrowser(
+    {
+      fragment: '',
+      fetcher: ((_input, init) =>
+        new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener('abort', () => reject(init.signal?.reason), {
+            once: true,
+          });
+        })) as typeof fetch,
+    },
+    async (browser) => {
+      const identity = new PersistentGoogleAuthSession({
+        brokerRequestTimeoutMs: 1,
+      });
+      identity.configure('https://sync.example.test', 'device-broker-timeout');
+
+      await assert.rejects(
+        () => identity.beginAuthorization({ requestTimeoutMs: 1_000 }),
+        SyncBackendUnavailableError,
+      );
+      assert.equal(browser.storage.getItem(PENDING_EXCHANGE_STORAGE_KEY), null);
+      assert.deepEqual(browser.assignedUrls, []);
+      assert.equal(identity.hasDeviceSession, false);
+    },
+  );
+});
+
 test('OAuth callback accepts the broker schema, retains the device session, and obtains an access token', async () => {
   const backendUrl = 'https://sync.example.test';
   const deviceId = 'device-oauth-success';
@@ -5197,6 +5636,212 @@ test('OAuth callback accepts the broker schema, retains the device session, and 
         { path: '/api/oauth/exchange', authorization: null },
         { path: '/api/google/access-token', authorization: `Bearer ${sessionToken}` },
       ]);
+    },
+  );
+});
+
+test('OAuth exchange cannot cross the device mode captured by its one-time authorization state', async () => {
+  const backendUrl = 'https://sync.example.test';
+  const deviceId = 'device-mode-bound-exchange';
+  const verifier = 'v'.repeat(43);
+  const grant = 'g'.repeat(43);
+  const sessionToken = 't'.repeat(43);
+  await withMockOAuthBrowser(
+    {
+      fragment: `#sync_auth_grant=${grant}`,
+      pendingExchange: {
+        backendUrl,
+        deviceId,
+        verifier,
+        createdAt: Date.now(),
+        sessionMode: 'personal',
+      },
+      fetcher: (async (input) => {
+        assert.equal(new URL(String(input)).pathname, '/api/oauth/exchange');
+        return Response.json({
+          sessionToken,
+          session: {
+            id: 'synthetic-cross-mode-session',
+            deviceId,
+            createdAt: 1_000,
+            lastUsedAt: 1_000,
+            current: true,
+            sessionMode: 'temporary',
+            expiresAt: Date.now() + 3_600_000,
+          },
+          sessionCount: 1,
+          accountId: 'opaque-account-a',
+          sessionMode: 'temporary',
+          expiresAt: Date.now() + 3_600_000,
+        });
+      }) as typeof fetch,
+    },
+    async ({ location, storage }) => {
+      const identity = new PersistentGoogleAuthSession();
+      identity.configure(backendUrl, deviceId, undefined, 'personal');
+
+      await assert.rejects(
+        () => identity.completeAuthorizationIfPresent(),
+        SyncBackendUnavailableError,
+      );
+      assert.equal(identity.hasDeviceSession, false);
+      assert.equal(identity.accountId, null);
+      assert.equal(identity.currentSessionMode, 'personal');
+      assert.equal(storage.getItem(PENDING_EXCHANGE_STORAGE_KEY), null);
+      assert.equal(storage.getItem(TEMPORARY_SESSION_STORAGE_KEY), null);
+      assert.equal(location.hash, '');
+    },
+  );
+});
+
+test('an OAuth callback for another selected device mode is rejected before exchange or session persistence', async () => {
+  const backendUrl = 'https://sync.example.test';
+  const deviceId = 'device-stale-mode-callback';
+  let exchangeCalls = 0;
+  await withMockOAuthBrowser(
+    {
+      fragment: `#sync_auth_grant=${'g'.repeat(43)}`,
+      pendingExchange: {
+        backendUrl,
+        deviceId,
+        verifier: 'v'.repeat(43),
+        createdAt: Date.now(),
+        sessionMode: 'temporary',
+      },
+      fetcher: (async () => {
+        exchangeCalls += 1;
+        throw new Error('A stale callback must not reach the broker.');
+      }) as typeof fetch,
+    },
+    async ({ location, storage }) => {
+      const identity = new PersistentGoogleAuthSession();
+      identity.configure(backendUrl, deviceId, undefined, 'personal');
+
+      await assert.rejects(
+        () => identity.completeAuthorizationIfPresent(),
+        GoogleReauthorizationRequiredError,
+      );
+      assert.equal(exchangeCalls, 0);
+      assert.equal(identity.hasDeviceSession, false);
+      assert.equal(identity.accountId, null);
+      assert.equal(storage.getItem(PENDING_EXCHANGE_STORAGE_KEY), null);
+      assert.equal(storage.getItem(TEMPORARY_SESSION_STORAGE_KEY), null);
+      assert.equal(location.hash, '');
+    },
+  );
+});
+
+test('temporary-device OAuth keeps its session scoped to the browser session', async () => {
+  const backendUrl = 'https://sync.example.test';
+  const deviceId = 'device-oauth-temporary';
+  const workspaceId = '00000000-0000-4000-8000-0000000000a1';
+  const verifier = 'v'.repeat(43);
+  const grant = 'g'.repeat(43);
+  const sessionToken = 't'.repeat(43);
+  await withMockOAuthBrowser(
+    {
+      fragment: `#sync_auth_grant=${grant}`,
+      initialStorage: {
+        [ACTIVE_TEMPORARY_WORKSPACE_KEY]: JSON.stringify({
+          version: 1,
+          id: workspaceId,
+        }),
+        [temporaryPendingExchangeStorageKey(workspaceId)]: JSON.stringify({
+          backendUrl,
+          deviceId,
+          verifier,
+          createdAt: Date.now(),
+          sessionMode: 'temporary',
+        }),
+      },
+      fetcher: (async (input) => {
+        assert.equal(new URL(String(input)).pathname, '/api/oauth/exchange');
+        return Response.json({
+          sessionToken,
+          session: {
+            id: 'temporary-session-summary-id',
+            deviceId,
+            createdAt: 1_000,
+            lastUsedAt: 1_000,
+            current: true,
+            sessionMode: 'temporary',
+            expiresAt: Date.now() + 3_600_000,
+          },
+          sessionCount: 1,
+          accountId: 'opaque-temporary-account-id',
+          sessionMode: 'temporary',
+          expiresAt: Date.now() + 3_600_000,
+        });
+      }) as typeof fetch,
+    },
+    async ({ storage }) => {
+      const identity = new PersistentGoogleAuthSession();
+      identity.configure(backendUrl, deviceId, undefined, 'temporary');
+
+      const exchange = await identity.completeAuthorizationIfPresent();
+      assert.ok(exchange);
+      assert.equal(identity.hasDeviceSession, true);
+      assert.equal(identity.currentSessionMode, 'temporary');
+      assert.equal(identity.persistedSessionToken, null);
+      assert.equal(storage.getItem(PENDING_EXCHANGE_STORAGE_KEY), null);
+      assert.equal(
+        storage.getItem(temporaryPendingExchangeStorageKey(workspaceId)),
+        null,
+      );
+
+      const sessionRecord = JSON.parse(
+        storage.getItem(temporarySessionStorageKey(workspaceId)) ?? 'null',
+      ) as { sessionToken?: unknown; accountId?: unknown } | null;
+      assert.equal(sessionRecord?.sessionToken, sessionToken);
+      assert.equal(sessionRecord?.accountId, 'opaque-temporary-account-id');
+      assert.equal(storage.getItem(TEMPORARY_SESSION_STORAGE_KEY), null);
+
+      const reloaded = new PersistentGoogleAuthSession();
+      reloaded.configure(backendUrl, deviceId, undefined, 'temporary');
+      assert.equal(reloaded.hasDeviceSession, true);
+      assert.equal(reloaded.persistedSessionToken, null);
+      assert.equal(reloaded.accountId, 'opaque-temporary-account-id');
+    },
+  );
+});
+
+test('temporary OAuth sessions are not reused across workspace UUIDs or from the legacy unscoped key', async () => {
+  const workspaceA = '00000000-0000-4000-8000-0000000000a1';
+  const workspaceB = '00000000-0000-4000-8000-0000000000b2';
+  const temporarySession = JSON.stringify({
+    version: 1,
+    sessionToken: 't'.repeat(43),
+    accountId: 'opaque-account-a',
+    expiresAt: Date.now() + 3_600_000,
+  });
+  await withMockOAuthBrowser(
+    {
+      fragment: '',
+      initialStorage: {
+        [ACTIVE_TEMPORARY_WORKSPACE_KEY]: JSON.stringify({
+          version: 1,
+          id: workspaceB,
+        }),
+        [temporarySessionStorageKey(workspaceA)]: temporarySession,
+        [TEMPORARY_SESSION_STORAGE_KEY]: temporarySession,
+      },
+      fetcher: (async () => {
+        throw new Error('No broker request is expected while configuring identity.');
+      }) as typeof fetch,
+    },
+    async ({ storage }) => {
+      const identity = new PersistentGoogleAuthSession();
+      identity.configure(
+        'https://sync.example.test',
+        'device-workspace-b',
+        undefined,
+        'temporary',
+      );
+      assert.equal(identity.hasDeviceSession, false);
+      assert.equal(identity.accountId, null);
+      assert.ok(storage.getItem(temporarySessionStorageKey(workspaceA)));
+      assert.ok(storage.getItem(TEMPORARY_SESSION_STORAGE_KEY));
+      assert.equal(storage.getItem(temporarySessionStorageKey(workspaceB)), null);
     },
   );
 });
@@ -5980,6 +6625,32 @@ test('Drive telemetry allowlists fields and redacts hostile diagnostic labels', 
   }
 });
 
+test('Drive requests preserve a coordinator abort reason instead of relabeling it', async () => {
+  const previousFetch = globalThis.fetch;
+  globalThis.fetch = ((_input, init) => {
+    if (init?.signal?.aborted) {
+      return Promise.reject(init.signal.reason);
+    }
+    return new Promise<Response>((_resolve, reject) => {
+      init?.signal?.addEventListener(
+        'abort',
+        () => reject(new DOMException('Synthetic transport abort', 'AbortError')),
+        { once: true },
+      );
+    });
+  }) as typeof fetch;
+  try {
+    const client = new DriveClient(() => 'redacted-token');
+    const controller = new AbortController();
+    const reason = new Error('synthetic operation safety deadline');
+    const request = client.getMetadata('synthetic-file', controller.signal);
+    controller.abort(reason);
+    await assert.rejects(request, (error: unknown) => error === reason);
+  } finally {
+    globalThis.fetch = previousFetch;
+  }
+});
+
 test('retained operation diagnostics bound large transition traces while preserving both edges', () => {
   const client = new DriveClient(() => 'not-transmitted');
   const operationId = client.beginOperationTelemetry('scan');
@@ -6008,6 +6679,10 @@ test('Drive telemetry preserves causal waves while an unrelated sibling remains 
     const id = new URL(String(input)).pathname.split('/').at(-1)!;
     return new Promise<Response>((resolve) => pending.set(id, resolve));
   }) as typeof fetch;
+  const requestActivity: Array<{
+    pendingRequestCount: number;
+    completedRequestCount: number;
+  }> = [];
   const waitForRequest = async (id: string) => {
     for (let attempt = 0; attempt < 20 && !pending.has(id); attempt += 1) {
       await Promise.resolve();
@@ -6027,7 +6702,9 @@ test('Drive telemetry preserves causal waves while an unrelated sibling remains 
   };
 
   try {
-    const client = new DriveClient(() => 'redacted-token');
+    const client = new DriveClient(() => 'redacted-token', {
+      onRequestActivity: (activity) => requestActivity.push({ ...activity }),
+    });
     const signal = new AbortController().signal;
     const operationId = client.beginOperationTelemetry('download');
     const first = client.getMetadata('first', signal, { phase: 'first' });
@@ -6035,6 +6712,10 @@ test('Drive telemetry preserves causal waves while an unrelated sibling remains 
       phase: 'slow-sibling',
     });
     await Promise.all([waitForRequest('first'), waitForRequest('slow-sibling')]);
+    assert.deepEqual(requestActivity.at(-1), {
+      pendingRequestCount: 2,
+      completedRequestCount: 0,
+    });
     resolveMetadata('first');
     await first;
 
@@ -6049,6 +6730,10 @@ test('Drive telemetry preserves causal waves while an unrelated sibling remains 
     await third;
     resolveMetadata('slow-sibling');
     await slowSibling;
+    assert.deepEqual(requestActivity.at(-1), {
+      pendingRequestCount: 0,
+      completedRequestCount: 4,
+    });
 
     const snapshot = client.finishOperationTelemetry(operationId);
     assert.ok(snapshot);
@@ -6481,8 +7166,12 @@ test('sync implementation is lazy, uses existing validators, and keeps only a on
     identity,
     /localStorage|\brefresh_token\s*[:=]|client_secret|gsi\/client|initTokenClient/,
   );
-  assert.match(identity, /sessionStorage\.setItem\(EXCHANGE_STORAGE_KEY/);
-  assert.match(identity, /sessionStorage\.removeItem\(EXCHANGE_STORAGE_KEY/);
+  assert.match(identity, /sessionStorage\.setItem\(exchangeStorageKey/);
+  assert.match(identity, /sessionStorage\.removeItem\(exchangeStorageKey/);
+  assert.match(
+    identity,
+    /this\.sessionMode === 'temporary'[\s\S]*scopedLocalStorageKey\(EXCHANGE_STORAGE_KEY\)/u,
+  );
   assert.doesNotMatch(identity, /GoogleOAuthRealm|\/api\/v3\//u);
 });
 

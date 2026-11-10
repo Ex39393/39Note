@@ -17,6 +17,7 @@ import {
 import pdfWorker from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
 import { useElementSize } from '../hooks/useElementSize';
 import { useReaderOcclusionInsets } from '../hooks/useReaderOcclusionInsets';
+import { usePdfOcr } from '../hooks/usePdfOcr';
 import { usePdfSearch } from '../hooks/usePdfSearch';
 import { usePdfTextSelection } from '../hooks/usePdfTextSelection';
 import type {
@@ -30,6 +31,8 @@ import type { ReadingPosition } from '../types/library';
 import type { PdfTextSelection } from '../types/textSelection';
 import type { Note } from '../types/note';
 import type { NoteAnchor } from '../types/noteAnchor';
+import type { DocumentLink } from '../types/documentLink';
+import type { ReaderAnnotationPalettes } from '../utils/readerPreferences.ts';
 import {
   isPdfGlossaryEntry,
   type DefinitionBubble,
@@ -51,7 +54,7 @@ import { PdfSearchBar, type PdfSearchPanelPosition } from './pdf/PdfSearchBar';
 import type { AnnotationFilterState } from './pdf/AnnotationFilterControl';
 import { matchesAnnotationFilter } from '../utils/annotationFilter';
 import { logNavigationDiagnostic } from '../utils/navigationDiagnostics';
-import { SelectionAction } from './pdf/SelectionAction';
+import { SelectionAction, type SelectionActionMode } from './pdf/SelectionAction';
 import { AnnotationTag } from './pdf/AnnotationTag';
 import type { NoteDragStartHandler } from './NoteDragHandle';
 import {
@@ -61,8 +64,12 @@ import {
 } from '../utils/dictionary';
 import { normalizeSelectionRectangles } from '../utils/highlights';
 import { isSameLogicalPdfSource } from '../utils/pdfSourceGeometry';
-import { markDefinitionBubbleAdded } from '../utils/glossary';
+import {
+  findMatchingPdfGlossaryEntry,
+  markDefinitionBubbleAdded,
+} from '../utils/glossary';
 import { deriveAnnotationTags } from '../utils/annotationTags';
+import { FeedbackNotice } from './FeedbackNotice.tsx';
 import {
   createReaderContextCandidates,
   getReaderContextCandidateKey,
@@ -73,6 +80,20 @@ import {
   isSimpleAnnotationTap,
   type AnnotationPointerStart,
 } from '../utils/annotationInteraction';
+import {
+  connectableDocumentLinks,
+  otherDocumentLinkEndpoint,
+} from '../utils/documentLinks';
+import {
+  formatDocumentLinkSnippet,
+  getDocumentLinkDisplayName,
+  type DocumentLinkEndpointReference,
+} from '../utils/documentLinkPresentation';
+import { EmptyReaderAmbient } from './EmptyReaderAmbient';
+import {
+  resolveSeaPdfDocumentPresentations,
+  type SeaPdfPresentationDecision,
+} from '../utils/seaPdfPresentation';
 
 GlobalWorkerOptions.workerSrc = pdfWorker;
 
@@ -83,6 +104,7 @@ interface ViewerProps {
   fitMode: FitMode;
   zoom: number;
   onOpenFile: (file: File) => void;
+  onOpenLibrary: () => void;
   onPageCountChange: (pageCount: number) => void;
   onCurrentPageChange: (pageNumber: number) => void;
   onEffectiveZoomChange: (zoom: number) => void;
@@ -90,6 +112,7 @@ interface ViewerProps {
   documentId: string | null;
   onTextSelectionChange?: (selection: PdfTextSelection[]) => void;
   annotations: PdfAnnotation[];
+  documentLinks: DocumentLink[];
   noteAnchors: NoteAnchor[];
   notes: Note[];
   glossaryEntries: GlossaryEntry[];
@@ -101,9 +124,16 @@ interface ViewerProps {
   onRemoveGlossaryEntry: (glossaryEntryId: string) => boolean;
   onCreateHighlights: (selections: PdfTextSelection[], color: HighlightColor) => void;
   onCreateUnderlines: (selections: PdfTextSelection[], color: UnderlineColor) => void;
+  onCreateLink: (selection: PdfTextSelection) => boolean;
+  onConnectLink: (linkId: string, selection: PdfTextSelection) => boolean;
+  onCreateLinkFromAnnotation: (annotationId: string) => boolean;
+  onConnectLinkFromAnnotation: (annotationId: string, linkId: string) => boolean;
+  onDeleteLink: (linkId: string) => void;
+  onRenameLink: (linkId: string, requestedName: string) => boolean;
   notedAnnotationIds: string[];
   onAddNoteToAnnotation: (annotationId: string) => void;
   onUpdateNote: (noteId: string, content: string) => void;
+  onCommitNoteEdit: (noteId: string) => void;
   onDeleteNote: (noteId: string) => void;
   onBeginNoteDrag: NoteDragStartHandler;
   onOpenLargeEditor: (note: Note) => void;
@@ -113,6 +143,12 @@ interface ViewerProps {
     type: AnnotationType,
     color: HighlightColor | UnderlineColor,
   ) => void;
+  annotationPalettes: ReaderAnnotationPalettes;
+  onAddCustomAnnotationColor: (
+    type: AnnotationType,
+    color: string,
+  ) => HighlightColor | UnderlineColor | null;
+  onResetAnnotationPalette: (type: AnnotationType) => void;
   zoomOperationId: number;
   onFitWidthLayoutChange: () => void;
   onSearchStateChange?: (state: PdfSearchToolbarState) => void;
@@ -120,8 +156,8 @@ interface ViewerProps {
   onPdfDocumentChange?: (document: PDFDocumentProxy | null) => void;
   onExplicitNavigation?: () => void;
   onAnnotationNavigationApplied?: (annotationId: string) => void;
+  isInteractionDisabled?: boolean;
 }
-
 export interface PdfSearchToolbarState {
   isOpen: boolean;
   isIndexing: boolean;
@@ -138,6 +174,7 @@ export interface ViewerHandle {
     options?: { showSourceActions?: boolean },
   ) => boolean;
   navigateToGlossaryEntry: (glossaryEntryId: string) => boolean;
+  navigateToLinkEndpoint: (linkId: string, endpointId: string) => boolean;
   goToPage: (pageNumber: number) => void;
   openSearch: () => void;
   closeSearch: () => void;
@@ -167,6 +204,7 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(function Viewer(
     fitMode,
     zoom,
     onOpenFile,
+    onOpenLibrary,
     onPageCountChange,
     onCurrentPageChange,
     onEffectiveZoomChange,
@@ -174,6 +212,7 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(function Viewer(
     documentId,
     onTextSelectionChange,
     annotations,
+    documentLinks,
     noteAnchors,
     notes,
     glossaryEntries,
@@ -182,14 +221,24 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(function Viewer(
     onRemoveGlossaryEntry,
     onCreateHighlights,
     onCreateUnderlines,
+    onCreateLink,
+    onConnectLink,
+    onCreateLinkFromAnnotation,
+    onConnectLinkFromAnnotation,
+    onDeleteLink,
+    onRenameLink,
     notedAnnotationIds,
     onAddNoteToAnnotation,
     onUpdateNote,
+    onCommitNoteEdit,
     onDeleteNote,
     onBeginNoteDrag,
     onOpenLargeEditor,
     onDeleteAnnotation,
     onCreateAnnotationFromSource,
+    annotationPalettes,
+    onAddCustomAnnotationColor,
+    onResetAnnotationPalette,
     zoomOperationId,
     onFitWidthLayoutChange,
     onSearchStateChange,
@@ -197,10 +246,15 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(function Viewer(
     onPdfDocumentChange,
     onExplicitNavigation,
     onAnnotationNavigationApplied,
+    isInteractionDisabled = false,
   },
   ref,
 ) {
   const [document, setDocument] = useState<PDFDocumentProxy | null>(null);
+  const [seaPageDecisionState, setSeaPageDecisionState] = useState<{
+    document: PDFDocumentProxy | null;
+    decisions: Record<number, SeaPdfPresentationDecision>;
+  }>({ document: null, decisions: {} });
   const [error, setError] = useState<PdfOpenFailurePresentation | null>(null);
   const [isDragging, setIsDragging] = useState(false);
   const [scrollElement, setScrollElement] = useState<HTMLDivElement | null>(null);
@@ -217,7 +271,12 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(function Viewer(
   const highlightIndicatorTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(
     null,
   );
+  const linkNavigationArrivalCleanupRef = useRef<(() => void) | null>(null);
   const pendingAnnotationNavigationRef = useRef<string | null>(null);
+  const pendingLinkNavigationRef = useRef<{
+    linkId: string;
+    endpointId: string;
+  } | null>(null);
   const pendingSourceActionRef = useRef<{
     annotationId: string;
     documentId: string;
@@ -244,18 +303,52 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(function Viewer(
     activeCandidateKey: string;
     position: { left: number; top: number };
   } | null>(null);
-  const [annotationType, setAnnotationType] = useState<AnnotationType | null>(null);
+  const [annotationType, setAnnotationType] = useState<SelectionActionMode | null>(
+    null,
+  );
   const [highlightColor, setHighlightColor] = useState<HighlightColor>('yellow');
   const [underlineColor, setUnderlineColor] = useState<UnderlineColor>('blue');
   const [activeAnnotationId, setActiveAnnotationId] = useState<string | null>(null);
   const [activeGlossaryEntryId, setActiveGlossaryEntryId] = useState<string | null>(
     null,
   );
+  const [activeLinkEndpointId, setActiveLinkEndpointId] = useState<string | null>(null);
   const [definitionBubbles, setDefinitionBubbles] = useState<DefinitionBubble[]>([]);
   const dictionaryGenerationRef = useRef(0);
   const dictionaryLookupsRef = useRef(new Map<string, AbortController>());
   const [activePageNumber, setActivePageNumber] = useState(1);
-  const search = usePdfSearch(document);
+  const resolvedSeaPageDecisions = useMemo(
+    () =>
+      resolveSeaPdfDocumentPresentations(
+        seaPageDecisionState.document === document
+          ? seaPageDecisionState.decisions
+          : {},
+        document?.numPages,
+      ),
+    [document, seaPageDecisionState],
+  );
+  const reportSeaPaperDecision = useCallback(
+    (pageNumber: number, decision: SeaPdfPresentationDecision) => {
+      if (!document) return;
+      setSeaPageDecisionState((current) => {
+        const decisions = current.document === document ? current.decisions : {};
+        const previous = decisions[pageNumber];
+        if (
+          previous?.presentation === decision.presentation &&
+          previous.reason === decision.reason
+        ) {
+          return current;
+        }
+        return {
+          document,
+          decisions: { ...decisions, [pageNumber]: decision },
+        };
+      });
+    },
+    [document],
+  );
+  const ocr = usePdfOcr(document);
+  const search = usePdfSearch(document, ocr.searchIndexes);
   const activeSearchResultId = search.activeResult?.id ?? null;
   const activeSearchResultPageNumber = search.activeResult?.pageNumber ?? null;
   const readerOcclusionInsets = useReaderOcclusionInsets(
@@ -274,11 +367,18 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(function Viewer(
     ? activeReaderContext.candidates.filter((candidate) =>
         candidate.kind === 'annotation'
           ? annotationTags.some((tag) => tag.annotation.id === candidate.annotationId)
-          : glossaryEntries.some(
-              (entry) =>
-                isPdfGlossaryEntry(entry) &&
-                entry.glossaryEntryId === candidate.glossaryEntryId,
-            ),
+          : candidate.kind === 'glossary'
+            ? glossaryEntries.some(
+                (entry) =>
+                  isPdfGlossaryEntry(entry) &&
+                  entry.glossaryEntryId === candidate.glossaryEntryId,
+              )
+            : documentLinks.some(
+                (link) =>
+                  link.id === candidate.linkId &&
+                  (link.endpointA.id === candidate.endpointId ||
+                    link.endpointB?.id === candidate.endpointId),
+              ),
       )
     : [];
   const activeContextCandidate = activeReaderContext
@@ -302,6 +402,14 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(function Viewer(
             entry.glossaryEntryId === activeContextCandidate.glossaryEntryId,
         ) ?? null)
       : null;
+  const visibleLinkTarget: DocumentLinkEndpointReference | null =
+    activeContextCandidate?.kind === 'link'
+      ? resolveDocumentLinkEndpointReference(
+          documentLinks,
+          activeContextCandidate.linkId,
+          activeContextCandidate.endpointId,
+        )
+      : null;
   const setScrollContainer = useCallback((element: HTMLDivElement | null) => {
     scrollRef.current = element;
     setScrollElement(element);
@@ -315,11 +423,13 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(function Viewer(
     (
       sourceAnnotations: readonly PdfAnnotation[],
       sourceGlossaryEntries: readonly PdfGlossaryEntry[],
+      sourceLinkEndpoints: readonly DocumentLinkEndpointReference[],
       position: { left: number; top: number },
     ) => {
       const candidates = createReaderContextCandidates(
         sourceAnnotations,
         sourceGlossaryEntries,
+        sourceLinkEndpoints,
       );
       if (candidates.length === 0) {
         setActiveReaderContext(null);
@@ -446,6 +556,8 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(function Viewer(
       onExplicitNavigation?.();
 
       setActiveAnnotationId(annotationId);
+      setActiveGlossaryEntryId(null);
+      setActiveLinkEndpointId(null);
       if (highlightIndicatorTimeoutRef.current !== null) {
         clearTimeout(highlightIndicatorTimeoutRef.current);
       }
@@ -487,7 +599,7 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(function Viewer(
             setSelectionActionPosition(position);
             setAnnotationType(null);
           } else {
-            showReaderContext([annotation], [], position);
+            showReaderContext([annotation], [], [], position);
           }
         });
       }
@@ -542,6 +654,8 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(function Viewer(
       );
       onExplicitNavigation?.();
       setActiveGlossaryEntryId(glossaryEntryId);
+      setActiveAnnotationId(null);
+      setActiveLinkEndpointId(null);
       if (highlightIndicatorTimeoutRef.current !== null) {
         clearTimeout(highlightIndicatorTimeoutRef.current);
       }
@@ -552,6 +666,97 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(function Viewer(
       return true;
     },
     [glossaryEntries, onExplicitNavigation],
+  );
+
+  const applyDocumentLinkEndpointNavigation = useCallback(
+    (linkId: string, endpointId: string) => {
+      const target = resolveDocumentLinkEndpointReference(
+        documentLinks,
+        linkId,
+        endpointId,
+      );
+      if (!target) return false;
+      const scroller = scrollRef.current;
+      const page = scroller?.querySelector<HTMLElement>(
+        `#page-${target.endpoint.anchor.pageNumber}`,
+      );
+      const rectangle = target.endpoint.anchor.rects.find(
+        (candidate) => candidate.width > 0 && candidate.height > 0,
+      );
+      if (!scroller || !page || !rectangle || page.clientHeight === 0) return false;
+
+      const scrollerRectangle = scroller.getBoundingClientRect();
+      const pageRectangle = page.getBoundingClientRect();
+      const anchorY =
+        pageRectangle.top + (rectangle.y + rectangle.height / 2) * pageRectangle.height;
+      const preferredY = scrollerRectangle.top + scroller.clientHeight * 0.4;
+      const targetScrollTop = clamp(
+        scroller.scrollTop + anchorY - preferredY,
+        0,
+        Math.max(0, scroller.scrollHeight - scroller.clientHeight),
+      );
+      const shouldAnimate =
+        Math.abs(targetScrollTop - scroller.scrollTop) > 1 &&
+        !window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+      navigationEpochRef.current += 1;
+      const appliedNavigationEpoch = navigationEpochRef.current;
+      onExplicitNavigation?.();
+      setActiveAnnotationId(null);
+      setActiveGlossaryEntryId(null);
+      setActiveLinkEndpointId(null);
+      pendingLinkNavigationRef.current = null;
+
+      linkNavigationArrivalCleanupRef.current?.();
+      linkNavigationArrivalCleanupRef.current = null;
+      const showArrival = () => {
+        if (navigationEpochRef.current !== appliedNavigationEpoch) return;
+        setActiveLinkEndpointId(endpointId);
+        if (highlightIndicatorTimeoutRef.current !== null) {
+          clearTimeout(highlightIndicatorTimeoutRef.current);
+        }
+        highlightIndicatorTimeoutRef.current = setTimeout(() => {
+          setActiveLinkEndpointId(null);
+          highlightIndicatorTimeoutRef.current = null;
+        }, 1200);
+      };
+
+      if (shouldAnimate) {
+        let settled = false;
+        const finishNavigation = () => {
+          if (settled) return;
+          settled = true;
+          scroller.removeEventListener('scrollend', finishNavigation);
+          window.clearTimeout(fallbackTimeout);
+          if (linkNavigationArrivalCleanupRef.current === cleanup) {
+            linkNavigationArrivalCleanupRef.current = null;
+          }
+          showArrival();
+        };
+        const cleanup = () => {
+          settled = true;
+          scroller.removeEventListener('scrollend', finishNavigation);
+          window.clearTimeout(fallbackTimeout);
+        };
+        const fallbackTimeout = window.setTimeout(finishNavigation, 700);
+        linkNavigationArrivalCleanupRef.current = cleanup;
+        scroller.addEventListener('scrollend', finishNavigation, { once: true });
+        scroller.scrollTo({ top: targetScrollTop, behavior: 'smooth' });
+      } else {
+        scroller.scrollTo({ top: targetScrollTop, behavior: 'auto' });
+        showArrival();
+      }
+      return true;
+    },
+    [documentLinks, onExplicitNavigation],
+  );
+
+  const navigateToLinkEndpoint = useCallback(
+    (linkId: string, endpointId: string) => {
+      pendingLinkNavigationRef.current = { linkId, endpointId };
+      setActiveReaderContext(null);
+      return applyDocumentLinkEndpointNavigation(linkId, endpointId);
+    },
+    [applyDocumentLinkEndpointNavigation],
   );
 
   const goToPage = useCallback(
@@ -747,6 +952,7 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(function Viewer(
       captureZoomAnchor,
       navigateToAnnotation,
       navigateToGlossaryEntry,
+      navigateToLinkEndpoint,
       goToPage,
       openSearch: search.open,
       closeSearch: search.close,
@@ -763,6 +969,7 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(function Viewer(
       goToPage,
       navigateToAnnotation,
       navigateToGlossaryEntry,
+      navigateToLinkEndpoint,
       restoreReadingPosition,
       search.close,
       search.goToNextResult,
@@ -794,14 +1001,6 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(function Viewer(
       const generation = dictionaryGenerationRef.current;
       const controller = new AbortController();
       dictionaryLookupsRef.current.set(bubbleId, controller);
-      const existingGlossaryEntry = glossaryEntries.find(
-        (entry) =>
-          isPdfGlossaryEntry(entry) &&
-          entry.pageNumber === selection.pageNumber &&
-          entry.startOffset === selection.startOffset &&
-          entry.endOffset === selection.endOffset &&
-          rectanglesMatch(entry.sourceRects, rects),
-      );
       const bubble: DefinitionBubble = {
         id: bubbleId,
         documentId,
@@ -816,10 +1015,14 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(function Viewer(
         isExpanded: false,
         isEnriching: true,
         userHasReordered: false,
-        ...(existingGlossaryEntry
-          ? { glossaryEntryId: existingGlossaryEntry.glossaryEntryId }
-          : {}),
       };
+      const existingGlossaryEntry = findMatchingPdfGlossaryEntry(
+        bubble,
+        glossaryEntries,
+      );
+      if (existingGlossaryEntry) {
+        bubble.glossaryEntryId = existingGlossaryEntry.glossaryEntryId;
+      }
       setDefinitionBubbles((current) => {
         const index = current.findIndex((candidate) => candidate.id === bubbleId);
         return index === -1
@@ -994,12 +1197,20 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(function Viewer(
         .filter(isPdfGlossaryEntry)
         .map(({ glossaryEntryId }) => glossaryEntryId),
     );
+    const linkEndpointKeys = new Set(
+      documentLinks.flatMap((link) => [
+        `${link.id}:${link.endpointA.id}`,
+        ...(link.endpointB ? [`${link.id}:${link.endpointB.id}`] : []),
+      ]),
+    );
     setActiveReaderContext((current) => {
       if (!current) return current;
       const remaining = current.candidates.filter((candidate) =>
         candidate.kind === 'annotation'
           ? annotationIds.has(candidate.annotationId)
-          : glossaryEntryIds.has(candidate.glossaryEntryId),
+          : candidate.kind === 'glossary'
+            ? glossaryEntryIds.has(candidate.glossaryEntryId)
+            : linkEndpointKeys.has(`${candidate.linkId}:${candidate.endpointId}`),
       );
       if (remaining.length === 0) return null;
       const activeStillExists = remaining.some(
@@ -1026,22 +1237,21 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(function Viewer(
             ),
       };
     });
-  }, [annotations, glossaryEntries]);
+  }, [annotations, documentLinks, glossaryEntries]);
 
   useEffect(() => {
-    const glossaryEntryIds = new Set(
-      glossaryEntries.map(({ glossaryEntryId }) => glossaryEntryId),
-    );
     setDefinitionBubbles((current) => {
       let changed = false;
       const next = current.map((bubble) => {
-        if (!bubble.glossaryEntryId || glossaryEntryIds.has(bubble.glossaryEntryId)) {
+        const matchingEntry = findMatchingPdfGlossaryEntry(bubble, glossaryEntries);
+        const matchingId = matchingEntry?.glossaryEntryId;
+        if (bubble.glossaryEntryId === matchingId) {
           return bubble;
         }
         changed = true;
         return {
           ...bubble,
-          glossaryEntryId: undefined,
+          glossaryEntryId: matchingId,
           addedConfirmationToken: undefined,
         };
       });
@@ -1116,9 +1326,22 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(function Viewer(
       if (annotation?.pageNumber === pageNumber) {
         applyAnnotationNavigation(annotation.id);
       }
+      const pendingLink = pendingLinkNavigationRef.current;
+      const linkTarget = pendingLink
+        ? resolveDocumentLinkEndpointReference(
+            documentLinks,
+            pendingLink.linkId,
+            pendingLink.endpointId,
+          )
+        : null;
+      if (linkTarget?.endpoint.anchor.pageNumber === pageNumber) {
+        applyDocumentLinkEndpointNavigation(linkTarget.link.id, linkTarget.endpoint.id);
+      }
     },
     [
       annotations,
+      applyDocumentLinkEndpointNavigation,
+      documentLinks,
       noteAnchors,
       applyAnnotationNavigation,
       applyPendingReadingPosition,
@@ -1134,6 +1357,8 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(function Viewer(
       if (highlightIndicatorTimeoutRef.current !== null) {
         clearTimeout(highlightIndicatorTimeoutRef.current);
       }
+      linkNavigationArrivalCleanupRef.current?.();
+      linkNavigationArrivalCleanupRef.current = null;
       if (sourceActionFrameRef.current !== null) {
         cancelAnimationFrame(sourceActionFrameRef.current);
       }
@@ -1173,9 +1398,15 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(function Viewer(
   }, [activeReaderContext, document, search, selectionActionPosition]);
 
   useEffect(() => {
+    setSeaPageDecisionState({ document, decisions: {} });
+  }, [document]);
+
+  useEffect(() => {
     if (!file) {
       setDocument(null);
       pendingAnnotationNavigationRef.current = null;
+      pendingLinkNavigationRef.current = null;
+      setActiveLinkEndpointId(null);
       pendingSourceActionRef.current = null;
       setSourceActionTarget(null);
       setActiveReaderContext(null);
@@ -1268,6 +1499,8 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(function Viewer(
 
   useEffect(() => {
     setSearchPanelPosition(null);
+    pendingLinkNavigationRef.current = null;
+    setActiveLinkEndpointId(null);
     pendingSourceActionRef.current = null;
     setSourceActionTarget(null);
     setActiveReaderContext(null);
@@ -1383,7 +1616,7 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(function Viewer(
   };
 
   const createAnnotation = () => {
-    if (sourceActionTarget && annotationType) {
+    if (sourceActionTarget && annotationType && annotationType !== 'link') {
       onCreateAnnotationFromSource(
         sourceActionTarget,
         annotationType,
@@ -1403,6 +1636,52 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(function Viewer(
     setSelectionActionPosition(null);
   };
 
+  const finishLinkSelectionAction = () => {
+    window.getSelection()?.removeAllRanges();
+    textSelectionRef.current = [];
+    setAnnotationType(null);
+    setSelectionActionPosition(null);
+  };
+
+  const createLinkFromSelection = () => {
+    const selection = textSelectionRef.current[0];
+    if (!selection) return;
+    if (onCreateLink(selection)) finishLinkSelectionAction();
+  };
+
+  const connectLinkFromSelection = (linkId: string) => {
+    const selection = textSelectionRef.current[0];
+    if (!selection) return;
+    if (onConnectLink(linkId, selection)) finishLinkSelectionAction();
+  };
+
+  const activateLinkBadge = (
+    linkId: string,
+    endpointId: string,
+    point: { clientX: number; clientY: number },
+  ) => {
+    const link = documentLinks.find((candidate) => candidate.id === linkId);
+    if (!link) return;
+    const otherEndpoint = otherDocumentLinkEndpoint(link, endpointId);
+    if (otherEndpoint) {
+      navigateToLinkEndpoint(link.id, otherEndpoint.id);
+      return;
+    }
+    const target = resolveDocumentLinkEndpointReference(
+      documentLinks,
+      linkId,
+      endpointId,
+    );
+    if (target) {
+      showReaderContext(
+        [],
+        [],
+        [target],
+        getAnnotationTagPosition(point.clientX, point.clientY),
+      );
+    }
+  };
+
   const activateDictionaryLookup = () => {
     const selection = getDictionaryLookupSelection(textSelectionRef.current);
     if (!selection) return;
@@ -1414,8 +1693,10 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(function Viewer(
   if (!file) {
     return (
       <section
-        className={`viewer ${isDragging ? 'is-dragging' : ''}`}
+        className={`viewer is-empty ${isDragging ? 'is-dragging' : ''}`}
         aria-label="PDF viewer"
+        aria-hidden={isInteractionDisabled ? true : undefined}
+        inert={isInteractionDisabled ? true : undefined}
         onDragEnter={(event) => {
           event.preventDefault();
           setIsDragging(true);
@@ -1433,6 +1714,7 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(function Viewer(
         }}
       >
         <div className="viewer-panel">
+          <EmptyReaderAmbient />
           <span className="viewer-icon" aria-hidden="true">
             &#128196;
           </span>
@@ -1461,6 +1743,8 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(function Viewer(
       ref={setViewerShellElement}
       className="viewer is-document-loaded"
       aria-label="PDF viewer"
+      aria-hidden={isInteractionDisabled ? true : undefined}
+      inert={isInteractionDisabled ? true : undefined}
       onDragOver={(event) => event.preventDefault()}
       onDrop={(event) => {
         event.preventDefault();
@@ -1468,13 +1752,30 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(function Viewer(
       }}
     >
       {error ? (
-        <div className="viewer-error" role="alert">
-          <p>{error.message}</p>
-          {error.reloadRecommended ? (
-            <button type="button" onClick={() => window.location.reload()}>
-              Reload 39Note
-            </button>
-          ) : null}
+        <div className="viewer-error">
+          <FeedbackNotice
+            actions={
+              <>
+                {error.reloadRecommended ? (
+                  <button
+                    className="is-primary"
+                    type="button"
+                    onClick={() => window.location.reload()}
+                  >
+                    Reload 39Note
+                  </button>
+                ) : null}
+                <button type="button" onClick={onOpenLibrary}>
+                  Open Library
+                </button>
+              </>
+            }
+            className="viewer-error-notice"
+            description={error.message}
+            persistent
+            title={pdfOpenFailureTitle(error)}
+            tone="error"
+          />
         </div>
       ) : (
         <div
@@ -1500,6 +1801,7 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(function Viewer(
                   document={document}
                   fitMode={fitMode}
                   annotations={annotationsForPage(index + 1)}
+                  documentLinks={documentLinks}
                   noteAnchors={noteAnchors.filter(
                     (anchor) => anchor.pageNumber === index + 1,
                   )}
@@ -1511,6 +1813,7 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(function Viewer(
                   )}
                   activeAnnotationId={activeAnnotationId}
                   activeGlossaryEntryId={activeGlossaryEntryId}
+                  activeLinkEndpointId={activeLinkEndpointId}
                   key={index + 1}
                   onCurrentPageChange={() => undefined}
                   onScaleChange={(pageNumber, scale) => {
@@ -1528,18 +1831,34 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(function Viewer(
                   onToggleDefinitionsExpanded={toggleDefinitionsExpanded}
                   onPageLayoutChange={handlePageLayoutChange}
                   onTextLayerReady={handleTextLayerReady}
-                  onOpenReaderContext={(hitAnnotations, hitGlossaryEntries, point) =>
+                  ocrState={ocr.getPageState(index + 1)}
+                  documentOcrState={ocr.documentState}
+                  isOcrBusy={ocr.isBusy}
+                  onRecognizeText={(pageNumber) => ocr.recognizePage(pageNumber)}
+                  onCancelRecognition={ocr.cancelPage}
+                  onRecognizeDocument={ocr.recognizeDocument}
+                  onCancelDocumentRecognition={ocr.cancelDocument}
+                  onOpenReaderContext={(
+                    hitAnnotations,
+                    hitGlossaryEntries,
+                    hitLinkEndpoints,
+                    point,
+                  ) =>
                     showReaderContext(
                       hitAnnotations,
                       hitGlossaryEntries,
+                      hitLinkEndpoints,
                       getAnnotationTagPosition(point.clientX, point.clientY),
                     )
                   }
+                  onActivateLinkBadge={activateLinkBadge}
                   onDismissReaderContext={() => setActiveReaderContext(null)}
                   searchResults={search.results.filter(
                     (result) => result.pageNumber === index + 1,
                   )}
                   activeSearchResultId={search.activeResult?.id ?? null}
+                  seaDocumentDecision={resolvedSeaPageDecisions[index + 1]}
+                  onSeaPaperDecision={reportSeaPaperDecision}
                   pageNumber={index + 1}
                   scrollElement={scrollElement}
                   zoom={zoom}
@@ -1572,8 +1891,38 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(function Viewer(
               ? activateDictionaryLookup
               : undefined
           }
+          connectableLinks={
+            !sourceActionTarget && documentId
+              ? connectableDocumentLinks(documentLinks, documentId).map((link) => ({
+                  id: link.id,
+                  visibleNumber: link.visibleNumber,
+                  name: getDocumentLinkDisplayName(link),
+                  sourceSnippet: formatDocumentLinkSnippet(link.endpointA.anchor.quote),
+                }))
+              : []
+          }
+          onCreateLink={
+            !sourceActionTarget && documentId && textSelectionRef.current.length === 1
+              ? createLinkFromSelection
+              : undefined
+          }
+          onConnectLink={
+            !sourceActionTarget && documentId && textSelectionRef.current.length === 1
+              ? connectLinkFromSelection
+              : undefined
+          }
+          linkDisabledReason={
+            !sourceActionTarget && documentId && textSelectionRef.current.length > 1
+              ? 'Link endpoints must be selected on one PDF page.'
+              : undefined
+          }
           selectedColor={
             annotationType === 'highlight' ? highlightColor : underlineColor
+          }
+          colorPalette={
+            annotationType === 'underline'
+              ? annotationPalettes.underline
+              : annotationPalettes.highlight
           }
           onColorChange={(color) => {
             if (annotationType === 'highlight') {
@@ -1582,12 +1931,32 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(function Viewer(
               setUnderlineColor(color as UnderlineColor);
             }
           }}
+          onCustomColor={(color) => {
+            if (annotationType !== 'highlight' && annotationType !== 'underline')
+              return;
+            const selected = onAddCustomAnnotationColor(annotationType, color);
+            if (!selected) return;
+            if (annotationType === 'highlight') {
+              setHighlightColor(selected as HighlightColor);
+            } else {
+              setUnderlineColor(selected as UnderlineColor);
+            }
+          }}
+          onResetPalette={() => {
+            if (annotationType !== 'highlight' && annotationType !== 'underline')
+              return;
+            onResetAnnotationPalette(annotationType);
+            if (annotationType === 'highlight') setHighlightColor('yellow');
+            else setUnderlineColor('blue');
+          }}
         />
       ) : null}
-      {activeReaderContext && (visibleAnnotationTag || visibleGlossaryEntry) ? (
+      {activeReaderContext &&
+      (visibleAnnotationTag || visibleGlossaryEntry || visibleLinkTarget) ? (
         <AnnotationTag
           tag={visibleAnnotationTag}
           glossaryEntry={visibleGlossaryEntry}
+          linkTarget={visibleLinkTarget}
           draggedNoteId={draggedNoteId}
           candidates={activeContextCandidates}
           activeCandidateKey={activeReaderContext.activeCandidateKey}
@@ -1599,6 +1968,7 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(function Viewer(
           }
           onAddNote={onAddNoteToAnnotation}
           onUpdateNote={onUpdateNote}
+          onCommitNoteEdit={onCommitNoteEdit}
           onDeleteNote={onDeleteNote}
           onBeginNoteDrag={onBeginNoteDrag}
           onOpenLargeEditor={onOpenLargeEditor}
@@ -1619,6 +1989,40 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(function Viewer(
                 glossaryEntryId,
               }),
             );
+          }}
+          onNavigateLink={(linkId, endpointId) => {
+            const link = documentLinks.find((candidate) => candidate.id === linkId);
+            const otherEndpoint = link
+              ? otherDocumentLinkEndpoint(link, endpointId)
+              : null;
+            if (link && otherEndpoint) {
+              navigateToLinkEndpoint(link.id, otherEndpoint.id);
+            }
+          }}
+          onDeleteLink={(linkId, endpointId) => {
+            onDeleteLink(linkId);
+            removeCandidateFromReaderContext(
+              getReaderContextCandidateKey({ kind: 'link', linkId, endpointId }),
+            );
+          }}
+          onRenameLink={onRenameLink}
+          connectableLinks={
+            documentId
+              ? connectableDocumentLinks(documentLinks, documentId).map((link) => ({
+                  id: link.id,
+                  visibleNumber: link.visibleNumber,
+                  name: getDocumentLinkDisplayName(link),
+                  sourceSnippet: formatDocumentLinkSnippet(link.endpointA.anchor.quote),
+                }))
+              : []
+          }
+          onCreateLinkFromAnnotation={(annotationId) => {
+            if (onCreateLinkFromAnnotation(annotationId)) setActiveReaderContext(null);
+          }}
+          onConnectLinkFromAnnotation={(annotationId, linkId) => {
+            if (onConnectLinkFromAnnotation(annotationId, linkId)) {
+              setActiveReaderContext(null);
+            }
           }}
           onClose={() => setActiveReaderContext(null)}
         />
@@ -1650,8 +2054,37 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(function Viewer(
   );
 });
 
+function pdfOpenFailureTitle(error: PdfOpenFailurePresentation): string {
+  switch (error.kind) {
+    case 'runtime-version-mismatch':
+      return 'PDF reader update required';
+    case 'password-protected':
+      return 'Password-protected PDF';
+    case 'invalid-pdf':
+      return 'PDF unavailable';
+    case 'unknown':
+      return 'PDF could not be opened';
+  }
+}
+
 function isPdfFile(file: File): boolean {
   return file.type === 'application/pdf' || file.name.toLowerCase().endsWith('.pdf');
+}
+
+function resolveDocumentLinkEndpointReference(
+  links: readonly DocumentLink[],
+  linkId: string,
+  endpointId: string,
+): DocumentLinkEndpointReference | null {
+  const link = links.find((candidate) => candidate.id === linkId);
+  if (!link) return null;
+  if (link.endpointA.id === endpointId) {
+    return { link, endpoint: link.endpointA, endpointLabel: 'A' };
+  }
+  if (link.endpointB?.id === endpointId) {
+    return { link, endpoint: link.endpointB, endpointLabel: 'B' };
+  }
+  return null;
 }
 
 function isBlankReaderSurface(
@@ -1737,23 +2170,4 @@ function createDefinitionBubbleId(
         .join(','),
     )
     .join(';')}`;
-}
-
-function rectanglesMatch(
-  first: Array<{ x: number; y: number; width: number; height: number }>,
-  second: Array<{ x: number; y: number; width: number; height: number }>,
-): boolean {
-  return (
-    first.length === second.length &&
-    first.every((rectangle, index) => {
-      const candidate = second[index];
-      return (
-        candidate !== undefined &&
-        Math.abs(rectangle.x - candidate.x) < 0.0001 &&
-        Math.abs(rectangle.y - candidate.y) < 0.0001 &&
-        Math.abs(rectangle.width - candidate.width) < 0.0001 &&
-        Math.abs(rectangle.height - candidate.height) < 0.0001
-      );
-    })
-  );
 }

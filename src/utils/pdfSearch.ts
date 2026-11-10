@@ -77,7 +77,9 @@ export function findPdfSearchResults(
         pageNumber: page.pageNumber,
         matchIndexOnPage,
         matchedText: page.text.slice(matchStart, matchEnd),
-        contextBefore: page.text.slice(Math.max(0, matchStart - 42), matchStart).trimStart(),
+        contextBefore: page.text
+          .slice(Math.max(0, matchStart - 42), matchStart)
+          .trimStart(),
         contextAfter: page.text.slice(matchEnd, matchEnd + 42).trimEnd(),
         rects,
         firstRect: rects[0] ?? null,
@@ -93,11 +95,7 @@ export function findPdfSearchResults(
 }
 
 export function normalizePdfSearchText(value: string): string {
-  return value
-    .normalize('NFKC')
-    .replace(/\s+/gu, ' ')
-    .trim()
-    .toLocaleLowerCase();
+  return value.normalize('NFKC').replace(/\s+/gu, ' ').trim().toLocaleLowerCase();
 }
 
 function getNormalizedItemRectangle(
@@ -106,7 +104,11 @@ function getNormalizedItemRectangle(
 ): PdfSearchPageIndex['items'][number]['rect'] {
   const transform = Util.transform(viewport.transform, item.transform);
   const width = Math.max(Math.abs(item.width), 0);
-  const height = Math.max(Math.hypot(transform[2], transform[3]), Math.abs(item.height), 0);
+  const height = Math.max(
+    Math.hypot(transform[2], transform[3]),
+    Math.abs(item.height),
+    0,
+  );
   const x = transform[4];
   const y = transform[5] - height;
 
@@ -156,8 +158,12 @@ function getCombinedBounds(
   }
   const left = Math.min(...rectangles.map((rectangle) => rectangle.x));
   const top = Math.min(...rectangles.map((rectangle) => rectangle.y));
-  const right = Math.max(...rectangles.map((rectangle) => rectangle.x + rectangle.width));
-  const bottom = Math.max(...rectangles.map((rectangle) => rectangle.y + rectangle.height));
+  const right = Math.max(
+    ...rectangles.map((rectangle) => rectangle.x + rectangle.width),
+  );
+  const bottom = Math.max(
+    ...rectangles.map((rectangle) => rectangle.y + rectangle.height),
+  );
   return {
     x: left,
     y: top,

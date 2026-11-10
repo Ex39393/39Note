@@ -1,3 +1,5 @@
+import { scopedLocalStorageKey } from '../services/temporaryWorkspace.ts';
+
 export interface GoogleAccessToken {
   value: string;
   expiresAt: number;
@@ -33,6 +35,11 @@ interface PendingExchange {
 const EXCHANGE_STORAGE_KEY = '39note.google-drive.pending-exchange';
 const TEMPORARY_SESSION_STORAGE_KEY = '39note.google-drive.temporary-session';
 const EXCHANGE_MAX_AGE = 15 * 60_000;
+const AUTHORIZATION_START_TIMEOUT_MS = 15_000;
+const BROKER_REQUEST_TIMEOUT_MS = 30_000;
+
+export type GoogleAuthorizationStartFailure =
+  'request-failed' | 'request-timed-out' | 'response-invalid' | 'navigation-failed';
 
 export class SyncBackendUnavailableError extends Error {
   constructor() {
@@ -50,10 +57,34 @@ export class SyncServiceRateLimitedError extends Error {
   }
 }
 
+export class SyncOriginNotAllowedError extends Error {
+  constructor() {
+    super(
+      'This 39Note app address is not configured for Google Drive sign-in. Use an approved 39Note address and try again.',
+    );
+    this.name = 'SyncOriginNotAllowedError';
+  }
+}
+
 export class GoogleAuthorizationCancelledError extends Error {
   constructor() {
     super('Google Drive authorization was cancelled.');
     this.name = 'GoogleAuthorizationCancelledError';
+  }
+}
+
+/**
+ * A redacted pre-authorization failure. The reason is intentionally limited to
+ * lifecycle phases and never includes a URL, OAuth state, verifier, or provider
+ * response.
+ */
+export class GoogleAuthorizationStartError extends Error {
+  readonly reason: GoogleAuthorizationStartFailure;
+
+  constructor(reason: GoogleAuthorizationStartFailure) {
+    super('Google Drive sign-in could not be started. Your local data is safe.');
+    this.name = 'GoogleAuthorizationStartError';
+    this.reason = reason;
   }
 }
 
@@ -78,25 +109,41 @@ export class PersistentGoogleAuthSession {
   private sessionMode: 'personal' | 'temporary' = 'personal';
   private accountIdValue: string | null = null;
   private sessionExpiresAtValue: number | null = null;
+  private readonly brokerRequestTimeoutMs: number;
+
+  constructor(options: { brokerRequestTimeoutMs?: number } = {}) {
+    const requestedTimeout = options.brokerRequestTimeoutMs;
+    this.brokerRequestTimeoutMs =
+      typeof requestedTimeout === 'number' &&
+      Number.isFinite(requestedTimeout) &&
+      requestedTimeout > 0
+        ? requestedTimeout
+        : BROKER_REQUEST_TIMEOUT_MS;
+  }
 
   configure(
     backendUrl: string,
     deviceId: string,
     deviceSessionToken?: string,
     sessionMode: 'personal' | 'temporary' = 'personal',
+    persistedVerifiedAccountId?: string,
   ): void {
     this.backendUrl = validateSyncAuthUrl(backendUrl);
     this.deviceId = deviceId;
     this.sessionMode = sessionMode;
     const temporary =
       sessionMode === 'temporary'
-        ? readTemporarySession(TEMPORARY_SESSION_STORAGE_KEY)
+        ? readTemporarySession(temporarySessionStorageKey())
         : null;
     this.deviceSessionToken =
       sessionMode === 'temporary'
         ? (temporary?.sessionToken ?? null)
         : deviceSessionToken || null;
-    this.accountIdValue = temporary?.accountId ?? null;
+    this.accountIdValue =
+      temporary?.accountId ??
+      (this.deviceSessionToken && persistedVerifiedAccountId
+        ? persistedVerifiedAccountId
+        : null);
     this.sessionExpiresAtValue = temporary?.expiresAt ?? null;
     this.accessTokenValue = null;
   }
@@ -132,7 +179,16 @@ export class PersistentGoogleAuthSession {
   }
 
   async beginAuthorization(
-    options: { forceConsent?: boolean; switchAccount?: boolean } = {},
+    options: {
+      forceConsent?: boolean;
+      switchAccount?: boolean;
+      /** Focused-test override; production callers use the bounded default. */
+      requestTimeoutMs?: number;
+      /** Local lifecycle hook invoked only after a valid authorization URL exists. */
+      beforeNavigation?: () => void | Promise<void>;
+      /** Reverses a local lifecycle handoff if same-tab navigation cannot start. */
+      onNavigationFailure?: () => void | Promise<void>;
+    } = {},
   ): Promise<never> {
     this.requireConfiguration();
     const verifier = randomBrowserToken();
@@ -144,31 +200,75 @@ export class PersistentGoogleAuthSession {
       createdAt: Date.now(),
       sessionMode: this.sessionMode,
     };
-    sessionStorage.setItem(EXCHANGE_STORAGE_KEY, JSON.stringify(pending));
+    const exchangeStorageKey = this.exchangeStorageKey();
+    // A new explicit attempt supersedes any abandoned same-tab attempt. Keep
+    // the verifier in memory until an authorization URL has been obtained so a
+    // rejected pre-auth request cannot leave stale exchange state behind.
+    sessionStorage.removeItem(exchangeStorageKey);
     const returnUrl = new URL(window.location.href);
     returnUrl.hash = '';
-    const response = await brokerRequest(
-      `${this.backendUrl}/api/oauth/start`,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          deviceId: this.deviceId,
-          exchangeChallenge,
-          returnUrl: returnUrl.toString(),
-          forceConsent: options.forceConsent === true,
-          switchAccount: options.switchAccount === true,
-          sessionMode: this.sessionMode,
-        }),
-      },
-      false,
-    );
-    const body = await readJson<{ authorizationUrl?: unknown }>(response);
-    if (typeof body.authorizationUrl !== 'string') {
-      sessionStorage.removeItem(EXCHANGE_STORAGE_KEY);
-      throw new SyncBackendUnavailableError();
+    const controller = new AbortController();
+    let requestTimedOut = false;
+    const timeout = setTimeout(() => {
+      requestTimedOut = true;
+      controller.abort();
+    }, options.requestTimeoutMs ?? AUTHORIZATION_START_TIMEOUT_MS);
+    let body: { authorizationUrl?: unknown };
+    try {
+      const response = await brokerRequest(
+        `${this.backendUrl}/api/oauth/start`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            deviceId: this.deviceId,
+            exchangeChallenge,
+            returnUrl: returnUrl.toString(),
+            forceConsent: options.forceConsent === true,
+            switchAccount: options.switchAccount === true,
+            sessionMode: this.sessionMode,
+          }),
+          signal: controller.signal,
+        },
+        false,
+        this.brokerRequestTimeoutMs,
+      );
+      body = await readJson<{ authorizationUrl?: unknown }>(response);
+    } catch (error) {
+      if (requestTimedOut) {
+        throw new GoogleAuthorizationStartError('request-timed-out');
+      }
+      if (
+        error instanceof SyncBackendUnavailableError ||
+        error instanceof SyncServiceRateLimitedError ||
+        error instanceof SyncOriginNotAllowedError
+      ) {
+        throw error;
+      }
+      throw new GoogleAuthorizationStartError('request-failed');
+    } finally {
+      clearTimeout(timeout);
     }
-    window.location.assign(body.authorizationUrl);
+    const authorizationUrl = validateAuthorizationNavigationUrl(
+      body.authorizationUrl,
+      this.backendUrl,
+    );
+    sessionStorage.setItem(exchangeStorageKey, JSON.stringify(pending));
+    try {
+      await options.beforeNavigation?.();
+      // This flow intentionally uses same-tab navigation. It does not use a
+      // popup, postMessage, or window.open(), so popup blocking is irrelevant.
+      window.location.assign(authorizationUrl);
+    } catch {
+      sessionStorage.removeItem(exchangeStorageKey);
+      try {
+        await options.onNavigationFailure?.();
+      } catch {
+        // The original navigation failure remains authoritative. A failed
+        // best-effort lifecycle rollback must not hide it.
+      }
+      throw new GoogleAuthorizationStartError('navigation-failed');
+    }
     return new Promise<never>(() => undefined);
   }
 
@@ -178,15 +278,17 @@ export class PersistentGoogleAuthSession {
     const error = fragment.get('sync_auth_error');
     if (!grant && !error) return null;
     clearAuthorizationFragment();
-    const pending = readPendingExchange(EXCHANGE_STORAGE_KEY);
-    sessionStorage.removeItem(EXCHANGE_STORAGE_KEY);
+    const exchangeStorageKey = this.exchangeStorageKey();
+    const pending = readPendingExchange(exchangeStorageKey);
+    sessionStorage.removeItem(exchangeStorageKey);
     if (error) {
       throw mapAuthorizationCallbackError(error, fragment.get('sync_auth_action'));
     }
     if (
       !pending ||
       pending.backendUrl !== this.backendUrl ||
-      pending.deviceId !== this.deviceId
+      pending.deviceId !== this.deviceId ||
+      pending.sessionMode !== this.sessionMode
     ) {
       throw new GoogleReauthorizationRequiredError(
         'The one-time authorization exchange expired. Connect Google Drive again.',
@@ -204,6 +306,7 @@ export class PersistentGoogleAuthSession {
         }),
       },
       false,
+      this.brokerRequestTimeoutMs,
     );
     if (response.status === 401) {
       throw new GoogleReauthorizationRequiredError(
@@ -215,8 +318,9 @@ export class PersistentGoogleAuthSession {
       !isSessionToken(body.sessionToken) ||
       !isSessionSummary(body.session) ||
       typeof body.sessionCount !== 'number' ||
-      typeof body.accountId !== 'string' ||
+      !isAccountId(body.accountId) ||
       (body.sessionMode !== 'personal' && body.sessionMode !== 'temporary') ||
+      body.sessionMode !== pending.sessionMode ||
       (body.expiresAt !== null && typeof body.expiresAt !== 'number')
     ) {
       throw new SyncBackendUnavailableError();
@@ -232,7 +336,7 @@ export class PersistentGoogleAuthSession {
           accountId: body.accountId,
           expiresAt: body.expiresAt,
         },
-        TEMPORARY_SESSION_STORAGE_KEY,
+        temporarySessionStorageKey(),
       );
     } else {
       sessionStorage.removeItem(TEMPORARY_SESSION_STORAGE_KEY);
@@ -307,6 +411,7 @@ export class PersistentGoogleAuthSession {
     this.accountIdValue = null;
     this.sessionExpiresAtValue = null;
     sessionStorage.removeItem(TEMPORARY_SESSION_STORAGE_KEY);
+    sessionStorage.removeItem(temporarySessionStorageKey());
   }
 
   private async authenticatedRequest(
@@ -326,6 +431,7 @@ export class PersistentGoogleAuthSession {
         },
       },
       retry,
+      this.brokerRequestTimeoutMs,
     );
     if (response.status === 401) {
       this.accessTokenValue = null;
@@ -338,6 +444,16 @@ export class PersistentGoogleAuthSession {
     if (!this.backendUrl) throw new Error('Persistent sync backend not configured.');
     if (!this.deviceId) throw new Error('This browser does not have a sync device ID.');
   }
+
+  private exchangeStorageKey(): string {
+    return this.sessionMode === 'temporary'
+      ? scopedLocalStorageKey(EXCHANGE_STORAGE_KEY)
+      : EXCHANGE_STORAGE_KEY;
+  }
+}
+
+function temporarySessionStorageKey(): string {
+  return scopedLocalStorageKey(TEMPORARY_SESSION_STORAGE_KEY);
 }
 
 export function getBuildTimeSyncAuthUrl(): string {
@@ -369,16 +485,57 @@ export function validateSyncAuthUrl(value: string): string {
   return url.toString().replace(/\/$/u, '');
 }
 
+/**
+ * Fail closed if a broker response tries to navigate anywhere except Google's
+ * OAuth endpoint. A loopback broker may keep navigation on its exact loopback
+ * origin so disconnected development acceptance can use a local provider stub.
+ */
+export function validateAuthorizationNavigationUrl(
+  value: unknown,
+  backendUrl: string,
+): string {
+  if (typeof value !== 'string') {
+    throw new GoogleAuthorizationStartError('response-invalid');
+  }
+  let authorization: URL;
+  let backend: URL;
+  try {
+    authorization = new URL(value);
+    backend = new URL(backendUrl);
+  } catch {
+    throw new GoogleAuthorizationStartError('response-invalid');
+  }
+  if (authorization.username || authorization.password || authorization.hash) {
+    throw new GoogleAuthorizationStartError('response-invalid');
+  }
+  const googleOAuth =
+    authorization.protocol === 'https:' &&
+    authorization.origin === 'https://accounts.google.com' &&
+    authorization.pathname === '/o/oauth2/v2/auth';
+  const loopbackBroker =
+    backend.protocol === 'http:' &&
+    (backend.hostname === '127.0.0.1' || backend.hostname === 'localhost');
+  const sameLoopbackOrigin =
+    loopbackBroker &&
+    authorization.protocol === 'http:' &&
+    authorization.origin === backend.origin;
+  if (!googleOAuth && !sameLoopbackOrigin) {
+    throw new GoogleAuthorizationStartError('response-invalid');
+  }
+  return authorization.toString();
+}
+
 async function brokerRequest(
   url: string,
   init: RequestInit,
   retry: boolean,
+  timeoutMs: number,
 ): Promise<Response> {
   const attempts = retry ? 2 : 1;
   for (let attempt = 0; attempt < attempts; attempt += 1) {
     let response: Response;
     try {
-      response = await fetch(url, init);
+      response = await fetchBrokerResponse(url, init, timeoutMs);
     } catch {
       if (attempt + 1 === attempts) throw new SyncBackendUnavailableError();
       await delay(300);
@@ -396,10 +553,48 @@ async function brokerRequest(
     if (response.status === 429 || body.error === 'rate_limited') {
       throw new SyncServiceRateLimitedError();
     }
+    if (response.status === 403 && body.error === 'origin_not_allowed') {
+      throw new SyncOriginNotAllowedError();
+    }
     if (response.status >= 500) throw new SyncBackendUnavailableError();
     throw new Error('Persistent sync service rejected the request.');
   }
   throw new SyncBackendUnavailableError();
+}
+
+async function fetchBrokerResponse(
+  url: string,
+  init: RequestInit,
+  timeoutMs: number,
+): Promise<Response> {
+  const controller = new AbortController();
+  const parentSignal = init.signal;
+  if (parentSignal?.aborted) {
+    throw parentSignal.reason ?? new DOMException('Aborted', 'AbortError');
+  }
+  const relayParentAbort = () => {
+    controller.abort(parentSignal?.reason ?? new DOMException('Aborted', 'AbortError'));
+  };
+  parentSignal?.addEventListener('abort', relayParentAbort, { once: true });
+  const timeout = setTimeout(() => {
+    controller.abort(new SyncBackendUnavailableError());
+  }, timeoutMs);
+  try {
+    const response = await fetch(url, { ...init, signal: controller.signal });
+    const body = await response.arrayBuffer();
+    return new Response(body.byteLength ? body : null, {
+      status: response.status,
+      statusText: response.statusText,
+      headers: response.headers,
+    });
+  } catch (error) {
+    if (parentSignal?.aborted) throw parentSignal.reason ?? error;
+    if (controller.signal.aborted) throw controller.signal.reason ?? error;
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+    parentSignal?.removeEventListener('abort', relayParentAbort);
+  }
 }
 
 async function readJson<T>(response: Response): Promise<T> {
@@ -456,6 +651,19 @@ function isSessionToken(value: unknown): value is string {
   return typeof value === 'string' && /^[A-Za-z0-9_-]{43}$/u.test(value);
 }
 
+function isAccountId(value: unknown): value is string {
+  return (
+    typeof value === 'string' &&
+    value.length > 0 &&
+    value.length <= 256 &&
+    value.trim() === value &&
+    !Array.from(value).some((character) => {
+      const codePoint = character.codePointAt(0) ?? 0;
+      return codePoint <= 0x1f || codePoint === 0x7f;
+    })
+  );
+}
+
 function isSessionSummary(value: unknown): value is GoogleDeviceSessionSummary {
   if (!value || typeof value !== 'object') return false;
   const session = value as Partial<GoogleDeviceSessionSummary>;
@@ -483,8 +691,7 @@ function readTemporarySession(key: string): TemporaryBrowserSession | null {
     ) as Partial<TemporaryBrowserSession>;
     if (
       isSessionToken(value.sessionToken) &&
-      typeof value.accountId === 'string' &&
-      value.accountId.length > 0 &&
+      isAccountId(value.accountId) &&
       (value.expiresAt === null ||
         (typeof value.expiresAt === 'number' && value.expiresAt > Date.now()))
     ) {

@@ -103,12 +103,16 @@ export function saveAiConfigurationWithoutCredentials(
   notifyChange = true,
 ): void {
   const existing = loadAiConfiguration();
+  const sanitized = sanitizeConfiguration(config);
+  const sameCredentialProfile =
+    existing !== null &&
+    getCredentialProfileId(existing) === getCredentialProfileId(sanitized);
   localStorage.setItem(
     workspaceKey(CONFIG_KEY),
     JSON.stringify({
-      ...sanitizeConfiguration(config),
-      customHeaders: existing?.customHeaders ?? {},
-      rememberApiKey: existing?.rememberApiKey ?? false,
+      ...sanitized,
+      customHeaders: sameCredentialProfile ? existing.customHeaders : {},
+      rememberApiKey: sameCredentialProfile ? existing.rememberApiKey : false,
     }),
   );
   if (notifyChange) notifyPersistentChange({ kind: 'ai-settings' });

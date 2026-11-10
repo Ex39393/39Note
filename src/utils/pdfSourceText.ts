@@ -22,11 +22,36 @@ export interface PdfSourceTextFragment {
 
 const NO_SPACE_BEFORE = ',;:!?%)]}\u2019\u201d*/-\u2013\u2014';
 const NO_SPACE_AFTER = '([{\u2018\u201c*/-\u2013\u2014';
-const SCRIPT_WITHOUT_WORD_SPACES = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u;
+const SCRIPT_WITHOUT_WORD_SPACES =
+  /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u;
 const ATTACHED_MARK = /[\p{M}\u00b2\u00b3\u00b9\u2070-\u209f]/u;
 const ALLOWED_SHORT_PIECES = new Set([
-  'a', 'i', 'am', 'an', 'as', 'at', 'be', 'by', 'do', 'go', 'he', 'if', 'in',
-  'is', 'it', 'me', 'my', 'no', 'of', 'on', 'or', 'so', 'to', 'up', 'us', 'we',
+  'a',
+  'i',
+  'am',
+  'an',
+  'as',
+  'at',
+  'be',
+  'by',
+  'do',
+  'go',
+  'he',
+  'if',
+  'in',
+  'is',
+  'it',
+  'me',
+  'my',
+  'no',
+  'of',
+  'on',
+  'or',
+  'so',
+  'to',
+  'up',
+  'us',
+  'we',
 ]);
 const PROTECTED_HYPHENATED_WORDS = new Set([
   'evidence-based',
@@ -70,13 +95,8 @@ export function reconstructPdfSourceText(
  * and TextContent `hasEOL` signals are no longer available.
  */
 export function formatPdfSourceTextForDisplay(value: string): string {
-  const normalized = value
-    .replaceAll('\u00ad', '')
-    .replaceAll(/\s+/gu, ' ')
-    .trim();
-  return repairMergedEnglishTokens(
-    repairHistoricalHyphenation(normalized),
-  );
+  const normalized = value.replaceAll('\u00ad', '').replaceAll(/\s+/gu, ' ').trim();
+  return repairMergedEnglishTokens(repairHistoricalHyphenation(normalized));
 }
 
 function shouldInsertSyntheticSpace(
@@ -92,10 +112,8 @@ function shouldInsertSyntheticSpace(
     preventsSpaceBefore(next.text, nextCharacter) ||
     NO_SPACE_AFTER.includes(previousCharacter) ||
     ATTACHED_MARK.test(nextCharacter) ||
-    (
-      SCRIPT_WITHOUT_WORD_SPACES.test(previousCharacter) &&
-      SCRIPT_WITHOUT_WORD_SPACES.test(nextCharacter)
-    )
+    (SCRIPT_WITHOUT_WORD_SPACES.test(previousCharacter) &&
+      SCRIPT_WITHOUT_WORD_SPACES.test(nextCharacter))
   ) {
     return false;
   }
@@ -105,9 +123,8 @@ function shouldInsertSyntheticSpace(
   if (!previousRectangle || !nextRectangle) return false;
   if (!areOnSameVisualLine(previousRectangle, nextRectangle)) return true;
 
-  const horizontalGap = nextRectangle.left - (
-    previousRectangle.left + previousRectangle.width
-  );
+  const horizontalGap =
+    nextRectangle.left - (previousRectangle.left + previousRectangle.width);
   const meaningfulGap = getMeaningfulWordGap(
     previous,
     next,
@@ -145,11 +162,10 @@ function shouldRemoveLineBreakHyphen(
   const metadataConfirmsLineEnd = Boolean(
     previous.sourceItem?.hasEOL && previous.endsSourceItem,
   );
-  const geometryConfirmsLineEnd = (
+  const geometryConfirmsLineEnd =
     nextRectangle.top > previousRectangle.top &&
     nextRectangle.top - previousRectangle.top <=
-      Math.max(previousRectangle.height, nextRectangle.height) * 2.5
-  );
+      Math.max(previousRectangle.height, nextRectangle.height) * 2.5;
   if (!metadataConfirmsLineEnd && !geometryConfirmsLineEnd) return false;
 
   return canRemoveHyphen(previousMatch[1], nextMatch[1], previousMatch[2]);
@@ -205,10 +221,11 @@ function getTwoPieceCandidates(value: string): Array<{
     const score = getSplitCandidateScore(first, second);
     if (score > 0) candidates.push({ first, second, score });
   }
-  return candidates.sort((first, second) =>
-    second.score - first.score ||
-    Math.abs(second.first.length - second.second.length) -
-      Math.abs(first.first.length - first.second.length),
+  return candidates.sort(
+    (first, second) =>
+      second.score - first.score ||
+      Math.abs(second.first.length - second.second.length) -
+        Math.abs(first.first.length - first.second.length),
   );
 }
 
@@ -218,8 +235,10 @@ function getSplitCandidateScore(first: string, second: string): number {
   const secondConfidence = getPdfLexicalConfidence(second);
   if (firstConfidence === 0 || secondConfidence === 0) return 0;
   if (getPdfLexicalConfidence(`${first}${second}`) > 0) return 0;
-  return firstConfidence + secondConfidence + (
-    first.length >= 3 && second.length >= 3 ? 1 : 0
+  return (
+    firstConfidence +
+    secondConfidence +
+    (first.length >= 3 && second.length >= 3 ? 1 : 0)
   );
 }
 
@@ -227,17 +246,23 @@ function hasStrongLexicalBoundary(previous: string, next: string): boolean {
   const previousMatch = /([A-Za-z]+)$/u.exec(previous);
   const nextMatch = /^([A-Za-z]+)/u.exec(next);
   if (!previousMatch || !nextMatch) return false;
-  return getSplitCandidateScore(
-    previousMatch[1].toLocaleLowerCase('en-US'),
-    nextMatch[1].toLocaleLowerCase('en-US'),
-  ) >= 6;
+  return (
+    getSplitCandidateScore(
+      previousMatch[1].toLocaleLowerCase('en-US'),
+      nextMatch[1].toLocaleLowerCase('en-US'),
+    ) >= 6
+  );
 }
 
 function isAllowedPiece(value: string): boolean {
   return value.length >= 3 || ALLOWED_SHORT_PIECES.has(value);
 }
 
-function isProtectedTokenContext(value: string, offset: number, length: number): boolean {
+function isProtectedTokenContext(
+  value: string,
+  offset: number,
+  length: number,
+): boolean {
   const previous = value.at(offset - 1) ?? '';
   const next = value.at(offset + length) ?? '';
   return /[A-Za-z0-9_@/.\\]/u.test(previous) || /[A-Za-z0-9_@/.\\]/u.test(next);
@@ -254,14 +279,16 @@ function areOnSameVisualLine(
 ): boolean {
   const previousBottom = previous.top + previous.height;
   const nextBottom = next.top + next.height;
-  const overlap = Math.min(previousBottom, nextBottom) - Math.max(previous.top, next.top);
+  const overlap =
+    Math.min(previousBottom, nextBottom) - Math.max(previous.top, next.top);
   const minimumHeight = Math.min(previous.height, next.height);
   const previousCenter = previous.top + previous.height / 2;
   const nextCenter = next.top + next.height / 2;
 
   return (
     overlap >= minimumHeight * 0.2 ||
-    Math.abs(previousCenter - nextCenter) <= Math.max(previous.height, next.height) * 0.55
+    Math.abs(previousCenter - nextCenter) <=
+      Math.max(previous.height, next.height) * 0.55
   );
 }
 
@@ -298,7 +325,9 @@ function getAverageCharacterWidth(
   width: number,
   fallbackHeight: number,
 ): number {
-  const characterCount = Array.from(text).filter((character) => !/\s/u.test(character)).length;
+  const characterCount = Array.from(text).filter(
+    (character) => !/\s/u.test(character),
+  ).length;
   return characterCount > 0 && width > 0
     ? width / characterCount
     : fallbackHeight * 0.5;

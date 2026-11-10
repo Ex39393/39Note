@@ -12,9 +12,11 @@ first-class Reader format.
 
 ## Browser support
 
-39Note v1 targets current modern browsers. Release qualification was performed
-with Google Chrome 153. Other browsers and significantly older browser releases
-have not been qualified and are not claimed as supported.
+39Note v1 targets current Chromium-based desktop browsers. Automated release
+checks exercise targeted Drive recovery and restore-safety flows in Google Chrome
+and Microsoft Edge, including a 390 x 844 touch-emulation viewport. They are not
+whole-app browser qualification, Android or iOS real-device qualification, or
+Safari/WebKit qualification; those environments are not claimed as supported.
 
 ## Initial setup
 
@@ -63,11 +65,23 @@ pixel-perfect fidelity.
 
 - Some presentations containing flattened slide images plus retained PowerPoint
   text objects may show duplicated or ghosted text after conversion.
-- Text that exists only inside bitmap images is not selectable or searchable
-  because OCR is not implemented.
+- Text that exists only inside bitmap images is labelled only after PDF.js reports
+  no selectable text and records rendered image content. The user can then run
+  explicit English OCR locally for one page or, through a cancellable serial queue,
+  every verified image-only page in the document. Native-text pages are skipped.
+  Raw recognition text and coordinates remain session-only and may contain errors.
+  If the user explicitly creates a Highlight, Underline, Link, or Note from that
+  text, the resulting user record includes the selected text and geometry and follows
+  normal local persistence, backup, and optional Drive sync. Neither the raw result
+  nor a derived record replaces the PDF, its fingerprint, or its document identity.
+  39Note does not start OCR automatically or expose low-confidence output as
+  selectable text.
 
-Third-party license notices for shipped runtime code and assets are included in
-[`public/licenses`](public/licenses).
+Third-party license and attribution notices for shipped runtime code, data, and
+assets are included in [`public/licenses`](public/licenses),
+[`public/dictionary/WORDNET-LICENSE.txt`](public/dictionary/WORDNET-LICENSE.txt),
+[`public/pdfjs-wasm`](public/pdfjs-wasm), and
+[`DICTIONARY_SOURCES.md`](DICTIONARY_SOURCES.md).
 
 ## Web deployment
 
@@ -83,3 +97,22 @@ changing the published domain.
 Define the public GitHub Actions repository variable `VITE_39NOTE_SYNC_AUTH_URL`
 with the deployed Worker origin. Google client credentials and the token-encryption
 key are Cloudflare Worker secrets; never expose them to Pages or commit them.
+
+## License
+
+Copyright (c) 2026 Ex39393. All rights reserved.
+
+The original 39Note source code and project materials are publicly viewable but
+are not licensed for reuse and are not open-source software. See [`LICENSE`](LICENSE)
+for the complete terms. Third-party software, fonts, data, models, and other assets
+remain subject to their respective licenses and attribution requirements in
+[`public/licenses`](public/licenses),
+[`public/dictionary/WORDNET-LICENSE.txt`](public/dictionary/WORDNET-LICENSE.txt),
+[`public/pdfjs-wasm`](public/pdfjs-wasm),
+[`DICTIONARY_SOURCES.md`](DICTIONARY_SOURCES.md), and the dependency metadata.
+
+## Policies
+
+The release includes a public [Privacy Policy](public/privacy.html) and
+[Terms of Service](public/terms.html). The application Home and Settings pages link
+to the deployed copies using the active Vite base path.

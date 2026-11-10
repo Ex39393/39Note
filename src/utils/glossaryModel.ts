@@ -5,6 +5,7 @@ import type {
   DictionaryDefinition,
   GlossaryEntry,
   NotesPrintLayout,
+  PdfGlossaryEntry,
   SemanticGlossaryEntry,
 } from '../types/glossary';
 import { isPdfGlossaryEntry, isSemanticGlossaryEntry } from '../types/glossary.ts';
@@ -69,6 +70,26 @@ export function markDefinitionBubbleAdded(
     glossaryEntryId,
     addedConfirmationToken: confirmationToken,
   };
+}
+
+export function findMatchingPdfGlossaryEntry(
+  bubble: Pick<
+    DefinitionBubble,
+    'documentId' | 'pageNumber' | 'rects' | 'startOffset' | 'endOffset'
+  >,
+  entries: readonly GlossaryEntry[],
+): PdfGlossaryEntry | null {
+  return (
+    entries.find(
+      (entry): entry is PdfGlossaryEntry =>
+        isPdfGlossaryEntry(entry) &&
+        entry.documentId === bubble.documentId &&
+        entry.pageNumber === bubble.pageNumber &&
+        entry.startOffset === bubble.startOffset &&
+        entry.endOffset === bubble.endOffset &&
+        glossaryRectanglesMatch(entry.sourceRects, bubble.rects),
+    ) ?? null
+  );
 }
 
 export function sortGlossaryEntries(
@@ -144,4 +165,23 @@ export function getDefaultPrintLayout(): NotesPrintLayout {
 
 export function getPrintLayoutClass(layout: NotesPrintLayout): string {
   return `print-layout-${layout}`;
+}
+
+function glossaryRectanglesMatch(
+  first: Array<{ x: number; y: number; width: number; height: number }>,
+  second: Array<{ x: number; y: number; width: number; height: number }>,
+): boolean {
+  return (
+    first.length === second.length &&
+    first.every((rectangle, index) => {
+      const candidate = second[index];
+      return (
+        candidate !== undefined &&
+        Math.abs(rectangle.x - candidate.x) < 0.0001 &&
+        Math.abs(rectangle.y - candidate.y) < 0.0001 &&
+        Math.abs(rectangle.width - candidate.width) < 0.0001 &&
+        Math.abs(rectangle.height - candidate.height) < 0.0001
+      );
+    })
+  );
 }

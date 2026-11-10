@@ -8,7 +8,8 @@ import {
   type PDFFont,
   type RGB,
 } from 'pdf-lib';
-import type { PdfAnnotation } from '../types/highlight';
+import notoSansScRegularUrl from '@expo-google-fonts/noto-sans-sc/400Regular/NotoSansSC_400Regular.ttf?url';
+import { normalizeOpaqueHexColor, type PdfAnnotation } from '../types/highlight';
 import type {
   AnnotatedPdfExportRequest,
   AnnotatedPdfExportResult,
@@ -38,6 +39,8 @@ const APPENDIX_LINE_HEIGHT = 13;
 const MARKER_FONT_SIZE_POINTS = 7;
 const MARKER_HEIGHT_POINTS = 10;
 const MARKER_GAP_POINTS = 3;
+
+let bundledAppendixFontBytesPromise: Promise<Uint8Array> | null = null;
 
 const HIGHLIGHT_COLORS: Record<string, RGB> = {
   yellow: rgb(1, 0.9, 0),
@@ -77,8 +80,13 @@ export class AnnotatedPdfExportError extends Error {
   }
 }
 
+export interface AnnotatedPdfExportDependencies {
+  loadAppendixFontBytes?: () => Promise<Uint8Array>;
+}
+
 export async function createAnnotatedPdf(
   request: AnnotatedPdfExportRequest,
+  dependencies: AnnotatedPdfExportDependencies = {},
 ): Promise<AnnotatedPdfExportResult> {
   request.onProgress?.({
     stage: 'preparing',
@@ -128,17 +136,23 @@ export async function createAnnotatedPdf(
     ),
   );
   const appendixFont =
-    references.length > 0 ? await pdfDocument.embedFont(StandardFonts.Helvetica) : null;
+    references.length > 0
+      ? await embedUnicodeAppendixFont(
+          pdfDocument,
+          dependencies.loadAppendixFontBytes ?? loadBundledAppendixFontBytes,
+        )
+      : null;
   const appendixBoldFont =
     references.length > 0
       ? await pdfDocument.embedFont(StandardFonts.HelveticaBold)
       : null;
 
-  if (references.length > 0) {
+  if (references.length > 0 && appendixFont) {
     assertAppendixTextIsSupported(
       request.documentTitle,
       references,
       request.options.includeSelectedText,
+      appendixFont,
     );
   }
 
@@ -220,9 +234,7 @@ function drawAnnotation(
   includeColors: boolean,
 ): void {
   if (annotation.type === 'highlight') {
-    const color = includeColors
-      ? (HIGHLIGHT_COLORS[annotation.color] ?? DEFAULT_HIGHLIGHT_COLOR)
-      : DEFAULT_HIGHLIGHT_COLOR;
+    const color = resolveAnnotationExportColor(annotation, includeColors);
     for (const rectangle of annotation.rects) {
       const pdfRectangle = normalizedRectangleToPdfRectangle(rectangle, geometry);
       page.drawRectangle({
@@ -235,9 +247,7 @@ function drawAnnotation(
     return;
   }
 
-  const color = includeColors
-    ? (UNDERLINE_COLORS[annotation.color] ?? DEFAULT_UNDERLINE_COLOR)
-    : DEFAULT_UNDERLINE_COLOR;
+  const color = resolveAnnotationExportColor(annotation, includeColors);
   for (const rectangle of annotation.rects) {
     const line = normalizedRectangleToPdfUnderline(rectangle, geometry);
     page.drawLine({
@@ -248,6 +258,29 @@ function drawAnnotation(
       opacity: 1,
     });
   }
+}
+
+// Pure export-colour resolution is kept public for deterministic regression tests.
+export function resolveAnnotationExportColor(
+  annotation: PdfAnnotation,
+  includeColors: boolean,
+): RGB {
+  const fallback =
+    annotation.type === 'highlight' ? DEFAULT_HIGHLIGHT_COLOR : DEFAULT_UNDERLINE_COLOR;
+  if (!includeColors) return fallback;
+  const customColor = normalizeOpaqueHexColor(annotation.color);
+  if (customColor) return colorFromHex(customColor);
+  return annotation.type === 'highlight'
+    ? (HIGHLIGHT_COLORS[annotation.color] ?? fallback)
+    : (UNDERLINE_COLORS[annotation.color] ?? fallback);
+}
+
+function colorFromHex(color: `#${string}`): RGB {
+  return rgb(
+    Number.parseInt(color.slice(1, 3), 16) / 255,
+    Number.parseInt(color.slice(3, 5), 16) / 255,
+    Number.parseInt(color.slice(5, 7), 16) / 255,
+  );
 }
 
 function drawReferenceMarker(
@@ -479,19 +512,74 @@ function assertAppendixTextIsSupported(
   documentTitle: string,
   references: AnnotationExportReference[],
   includeSelectedText: boolean,
+  font: PDFFont,
 ): void {
-  const text = [
-    documentTitle,
-    ...references.flatMap((reference) => [
-      reference.note.content,
-      ...(includeSelectedText ? [reference.annotation.text] : []),
-    ]),
-  ].join('\n');
-  if (findUnsupportedAppendixCharacters(text).length > 0) {
+  const supportedCodePoints = new Set(font.getCharacterSet());
+  const unsupportedLocations: string[] = [];
+  const inspect = (label: string, text: string) => {
+    if (findUnsupportedAppendixCharacters(text, supportedCodePoints).length > 0) {
+      unsupportedLocations.push(label);
+    }
+  };
+
+  inspect('document title', documentTitle);
+  for (const reference of references) {
+    inspect(`Note [${reference.referenceNumber}]`, reference.note.content);
+    if (includeSelectedText) {
+      inspect(
+        `selected source text [${reference.referenceNumber}]`,
+        reference.annotation.text,
+      );
+    }
+  }
+
+  if (unsupportedLocations.length > 0) {
     throw new AnnotatedPdfExportError(
-      'The Notes appendix contains characters that the bundled PDF font cannot encode. Export annotations without the Notes appendix, or remove unsupported Unicode characters such as CJK text.',
+      `The bundled Unicode PDF font cannot encode characters in: ${unsupportedLocations.join(', ')}. Export annotations without the Notes appendix, or remove those unsupported characters.`,
       'unsupported-unicode',
     );
+  }
+}
+
+async function embedUnicodeAppendixFont(
+  pdfDocument: PDFDocument,
+  loadFontBytes: () => Promise<Uint8Array>,
+): Promise<PDFFont> {
+  try {
+    const [fontkitModule, fontBytes] = await Promise.all([
+      import('@pdf-lib/fontkit'),
+      loadFontBytes(),
+    ]);
+    if (fontBytes.byteLength === 0) {
+      throw new Error('The bundled appendix font was empty.');
+    }
+
+    pdfDocument.registerFontkit(fontkitModule.default);
+    return await pdfDocument.embedFont(fontBytes, { subset: true });
+  } catch (error) {
+    throw new AnnotatedPdfExportError(
+      'The bundled Unicode PDF font could not be loaded. The original PDF was not changed.',
+      'generic',
+      { cause: error },
+    );
+  }
+}
+
+async function loadBundledAppendixFontBytes(): Promise<Uint8Array> {
+  bundledAppendixFontBytesPromise ??= fetch(notoSansScRegularUrl).then(
+    async (response) => {
+      if (!response.ok) {
+        throw new Error(`Bundled appendix font request failed (${response.status}).`);
+      }
+      return new Uint8Array(await response.arrayBuffer());
+    },
+  );
+
+  try {
+    return await bundledAppendixFontBytesPromise;
+  } catch (error) {
+    bundledAppendixFontBytesPromise = null;
+    throw error;
   }
 }
 

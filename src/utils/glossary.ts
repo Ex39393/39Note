@@ -34,6 +34,7 @@ export function createGlossaryEntry(
 
 export {
   createGlossaryEntryFromBubble,
+  findMatchingPdfGlossaryEntry,
   getDefaultPrintLayout,
   getPrintContentItems,
   getPrintLayoutClass,

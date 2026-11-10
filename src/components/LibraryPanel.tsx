@@ -1,12 +1,18 @@
-import { useEffect, useMemo, useRef, useState, type CSSProperties } from 'react';
+import {
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type CSSProperties,
+  type KeyboardEvent as ReactKeyboardEvent,
+} from 'react';
 import {
   getLibraryStorageSummary,
-  listTags,
   listLibraryDocuments,
+  loadDurableRestoreOperation,
   type LibraryDocument,
   type LibraryStorageSummary,
 } from '../services/annotationPersistence';
-import type { TagRecord } from '../types/library';
 import {
   getPaperGoogleDriveSyncCoordinator,
   type PaperActiveOperationType,
@@ -30,20 +36,30 @@ import {
 import {
   downloadLibraryBackup,
   downloadSelectedPackage,
+  getBackupCreationErrorMessage,
   inspectBackup,
-  restoreBackup,
   type RestorePreview,
 } from '../services/libraryBackup';
+import {
+  runCrashSafeRestore,
+  type CrashSafeRestoreProgress,
+} from '../services/crashSafeRestoreEngine.ts';
 import {
   DOCUMENT_FILE_EXTENSIONS,
   DOCUMENT_MIME_TYPES,
   type DocumentType,
 } from '../types/document';
+import {
+  resolveLibraryScrollContainer,
+  scrollLibraryContainerToTop,
+} from '../utils/libraryScroll';
+import { FeedbackNotice } from './FeedbackNotice.tsx';
 
 const SUPPORTED_DOCUMENT_ACCEPT = [
   ...Object.values(DOCUMENT_MIME_TYPES),
   ...Object.values(DOCUMENT_FILE_EXTENSIONS),
 ].join(',');
+const PDF_DOCUMENT_ACCEPT = `${DOCUMENT_MIME_TYPES.pdf},${DOCUMENT_FILE_EXTENSIONS.pdf}`;
 
 export interface LibraryPanelProps {
   isOpen: boolean;
@@ -52,6 +68,7 @@ export interface LibraryPanelProps {
   onClose: () => void;
   onForget: (documentId: string) => Promise<boolean>;
   onOpenFile: (file: File) => void;
+  onImportAsNewPaper: (file: File) => void;
   onOpenStoredDocument: (documentId: string) => Promise<boolean>;
   onOpenLibraryNote: (
     documentId: string,
@@ -73,10 +90,6 @@ export interface LibraryPanelProps {
   onForgetMany: (
     documentIds: string[],
   ) => Promise<{ deleted: string[]; failed: string[] }>;
-  onUpdateOrganization: (
-    documentId: string,
-    update: { tagIds?: string[] },
-  ) => Promise<boolean>;
 }
 
 interface LibraryNoteResult {
@@ -89,8 +102,6 @@ interface LibraryNoteResult {
   selectedText: string;
 }
 
-type LibraryScope = { type: 'all' } | { type: 'tag'; id: string };
-
 interface LibraryWorkspaceSize {
   width: number;
   height: number;
@@ -102,6 +113,16 @@ interface LibraryBulkDriveRemovalFeedback {
   displayNames: Record<string, string>;
 }
 
+type LibraryRestoreExecutionPhase =
+  CrashSafeRestoreProgress['phase'] | 'cancelled' | 'error' | 'recovery-required';
+
+interface LibraryRestoreExecutionState {
+  phase: LibraryRestoreExecutionPhase;
+  completed?: number;
+  total?: number;
+  message?: string;
+}
+
 type LibraryCloudOperation = PaperActiveOperationType;
 type LibraryCloudAction = Exclude<LibraryCloudOperation, 'keep-local'>;
 
@@ -111,6 +132,29 @@ function cloudOperationLabel(operation: LibraryCloudOperation): string {
   if (operation === 'remove') return 'Removing from Google Drive…';
   if (operation === 'restore') return 'Restoring to Google Drive…';
   return 'Keeping local version…';
+}
+
+function restoreExecutionLabel(phase: LibraryRestoreExecutionPhase): string {
+  switch (phase) {
+    case 'validation':
+      return 'Validating the complete backup…';
+    case 'preparation':
+      return 'Preparing verified recovery snapshots…';
+    case 'restoration':
+      return 'Restoring local Library records…';
+    case 'verification':
+      return 'Verifying the restored Library…';
+    case 'rollback':
+      return 'Restoring the previous Library safely…';
+    case 'completion':
+      return 'Restore complete';
+    case 'cancelled':
+      return 'Restore cancelled safely';
+    case 'error':
+      return 'Restore could not be completed';
+    case 'recovery-required':
+      return 'Restore recovery is required';
+  }
 }
 
 function readLibraryWorkspaceSize(): LibraryWorkspaceSize | null {
@@ -130,6 +174,7 @@ export function LibraryPanel({
   onClose,
   onForget,
   onOpenFile,
+  onImportAsNewPaper,
   onOpenStoredDocument,
   onOpenLibraryNote,
   onSelectSourceForLibraryNote,
@@ -138,11 +183,12 @@ export function LibraryPanel({
   focusSearchRequestId,
   onPinDocument,
   onForgetMany,
-  onUpdateOrganization,
   presentation = 'overlay',
 }: LibraryPanelProps) {
   const [documents, setDocuments] = useState<LibraryDocument[]>([]);
   const [isLoading, setIsLoading] = useState(false);
+  const [libraryLoadFailed, setLibraryLoadFailed] = useState(false);
+  const [libraryLoadRetryToken, setLibraryLoadRetryToken] = useState(0);
   const [forgettingDocumentId, setForgettingDocumentId] = useState<string | null>(null);
   const [openingDocumentId, setOpeningDocumentId] = useState<string | null>(null);
   const [openingNoteId, setOpeningNoteId] = useState<string | null>(null);
@@ -157,8 +203,6 @@ export function LibraryPanel({
   const [isBatchForgetting, setIsBatchForgetting] = useState(false);
   const [isBatchForgetConfirmationOpen, setIsBatchForgetConfirmationOpen] =
     useState(false);
-  const [tags, setTags] = useState<TagRecord[]>([]);
-  const [scope, setScope] = useState<LibraryScope>({ type: 'all' });
   const [pendingForgetDocument, setPendingForgetDocument] =
     useState<LibraryDocument | null>(null);
   const [pendingSourceRemoval, setPendingSourceRemoval] =
@@ -177,6 +221,10 @@ export function LibraryPanel({
   const [isInspectingBackup, setIsInspectingBackup] = useState(false);
   const [isRestoring, setIsRestoring] = useState(false);
   const [restorePreview, setRestorePreview] = useState<RestorePreview | null>(null);
+  const [restoreExecution, setRestoreExecution] =
+    useState<LibraryRestoreExecutionState | null>(null);
+  const restoreAbortRef = useRef<AbortController | null>(null);
+  const restoreDialogRef = useRef<HTMLElement>(null);
   const [storageSummary, setStorageSummary] = useState<LibraryStorageSummary | null>(
     null,
   );
@@ -213,10 +261,26 @@ export function LibraryPanel({
   const [bulkDriveRemovalFeedback, setBulkDriveRemovalFeedback] =
     useState<LibraryBulkDriveRemovalFeedback | null>(null);
   const [isBulkDriveRemovalRunning, setIsBulkDriveRemovalRunning] = useState(false);
+  const destructiveDialogRef = useRef<HTMLElement>(null);
   const panelRef = useRef<HTMLElement>(null);
+  const contentRef = useRef<HTMLDivElement>(null);
   const restoreInputRef = useRef<HTMLInputElement>(null);
   const importDocumentInputRef = useRef<HTMLInputElement>(null);
+  const importNewPaperInputRef = useRef<HTMLInputElement>(null);
   const searchInputRef = useRef<HTMLInputElement>(null);
+  const [isLibraryScrollable, setIsLibraryScrollable] = useState(false);
+  const destructiveDialogKey = pendingForgetDocument
+    ? `forget:${pendingForgetDocument.documentId}`
+    : isBatchForgetConfirmationOpen
+      ? 'batch-forget'
+      : pendingBulkDriveRemoval
+        ? 'bulk-drive-removal'
+        : pendingDriveRemoval
+          ? `drive-removal:${pendingDriveRemoval.documentId}`
+          : pendingSourceRemoval
+            ? `source-removal:${pendingSourceRemoval.documentId}`
+            : null;
+  const isLibraryModalOpen = Boolean(restorePreview || destructiveDialogKey);
   const visibleDocuments = useMemo(
     () =>
       sortDocuments(
@@ -226,15 +290,11 @@ export function LibraryPanel({
             (libraryView === 'pinned'
               ? document.isPinned
               : Boolean(document.lastReadAt));
-          const matchesScope =
-            scope.type === 'all' ||
-            (scope.type === 'tag' && document.tagIds.includes(scope.id));
-
-          return matchesView && matchesScope;
+          return matchesView;
         }),
         sortMode,
       ),
-    [documents, libraryView, scope, sortMode],
+    [documents, libraryView, sortMode],
   );
   const searchResults = useMemo(
     () => getSearchResults(visibleDocuments, searchQuery),
@@ -246,10 +306,10 @@ export function LibraryPanel({
   );
   const cloudOnlyPapers = useMemo(() => {
     return selectCloudOnlyLibraryPapers(syncState.papers, localDocumentIds, {
-      includeCloudOnly: libraryView === 'all' && scope.type === 'all',
+      includeCloudOnly: libraryView === 'all',
       query: searchQuery,
     });
-  }, [libraryView, localDocumentIds, scope.type, searchQuery, syncState.papers]);
+  }, [libraryView, localDocumentIds, searchQuery, syncState.papers]);
   const cloudByDocumentId = useMemo(
     () => new Map(syncState.papers.map((paper) => [paper.documentId, paper])),
     [syncState.papers],
@@ -314,24 +374,26 @@ export function LibraryPanel({
 
     let isDisposed = false;
     setIsLoading(true);
+    setLibraryLoadFailed(false);
     setError(null);
 
-    void listLibraryDocuments().then((nextDocuments) => {
-      if (!isDisposed) {
-        setDocuments(nextDocuments);
-        setIsLoading(false);
-      }
-    });
-    void listTags().then((nextTags) => {
-      if (!isDisposed) {
-        setTags(nextTags);
-      }
-    });
-
+    void listLibraryDocuments()
+      .then((nextDocuments) => {
+        if (!isDisposed) {
+          setDocuments(nextDocuments);
+          setIsLoading(false);
+        }
+      })
+      .catch(() => {
+        if (!isDisposed) {
+          setLibraryLoadFailed(true);
+          setIsLoading(false);
+        }
+      });
     return () => {
       isDisposed = true;
     };
-  }, [isOpen, refreshToken]);
+  }, [isOpen, libraryLoadRetryToken, refreshToken]);
 
   useEffect(() => {
     if (!isOpen) return undefined;
@@ -339,6 +401,54 @@ export function LibraryPanel({
     void syncCoordinator.initialize().catch(() => undefined);
     return unsubscribe;
   }, [isOpen, syncCoordinator]);
+
+  useEffect(
+    () => () => {
+      restoreAbortRef.current?.abort();
+    },
+    [],
+  );
+
+  useEffect(() => {
+    if (!restorePreview) return undefined;
+    const returnFocus =
+      document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    const focusFrame = window.requestAnimationFrame(() => {
+      const dialog = restoreDialogRef.current;
+      const firstButton = dialog?.querySelector<HTMLButtonElement>(
+        'button:not(:disabled)',
+      );
+      (firstButton ?? dialog)?.focus({ preventScroll: true });
+    });
+    return () => {
+      window.cancelAnimationFrame(focusFrame);
+      window.requestAnimationFrame(() => {
+        if (returnFocus?.isConnected) returnFocus.focus({ preventScroll: true });
+      });
+    };
+  }, [restorePreview]);
+
+  useEffect(() => {
+    if (!destructiveDialogKey) return undefined;
+    const returnFocus =
+      document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    const focusFrame = window.requestAnimationFrame(() => {
+      const dialog = destructiveDialogRef.current;
+      const initialFocus = dialog?.querySelector<HTMLElement>(
+        '[data-dialog-initial-focus]:not(:disabled)',
+      );
+      const firstFocusable = dialog?.querySelector<HTMLElement>(
+        'button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled), a[href], [tabindex]:not([tabindex="-1"])',
+      );
+      (initialFocus ?? firstFocusable ?? dialog)?.focus({ preventScroll: true });
+    });
+    return () => {
+      window.cancelAnimationFrame(focusFrame);
+      window.requestAnimationFrame(() => {
+        if (returnFocus?.isConnected) returnFocus.focus({ preventScroll: true });
+      });
+    };
+  }, [destructiveDialogKey]);
 
   useEffect(() => {
     if (isOpen && focusSearchRequestId > 0) {
@@ -369,10 +479,43 @@ export function LibraryPanel({
   }, [isMaximized, isOpen, presentation]);
 
   useEffect(() => {
-    if (scope.type === 'tag' && !tags.some((tag) => tag.id === scope.id)) {
-      setScope({ type: 'all' });
+    const content = contentRef.current;
+    if (!isOpen || !content) {
+      setIsLibraryScrollable(false);
+      return undefined;
     }
-  }, [scope, tags]);
+
+    const scrollContainer = resolveLibraryScrollContainer(content, presentation);
+    const measureScrollability = () => {
+      const nextIsScrollable =
+        scrollContainer.scrollHeight > scrollContainer.clientHeight + 1;
+      setIsLibraryScrollable((current) =>
+        current === nextIsScrollable ? current : nextIsScrollable,
+      );
+    };
+    const frame = window.requestAnimationFrame(measureScrollability);
+    const observer =
+      typeof ResizeObserver === 'function'
+        ? new ResizeObserver(measureScrollability)
+        : null;
+    const mutationObserver =
+      typeof MutationObserver === 'function'
+        ? new MutationObserver(measureScrollability)
+        : null;
+    observer?.observe(content);
+    if (scrollContainer !== content) observer?.observe(scrollContainer);
+    mutationObserver?.observe(content, {
+      childList: true,
+      subtree: true,
+      characterData: true,
+    });
+
+    return () => {
+      window.cancelAnimationFrame(frame);
+      observer?.disconnect();
+      mutationObserver?.disconnect();
+    };
+  }, [isOpen, presentation]);
 
   const refreshLibrary = async () => {
     const [nextDocuments, nextSummary] = await Promise.all([
@@ -392,8 +535,8 @@ export function LibraryPanel({
       await downloadLibraryBackup((completed, total) =>
         setBackupProgress({ completed, total }),
       );
-    } catch {
-      setError('The Library backup could not be created. Please try again.');
+    } catch (backupError) {
+      setError(getBackupCreationErrorMessage(backupError));
     } finally {
       setBackupProgress(null);
     }
@@ -408,9 +551,12 @@ export function LibraryPanel({
       );
     } catch (packageError) {
       setError(
-        packageError instanceof Error
-          ? packageError.message
-          : 'The selected documents could not be packaged.',
+        getBackupCreationErrorMessage(
+          packageError,
+          packageError instanceof Error
+            ? packageError.message
+            : 'The selected documents could not be packaged.',
+        ),
       );
     } finally {
       setPackageProgress(null);
@@ -419,8 +565,18 @@ export function LibraryPanel({
 
   const selectBackup = async (file: File) => {
     setIsInspectingBackup(true);
+    setRestoreExecution(null);
     setError(null);
     try {
+      const existingOperation = await loadDurableRestoreOperation();
+      if (existingOperation) {
+        setError(
+          existingOperation.phase === 'publication-hold'
+            ? 'A restored Library is already waiting for Google Drive review. Review and resume it before starting another restore.'
+            : 'An earlier restore requires safe recovery before another backup can be opened. Reload 39Note to retry recovery.',
+        );
+        return;
+      }
       setRestorePreview(await inspectBackup(file));
     } catch (restoreError) {
       setError(
@@ -434,20 +590,83 @@ export function LibraryPanel({
   };
 
   const restorePreviewDocuments = async (replaceExisting: boolean) => {
-    if (!restorePreview) {
+    if (!restorePreview || restoreAbortRef.current) {
       return;
     }
+    const controller = new AbortController();
+    restoreAbortRef.current = controller;
     setIsRestoring(true);
+    setRestoreExecution({ phase: 'validation' });
     setError(null);
-    const result = await restoreBackup(restorePreview, replaceExisting);
-    setIsRestoring(false);
-    setRestorePreview(null);
-    if (result.failed > 0) {
-      setError(
-        `${result.imported} document${result.imported === 1 ? '' : 's'} restored; ${result.failed} could not be restored.`,
-      );
+    try {
+      const result = await runCrashSafeRestore({
+        preview: restorePreview,
+        collisionPolicy: replaceExisting ? 'replace-existing' : 'keep-existing',
+        signal: controller.signal,
+        onProgress: (progress) => setRestoreExecution(progress),
+      });
+      if (result.phase === 'publication-hold') {
+        await syncCoordinator.observeCommittedRestorePublicationHold().catch(() => {
+          setError(
+            'Restore completed and Drive publication remains safely blocked. Reopen 39Note before reviewing sync.',
+          );
+        });
+      }
+      setRestoreExecution({
+        phase: 'completion',
+        message:
+          result.phase === 'publication-hold'
+            ? `${result.imported} document${result.imported === 1 ? '' : 's'} restored locally. ${result.skipped} kept unchanged. Google Drive publication is paused until you review and explicitly resume it.`
+            : `No local records needed to change. ${result.skipped} existing document${result.skipped === 1 ? ' was' : 's were'} kept.`,
+      });
+      await refreshLibrary().catch(() => {
+        setError(
+          'Restore completed, but the Library view could not refresh. Reopen it.',
+        );
+      });
+    } catch (restoreError) {
+      let recoveryRequired = true;
+      let publicationHold = false;
+      try {
+        const operation = await loadDurableRestoreOperation();
+        recoveryRequired = operation !== null;
+        publicationHold = operation?.phase === 'publication-hold';
+      } catch {
+        // An unreadable barrier must remain fail-closed.
+      }
+      if (publicationHold) {
+        setRestoreExecution({
+          phase: 'error',
+          message:
+            'Another restore finished and is waiting for Google Drive review. Review that restored Library before starting another restore.',
+        });
+      } else if (recoveryRequired) {
+        setRestoreExecution({
+          phase: 'recovery-required',
+          message:
+            '39Note retained the recovery evidence and blocked further changes. Reload to retry safe recovery before continuing.',
+        });
+      } else if (
+        controller.signal.aborted ||
+        (restoreError instanceof DOMException && restoreError.name === 'AbortError')
+      ) {
+        setRestoreExecution({
+          phase: 'cancelled',
+          message: 'Restore cancelled. The previous Library state was restored.',
+        });
+      } else {
+        setRestoreExecution({
+          phase: 'error',
+          message:
+            restoreError instanceof Error
+              ? restoreError.message
+              : 'The backup could not be restored. No partial restore was retained.',
+        });
+      }
+    } finally {
+      if (restoreAbortRef.current === controller) restoreAbortRef.current = null;
+      setIsRestoring(false);
     }
-    await refreshLibrary();
   };
 
   const removeSourceCopy = async (document: LibraryDocument) => {
@@ -660,14 +879,51 @@ export function LibraryPanel({
   };
 
   const isSearching = searchQuery.trim().length > 0;
-  const activeScopeName =
-    scope.type === 'tag' ? tags.find((tag) => tag.id === scope.id)?.name : null;
-  const hasActiveScope = scope.type !== 'all' || libraryView !== 'all';
-  const applyScope = (nextScope: LibraryScope) => {
-    setScope(nextScope);
-    setSearchQuery('');
+  const closeDestructiveDialog = () => {
+    if (
+      pendingForgetDocument &&
+      forgettingDocumentId !== pendingForgetDocument.documentId
+    ) {
+      setPendingForgetDocument(null);
+    } else if (isBatchForgetConfirmationOpen && !isBatchForgetting) {
+      setIsBatchForgetConfirmationOpen(false);
+    } else if (pendingBulkDriveRemoval) {
+      setPendingBulkDriveRemoval(null);
+    } else if (pendingDriveRemoval) {
+      setPendingDriveRemoval(null);
+    } else if (pendingSourceRemoval) {
+      setPendingSourceRemoval(null);
+    }
   };
-
+  const handleDestructiveDialogKeyDown = (event: ReactKeyboardEvent<HTMLElement>) => {
+    if (event.key === 'Escape') {
+      event.preventDefault();
+      closeDestructiveDialog();
+      return;
+    }
+    if (event.key !== 'Tab') return;
+    const dialog = destructiveDialogRef.current;
+    if (!dialog) return;
+    const focusable = Array.from(
+      dialog.querySelectorAll<HTMLElement>(
+        'button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled), a[href], [tabindex]:not([tabindex="-1"])',
+      ),
+    ).filter((element) => !element.hasAttribute('inert'));
+    if (!focusable.length) {
+      event.preventDefault();
+      dialog.focus({ preventScroll: true });
+      return;
+    }
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+    if (event.shiftKey && document.activeElement === first) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault();
+      first.focus();
+    }
+  };
   return (
     <section
       ref={panelRef}
@@ -682,7 +938,11 @@ export function LibraryPanel({
           : undefined
       }
     >
-      <header className="library-panel-header">
+      <header
+        aria-hidden={isLibraryModalOpen ? true : undefined}
+        className="library-panel-header"
+        inert={isLibraryModalOpen ? true : undefined}
+      >
         <div>
           <p>Library</p>
           <h2>Saved documents</h2>
@@ -703,6 +963,29 @@ export function LibraryPanel({
             onChange={(event) => {
               const [selectedFile] = Array.from(event.target.files ?? []);
               if (selectedFile) onOpenFile(selectedFile);
+              event.target.value = '';
+            }}
+          />
+          <button
+            aria-describedby="library-import-new-paper-description"
+            className="library-import-button library-import-new-paper-button"
+            type="button"
+            onClick={() => importNewPaperInputRef.current?.click()}
+          >
+            Import as new paper
+          </button>
+          <span className="visually-hidden" id="library-import-new-paper-description">
+            Import a PDF as a separate paper. Existing local and cloud history is
+            unchanged and ignored cloud records are not deleted.
+          </span>
+          <input
+            ref={importNewPaperInputRef}
+            accept={PDF_DOCUMENT_ACCEPT}
+            className="visually-hidden"
+            type="file"
+            onChange={(event) => {
+              const [selectedFile] = Array.from(event.target.files ?? []);
+              if (selectedFile) onImportAsNewPaper(selectedFile);
               event.target.value = '';
             }}
           />
@@ -730,7 +1013,12 @@ export function LibraryPanel({
           ) : null}
         </div>
       </header>
-      <div className="library-panel-content">
+      <div
+        ref={contentRef}
+        aria-hidden={isLibraryModalOpen ? true : undefined}
+        className="library-panel-content"
+        inert={isLibraryModalOpen ? true : undefined}
+      >
         <p className="library-description">
           Your local papers and verified Google Drive papers appear together here. Word
           and PowerPoint files are converted locally to PDF before they are added.
@@ -746,7 +1034,11 @@ export function LibraryPanel({
               : 'Back up Library'}
           </button>
           <button
-            disabled={isInspectingBackup || isRestoring}
+            disabled={
+              isInspectingBackup ||
+              isRestoring ||
+              Boolean(syncState.restorePublicationHold)
+            }
             type="button"
             onClick={() => restoreInputRef.current?.click()}
           >
@@ -759,6 +1051,7 @@ export function LibraryPanel({
             ref={restoreInputRef}
             className="visually-hidden"
             accept="application/zip,.zip"
+            disabled={Boolean(syncState.restorePublicationHold)}
             type="file"
             onChange={(event) => {
               const [selectedFile] = Array.from(event.target.files ?? []);
@@ -769,6 +1062,12 @@ export function LibraryPanel({
             }}
           />
         </div>
+        {syncState.restorePublicationHold ? (
+          <p className="library-restore-hold-notice" role="status">
+            Another Library restore is unavailable until you review the restored work in
+            Google Drive settings. Local reading and editing remain available.
+          </p>
+        ) : null}
         {isStorageOpen && storageSummary ? (
           <section
             className="library-storage-summary"
@@ -857,44 +1156,6 @@ export function LibraryPanel({
             {isSelectionMode ? 'Done selecting' : 'Select'}
           </button>
         </div>
-        <div className="library-scope-row">
-          <div className="library-scope-list" aria-label="Browse Library by Tag">
-            <span>Browse:</span>
-            {hasActiveScope ? (
-              <strong>
-                {activeScopeName ??
-                  (libraryView === 'recent'
-                    ? 'Recent'
-                    : libraryView === 'pinned'
-                      ? 'Pinned'
-                      : 'All documents')}
-              </strong>
-            ) : null}
-            {tags.map((tag) => (
-              <button
-                aria-pressed={scope.type === 'tag' && scope.id === tag.id}
-                className="library-scope-button"
-                key={`tag:${tag.id}`}
-                type="button"
-                onClick={() => applyScope({ type: 'tag', id: tag.id })}
-              >
-                #{tag.name}
-              </button>
-            ))}
-          </div>
-          {hasActiveScope ? (
-            <button
-              className="library-clear-scope"
-              type="button"
-              onClick={() => {
-                applyScope({ type: 'all' });
-                setLibraryView('all');
-              }}
-            >
-              Clear Scope
-            </button>
-          ) : null}
-        </div>
         {isSelectionMode ? (
           <div className="library-backup-actions library-selection-actions">
             <button
@@ -953,10 +1214,34 @@ export function LibraryPanel({
             ) : null}
           </div>
         ) : null}
+        {libraryLoadFailed ? (
+          <FeedbackNotice
+            actions={
+              <button
+                type="button"
+                onClick={() => setLibraryLoadRetryToken((current) => current + 1)}
+              >
+                Retry
+              </button>
+            }
+            description="39Note could not read this device’s Library. Existing local data was not changed."
+            persistent
+            title="Library unavailable"
+            tone="error"
+          />
+        ) : null}
         {error ? (
-          <p className="library-error" role="status">
-            {error}
-          </p>
+          <FeedbackNotice
+            actions={
+              <button type="button" onClick={() => setError(null)}>
+                Dismiss
+              </button>
+            }
+            description={error}
+            persistent
+            title="Library action not completed"
+            tone="error"
+          />
         ) : null}
         {cloudActionNotice ? (
           <p className="sync-success" role="status">
@@ -1001,10 +1286,14 @@ export function LibraryPanel({
           </section>
         ) : null}
         {isLoading ? <p className="library-empty">Loading saved documents…</p> : null}
-        {!isLoading && documents.length === 0 && cloudOnlyPapers.length === 0 ? (
+        {!isLoading &&
+        !libraryLoadFailed &&
+        documents.length === 0 &&
+        cloudOnlyPapers.length === 0 ? (
           <p className="library-empty">No saved documents yet.</p>
         ) : null}
         {!isLoading &&
+        !libraryLoadFailed &&
         (documents.length > 0 || cloudOnlyPapers.length > 0) &&
         searchResults.documents.length === 0 &&
         cloudOnlyPapers.length === 0 &&
@@ -1052,15 +1341,6 @@ export function LibraryPanel({
                       : [...ids, document.documentId],
                   )
                 }
-                tags={tags}
-                onUpdateOrganization={(update) =>
-                  void onUpdateOrganization(document.documentId, update).then(
-                    (updated) => {
-                      if (updated) void refreshLibrary();
-                    },
-                  )
-                }
-                onScope={applyScope}
                 cloudPaper={cloudByDocumentId.get(document.documentId)}
                 syncPaper={syncByDocumentId.get(document.documentId)}
                 cloudOperation={cloudOperations[document.documentId]}
@@ -1136,14 +1416,47 @@ export function LibraryPanel({
             ))}
           </section>
         ) : null}
+        {isLibraryScrollable &&
+        (searchResults.documents.length > 0 ||
+          cloudOnlyPapers.length > 0 ||
+          searchResults.notes.length > 0) ? (
+          <footer className="library-list-footer">
+            <button
+              aria-label="Back to top"
+              className="library-back-to-top"
+              title="Back to top"
+              type="button"
+              onClick={() => {
+                const content = contentRef.current;
+                if (!content) return;
+                const scrollContainer = resolveLibraryScrollContainer(
+                  content,
+                  presentation,
+                );
+                const prefersReducedMotion =
+                  typeof window.matchMedia === 'function' &&
+                  window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+                scrollLibraryContainerToTop(scrollContainer, prefersReducedMotion);
+              }}
+            >
+              <svg aria-hidden="true" viewBox="0 0 24 24">
+                <path d="m6.5 14.5 5.5-5.5 5.5 5.5M12 9v10" />
+              </svg>
+              <span>Back to top</span>
+            </button>
+          </footer>
+        ) : null}
       </div>
       {pendingForgetDocument ? (
         <div className="library-confirm-overlay" role="presentation">
           <section
+            ref={destructiveDialogRef}
             className="library-confirm-dialog"
             aria-modal="true"
             aria-label="Forget document"
             role="dialog"
+            tabIndex={-1}
+            onKeyDown={handleDestructiveDialogKeyDown}
           >
             <h3>Remove from this device?</h3>
             <p>
@@ -1152,7 +1465,11 @@ export function LibraryPanel({
             </p>
             <div>
               {forgettingDocumentId !== pendingForgetDocument.documentId ? (
-                <button type="button" onClick={() => setPendingForgetDocument(null)}>
+                <button
+                  data-dialog-initial-focus
+                  type="button"
+                  onClick={() => setPendingForgetDocument(null)}
+                >
                   Cancel
                 </button>
               ) : null}
@@ -1173,10 +1490,13 @@ export function LibraryPanel({
       {isBatchForgetConfirmationOpen ? (
         <div className="library-confirm-overlay" role="presentation">
           <section
+            ref={destructiveDialogRef}
             className="library-confirm-dialog"
             aria-modal="true"
             aria-label="Forget selected documents"
             role="dialog"
+            tabIndex={-1}
+            onKeyDown={handleDestructiveDialogKeyDown}
           >
             <h3>Remove {selectedLocalDocumentIds.length} from this device?</h3>
             <p>
@@ -1186,6 +1506,7 @@ export function LibraryPanel({
             <div>
               {!isBatchForgetting ? (
                 <button
+                  data-dialog-initial-focus
                   type="button"
                   onClick={() => setIsBatchForgetConfirmationOpen(false)}
                 >
@@ -1207,10 +1528,13 @@ export function LibraryPanel({
       {pendingBulkDriveRemoval ? (
         <div className="library-confirm-overlay" role="presentation">
           <section
+            ref={destructiveDialogRef}
             aria-label="Remove selected papers from Google Drive"
             aria-modal="true"
             className="library-confirm-dialog"
             role="dialog"
+            tabIndex={-1}
+            onKeyDown={handleDestructiveDialogKeyDown}
           >
             <h3>
               Remove {pendingBulkDriveRemoval.eligible.length}{' '}
@@ -1232,7 +1556,11 @@ export function LibraryPanel({
               </p>
             ) : null}
             <div>
-              <button type="button" onClick={() => setPendingBulkDriveRemoval(null)}>
+              <button
+                data-dialog-initial-focus
+                type="button"
+                onClick={() => setPendingBulkDriveRemoval(null)}
+              >
                 Cancel
               </button>
               <button
@@ -1249,20 +1577,27 @@ export function LibraryPanel({
       {pendingDriveRemoval ? (
         <div className="library-confirm-overlay" role="presentation">
           <section
+            ref={destructiveDialogRef}
             aria-label="Remove paper from Google Drive"
             aria-modal="true"
             className="library-confirm-dialog"
             role="dialog"
+            tabIndex={-1}
+            onKeyDown={handleDestructiveDialogKeyDown}
           >
             <h3>Remove from Google Drive?</h3>
             <p>
               {pendingDriveRemoval.hasLocalCopy
-                ? `${pendingDriveRemoval.displayName} will stay on this device with its source document, annotations, Notes, Glossary, reading state, Collections, Tags, and Print Draft.`
+                ? `${pendingDriveRemoval.displayName} will stay on this device with its source document, annotations, Notes, Glossary, reading state, Collections, and Print Draft.`
                 : `${pendingDriveRemoval.displayName} will be removed from the active Drive library on every compatible device.`}
             </p>
             <p>The verified paper folder will be moved to Google Drive Trash.</p>
             <div>
-              <button type="button" onClick={() => setPendingDriveRemoval(null)}>
+              <button
+                data-dialog-initial-focus
+                type="button"
+                onClick={() => setPendingDriveRemoval(null)}
+              >
                 Cancel
               </button>
               <button
@@ -1281,10 +1616,13 @@ export function LibraryPanel({
       {pendingSourceRemoval ? (
         <div className="library-confirm-overlay" role="presentation">
           <section
+            ref={destructiveDialogRef}
             className="library-confirm-dialog"
             aria-modal="true"
             aria-label="Remove saved source copy"
             role="dialog"
+            tabIndex={-1}
+            onKeyDown={handleDestructiveDialogKeyDown}
           >
             <h3>Remove the saved source copy?</h3>
             <p>
@@ -1293,7 +1631,11 @@ export function LibraryPanel({
               Library. The original document on your computer is not deleted.
             </p>
             <div>
-              <button type="button" onClick={() => setPendingSourceRemoval(null)}>
+              <button
+                data-dialog-initial-focus
+                type="button"
+                onClick={() => setPendingSourceRemoval(null)}
+              >
                 Cancel
               </button>
               <button
@@ -1313,53 +1655,142 @@ export function LibraryPanel({
       {restorePreview ? (
         <div className="library-confirm-overlay" role="presentation">
           <section
+            ref={restoreDialogRef}
             className="library-confirm-dialog library-restore-dialog"
             aria-modal="true"
             aria-label="Restore Library backup"
             role="dialog"
+            tabIndex={-1}
+            onKeyDown={(event) => {
+              if (event.key === 'Escape') {
+                event.preventDefault();
+                if (!isRestoring && restoreExecution?.phase !== 'recovery-required') {
+                  setRestoreExecution(null);
+                  setRestorePreview(null);
+                }
+                return;
+              }
+              if (event.key !== 'Tab') return;
+              const dialog = restoreDialogRef.current;
+              if (!dialog) return;
+              const focusable = Array.from(
+                dialog.querySelectorAll<HTMLButtonElement>('button:not(:disabled)'),
+              );
+              if (!focusable.length) {
+                event.preventDefault();
+                dialog.focus({ preventScroll: true });
+                return;
+              }
+              const first = focusable[0];
+              const last = focusable[focusable.length - 1];
+              if (event.shiftKey && document.activeElement === first) {
+                event.preventDefault();
+                last.focus();
+              } else if (!event.shiftKey && document.activeElement === last) {
+                event.preventDefault();
+                first.focus();
+              }
+            }}
           >
             <h3>Restore Library backup</h3>
-            <p>
-              {restorePreview.documents.length} documents, {restorePreview.sourceCount}{' '}
-              source copies, {restorePreview.highlightCount} highlights,{' '}
-              {restorePreview.underlineCount} underlines, and {restorePreview.noteCount}{' '}
-              Notes are ready to restore.
-            </p>
-            <p>Created {formatUpdatedAt(restorePreview.manifest.createdAt)}.</p>
-            {restorePreview.conflictCount > 0 ? (
-              <p>
-                {restorePreview.conflictCount} document
-                {restorePreview.conflictCount === 1 ? '' : 's'} already exist
-                {restorePreview.conflictCount === 1 ? 's' : ''} in this Library.
-              </p>
-            ) : null}
+            {restoreExecution ? (
+              <div
+                aria-live={
+                  restoreExecution.phase === 'error' ||
+                  restoreExecution.phase === 'recovery-required'
+                    ? 'assertive'
+                    : 'polite'
+                }
+                className={`library-restore-progress is-${restoreExecution.phase}`}
+                role={
+                  restoreExecution.phase === 'error' ||
+                  restoreExecution.phase === 'recovery-required'
+                    ? 'alert'
+                    : 'status'
+                }
+              >
+                <strong>{restoreExecutionLabel(restoreExecution.phase)}</strong>
+                {restoreExecution.total !== undefined &&
+                restoreExecution.completed !== undefined ? (
+                  <progress
+                    aria-label={restoreExecutionLabel(restoreExecution.phase)}
+                    max={Math.max(restoreExecution.total, 1)}
+                    value={restoreExecution.completed}
+                  />
+                ) : null}
+                {restoreExecution.message ? <p>{restoreExecution.message}</p> : null}
+              </div>
+            ) : (
+              <>
+                <p>
+                  {restorePreview.documents.length} documents,{' '}
+                  {restorePreview.sourceCount} source copies,{' '}
+                  {restorePreview.highlightCount} highlights,{' '}
+                  {restorePreview.underlineCount} underlines, and{' '}
+                  {restorePreview.noteCount} Notes are ready to restore.
+                </p>
+                <p>Created {formatUpdatedAt(restorePreview.manifest.createdAt)}.</p>
+                {restorePreview.conflictCount > 0 ? (
+                  <p>
+                    {restorePreview.conflictCount} document
+                    {restorePreview.conflictCount === 1 ? '' : 's'} already exist
+                    {restorePreview.conflictCount === 1 ? 's' : ''} in this Library.
+                  </p>
+                ) : null}
+              </>
+            )}
             <div>
-              <button
-                disabled={isRestoring}
-                type="button"
-                onClick={() => setRestorePreview(null)}
-              >
-                Cancel
-              </button>
-              <button
-                disabled={isRestoring}
-                type="button"
-                onClick={() => void restorePreviewDocuments(false)}
-              >
-                {isRestoring
-                  ? 'Restoring...'
-                  : restorePreview.conflictCount > 0
-                    ? 'Keep existing'
-                    : 'Restore'}
-              </button>
-              {restorePreview.conflictCount > 0 ? (
+              {!restoreExecution ? (
+                <button type="button" onClick={() => setRestorePreview(null)}>
+                  Cancel
+                </button>
+              ) : null}
+              {!restoreExecution ? (
+                <button
+                  type="button"
+                  onClick={() => void restorePreviewDocuments(false)}
+                >
+                  {restorePreview.conflictCount > 0 ? 'Keep existing' : 'Restore'}
+                </button>
+              ) : null}
+              {!restoreExecution && restorePreview.conflictCount > 0 ? (
                 <button
                   className="library-forget-button"
-                  disabled={isRestoring}
                   type="button"
                   onClick={() => void restorePreviewDocuments(true)}
                 >
                   Replace existing
+                </button>
+              ) : null}
+              {isRestoring &&
+              (restoreExecution?.phase === 'validation' ||
+                restoreExecution?.phase === 'preparation' ||
+                restoreExecution?.phase === 'restoration') ? (
+                <button type="button" onClick={() => restoreAbortRef.current?.abort()}>
+                  Cancel restore safely
+                </button>
+              ) : null}
+              {!isRestoring &&
+              restoreExecution &&
+              restoreExecution.phase !== 'recovery-required' ? (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setRestoreExecution(null);
+                    if (
+                      restoreExecution.phase === 'completion' ||
+                      restoreExecution.phase === 'cancelled'
+                    ) {
+                      setRestorePreview(null);
+                    }
+                  }}
+                >
+                  {restoreExecution.phase === 'error' ? 'Back' : 'Close'}
+                </button>
+              ) : null}
+              {restoreExecution?.phase === 'recovery-required' ? (
+                <button type="button" onClick={() => window.location.reload()}>
+                  Retry safe recovery
                 </button>
               ) : null}
             </div>
@@ -1388,9 +1819,6 @@ interface LibraryDocumentCardProps {
   selectionMode: boolean;
   selected: boolean;
   onSelect: () => void;
-  tags: TagRecord[];
-  onUpdateOrganization: (update: { tagIds?: string[] }) => void;
-  onScope: (scope: LibraryScope) => void;
   cloudPaper?: PaperCloudSummary;
   syncPaper?: PaperSyncState;
   cloudOperation?: LibraryCloudOperation;
@@ -1419,9 +1847,6 @@ function LibraryDocumentCard({
   selectionMode,
   selected,
   onSelect,
-  tags,
-  onUpdateOrganization,
-  onScope,
   cloudPaper,
   syncPaper,
   cloudOperation,
@@ -1441,7 +1866,7 @@ function LibraryDocumentCard({
   return (
     <article
       className={`library-document ${selected ? 'is-selected' : ''}`}
-      tabIndex={0}
+      tabIndex={selectionMode ? 0 : undefined}
       onClick={selectionMode ? onSelect : undefined}
       onKeyDown={(event) => {
         if (selectionMode && (event.key === 'Enter' || event.key === ' ')) {
@@ -1450,159 +1875,127 @@ function LibraryDocumentCard({
         }
       }}
     >
-      <div className="library-document-title-row">
-        {selectionMode ? (
-          <input
-            aria-label={`Select ${document.displayTitle}`}
-            checked={selected}
-            type="checkbox"
-            onChange={onSelect}
-            onClick={(event) => event.stopPropagation()}
-          />
-        ) : null}
-        {editingTitle ? (
-          <input
-            aria-label="Document title"
-            autoFocus
-            className="library-title-input"
-            value={titleDraft}
-            onBlur={onCommitTitle}
-            onChange={(event) => onTitleDraftChange(event.target.value)}
-            onClick={(event) => event.stopPropagation()}
-            onKeyDown={(event) => {
-              if (event.key === 'Enter') {
-                event.preventDefault();
-                event.currentTarget.blur();
-              }
-              if (event.key === 'Escape') {
-                event.preventDefault();
-                onCancelTitle();
-              }
-            }}
-          />
-        ) : (
-          <h3>{document.displayTitle}</h3>
-        )}
-        <span
-          aria-label={`Document type: ${formatDocumentTypeLabel(document.documentType)}`}
-          className="library-count"
-        >
-          {formatDocumentTypeLabel(document.documentType)}
-        </span>
-        <button
-          aria-label="Rename document"
-          className="library-rename-button"
-          type="button"
-          onClick={(event) => {
-            event.stopPropagation();
-            onStartEditing();
-          }}
-        >
-          Rename
-        </button>
-        <button
-          aria-pressed={document.isPinned}
-          className="library-rename-button"
-          type="button"
-          onClick={(event) => {
-            event.stopPropagation();
-            onPin();
-          }}
-        >
-          {document.isPinned ? '● Pinned' : 'Pin'}
-        </button>
-      </div>
-      {document.originalFileName !== document.displayTitle ? (
-        <p className="library-original-file-name">{document.originalFileName}</p>
-      ) : null}
-      <LibraryPaperDriveStatus
-        cloudOperation={cloudOperation}
-        presentation={drivePresentation}
-      />
-      <div className="library-counts">
-        <span className="library-count library-highlight-count">
-          {document.highlightCount} Highlights
-        </span>
-        <span className="library-count library-underline-count">
-          {document.underlineCount} Underlines
-        </span>
-        <span className="library-count library-note-count">
-          {document.noteCount} Notes
-        </span>
-      </div>
-      <div className="library-document-actions">
-        <select
-          aria-label="Add Tag"
-          value=""
-          onClick={(event) => event.stopPropagation()}
-          onChange={(event) => {
-            const id = event.target.value;
-            if (id) onUpdateOrganization({ tagIds: [...document.tagIds, id] });
-          }}
-        >
-          <option value="">Add Tag</option>
-          {tags
-            .filter((item) => !document.tagIds.includes(item.id))
-            .map((item) => (
-              <option key={item.id} value={item.id}>
-                {item.name}
-              </option>
-            ))}
-        </select>
-      </div>
-      {document.tagIds.length > 0 ? (
-        <div className="library-counts" aria-label="Document organization">
-          {tags
-            .filter((item) => document.tagIds.includes(item.id))
-            .map((item) => (
-              <button
-                className="library-scope-button"
-                key={`scope-${item.id}`}
-                type="button"
-                onClick={(event) => {
-                  event.stopPropagation();
-                  onScope({ type: 'tag', id: item.id });
-                }}
-              >
-                Tag: {item.name}
-              </button>
-            ))}
-          {tags
-            .filter((item) => document.tagIds.includes(item.id))
-            .map((item) => (
-              <span className="library-count" key={item.id}>
-                Tag: {item.name}
-                <button
-                  aria-label={`Remove ${item.name} tag`}
-                  type="button"
-                  onClick={(event) => {
-                    event.stopPropagation();
-                    onUpdateOrganization({
-                      tagIds: document.tagIds.filter((id) => id !== item.id),
-                    });
-                  }}
-                >
-                  ×
-                </button>
-              </span>
-            ))}
+      <div className="library-document-heading">
+        <div className="library-document-title-row">
+          {selectionMode ? (
+            <input
+              aria-label={`Select ${document.displayTitle}`}
+              checked={selected}
+              type="checkbox"
+              onChange={onSelect}
+              onClick={(event) => event.stopPropagation()}
+            />
+          ) : null}
+          {editingTitle ? (
+            <input
+              aria-label="Document title"
+              autoFocus
+              className="library-title-input"
+              value={titleDraft}
+              onBlur={onCommitTitle}
+              onChange={(event) => onTitleDraftChange(event.target.value)}
+              onClick={(event) => event.stopPropagation()}
+              onKeyDown={(event) => {
+                if (event.key === 'Enter') {
+                  event.preventDefault();
+                  event.currentTarget.blur();
+                }
+                if (event.key === 'Escape') {
+                  event.preventDefault();
+                  onCancelTitle();
+                }
+              }}
+            />
+          ) : (
+            <h3 title={document.displayTitle}>{document.displayTitle}</h3>
+          )}
+          <span
+            aria-label={`Document type: ${formatDocumentTypeLabel(document.documentType)}`}
+            className="library-count library-document-type"
+          >
+            {formatDocumentTypeLabel(document.documentType)}
+          </span>
         </div>
-      ) : null}
-      <time dateTime={toDateTime(document.updatedAt)}>
-        Updated {formatUpdatedAt(document.updatedAt)}
-      </time>
-      {document.lastReadAt ? (
-        <time dateTime={toDateTime(document.lastReadAt)}>
-          Last read {formatUpdatedAt(document.lastReadAt)}
+        <LibraryPaperDriveStatus
+          cloudOperation={cloudOperation}
+          presentation={drivePresentation}
+        />
+        <div className="library-document-edit-actions">
+          <button
+            aria-label={`Rename ${document.displayTitle}`}
+            className="library-rename-button"
+            type="button"
+            onClick={(event) => {
+              event.stopPropagation();
+              onStartEditing();
+            }}
+          >
+            Rename
+          </button>
+          <button
+            aria-label={`${document.isPinned ? 'Unpin' : 'Pin'} ${document.displayTitle}`}
+            aria-pressed={document.isPinned}
+            className="library-rename-button"
+            type="button"
+            onClick={(event) => {
+              event.stopPropagation();
+              onPin();
+            }}
+          >
+            {document.isPinned ? '● Pinned' : 'Pin'}
+          </button>
+        </div>
+      </div>
+      <div className="library-document-summary">
+        <div className="library-counts">
+          <span className="library-count library-highlight-count">
+            {formatCount(document.highlightCount, 'Highlight')}
+          </span>
+          <span className="library-count library-underline-count">
+            {formatCount(document.underlineCount, 'Underline')}
+          </span>
+          <span className="library-count library-note-count">
+            {formatCount(document.noteCount, 'Note')}
+          </span>
+        </div>
+        {isPdfDocument ? (
+          <button
+            aria-label="Read Now"
+            className="library-open-button library-read-now-button"
+            disabled={!document.hasStoredSource || isOpening}
+            title={document.hasStoredSource ? 'Read Now' : 'Select the PDF first'}
+            type="button"
+            onClick={(event) => {
+              event.stopPropagation();
+              onOpen();
+            }}
+          >
+            {isOpening ? 'Opening…' : 'Read Now'}
+          </button>
+        ) : null}
+      </div>
+      <div className="library-document-metadata">
+        <time dateTime={toDateTime(document.updatedAt)}>
+          Updated {formatUpdatedAt(document.updatedAt)}
         </time>
-      ) : null}
-      <p className="library-document-hint">
-        {isPdfDocument
-          ? document.hasStoredSource
-            ? `Saved PDF source: ${formatFileSize(document.sourceSize ?? 0)}.`
-            : 'Select this PDF once from your device to enable direct reopening.'
-          : 'Experimental Office-native record preserved for compatibility. It is not treated as a readable 39Note paper.'}
-      </p>
+        {document.lastReadAt ? (
+          <time dateTime={toDateTime(document.lastReadAt)}>
+            Last read {formatUpdatedAt(document.lastReadAt)}
+          </time>
+        ) : null}
+        <p className="library-document-hint">
+          {isPdfDocument
+            ? document.hasStoredSource
+              ? `Saved PDF source: ${formatFileSize(document.sourceSize ?? 0)}.`
+              : 'Select this PDF once from your device to enable direct reopening.'
+            : 'Experimental Office-native record preserved for compatibility. It is not treated as a readable 39Note paper.'}
+        </p>
+        {document.originalFileName !== document.displayTitle ? (
+          <p className="library-original-file-name" title={document.originalFileName}>
+            Original: {document.originalFileName}
+          </p>
+        ) : null}
+      </div>
       {!isPdfDocument ? (
         <p className="library-compatibility-warning" role="note">
           Direct {formatDocumentTypeLabel(document.documentType)} reading and upload are
@@ -1629,6 +2022,7 @@ function LibraryDocumentCard({
           </button>
         ) : hasCloudCopy ? (
           <button
+            className="library-management-action library-cloud-removal-action"
             disabled={
               syncBusy || !cloudMutationAllowed || cloudNeedsAttention || selectionMode
             }
@@ -1645,7 +2039,10 @@ function LibraryDocumentCard({
               onRemoveFromDrive();
             }}
           >
-            {cloudOperation === 'remove' ? 'Removing…' : 'Remove from Google Drive'}
+            <LibraryManagementActionIcon kind="cloud" />
+            <span>
+              {cloudOperation === 'remove' ? 'Removing…' : 'Remove from Google Drive'}
+            </span>
           </button>
         ) : isPdfDocument ? (
           <button
@@ -1684,33 +2081,19 @@ function LibraryDocumentCard({
           </label>
         ) : document.hasStoredSource ? (
           <button
-            className="library-secondary-button"
+            className="library-management-action library-source-removal-action"
             type="button"
             onClick={(event) => {
               event.stopPropagation();
               onRemoveSourceCopy();
             }}
           >
-            Remove source copy
-          </button>
-        ) : null}
-        {isPdfDocument ? (
-          <button
-            aria-label="Read Now"
-            className="library-open-button library-read-now-button"
-            disabled={!document.hasStoredSource || isOpening}
-            title={document.hasStoredSource ? 'Read Now' : 'Select the PDF first'}
-            type="button"
-            onClick={(event) => {
-              event.stopPropagation();
-              onOpen();
-            }}
-          >
-            {isOpening ? 'Opening…' : 'Read Now'}
+            <LibraryManagementActionIcon kind="source" />
+            <span>Remove source copy</span>
           </button>
         ) : null}
         <button
-          className="library-forget-button"
+          className="library-management-action library-device-removal-action"
           disabled={isForgetting}
           type="button"
           onClick={(event) => {
@@ -1718,7 +2101,8 @@ function LibraryDocumentCard({
             onForget();
           }}
         >
-          {isForgetting ? 'Removing…' : 'Remove from this device'}
+          <LibraryManagementActionIcon kind="device" />
+          <span>{isForgetting ? 'Removing…' : 'Remove from this device'}</span>
         </button>
       </div>
     </article>
@@ -1757,7 +2141,7 @@ export function LibraryPaperDriveStatus({
         )}
       </div>
       {presentation.issue?.message ? (
-        <p className="library-error" role="alert">
+        <p className="library-error" role="status">
           {presentation.issue.message}
         </p>
       ) : null}
@@ -1794,7 +2178,7 @@ function CloudOnlyPaperCard({
   return (
     <article
       className={`library-document library-cloud-only-document ${selected ? 'is-selected' : ''}`}
-      tabIndex={0}
+      tabIndex={selectionMode ? 0 : undefined}
       onClick={selectionMode ? onSelect : undefined}
       onKeyDown={(event) => {
         if (selectionMode && (event.key === 'Enter' || event.key === ' ')) {
@@ -1803,27 +2187,32 @@ function CloudOnlyPaperCard({
         }
       }}
     >
-      <div className="library-document-title-row">
-        {selectionMode ? (
-          <input
-            aria-label={`Select ${paper.displayName}`}
-            checked={selected}
-            type="checkbox"
-            onChange={onSelect}
-            onClick={(event) => event.stopPropagation()}
-          />
-        ) : null}
-        <h3>{paper.displayName}</h3>
-        {documentType ? (
-          <span
-            aria-label={`Document type: ${formatDocumentTypeLabel(documentType)}`}
-            className="library-count"
-          >
-            {formatDocumentTypeLabel(documentType)}
-          </span>
-        ) : null}
+      <div className="library-document-heading library-cloud-only-heading">
+        <div className="library-document-title-row">
+          {selectionMode ? (
+            <input
+              aria-label={`Select ${paper.displayName}`}
+              checked={selected}
+              type="checkbox"
+              onChange={onSelect}
+              onClick={(event) => event.stopPropagation()}
+            />
+          ) : null}
+          <h3 title={paper.displayName}>{paper.displayName}</h3>
+          {documentType ? (
+            <span
+              aria-label={`Document type: ${formatDocumentTypeLabel(documentType)}`}
+              className="library-count library-document-type"
+            >
+              {formatDocumentTypeLabel(documentType)}
+            </span>
+          ) : null}
+        </div>
+        <LibraryPaperDriveStatus
+          cloudOperation={operation}
+          presentation={presentation}
+        />
       </div>
-      <LibraryPaperDriveStatus cloudOperation={operation} presentation={presentation} />
       <p className="library-document-hint">
         {isPdfDocument
           ? 'Metadata only. The PDF and editable state stay in Google Drive until you choose Download.'
@@ -1846,6 +2235,7 @@ function CloudOnlyPaperCard({
           </button>
         ) : null}
         <button
+          className="library-management-action library-cloud-removal-action"
           disabled={busy || !cloudRemovalAllowed || needsAttention || selectionMode}
           title={
             !cloudRemovalAllowed
@@ -1857,7 +2247,10 @@ function CloudOnlyPaperCard({
           type="button"
           onClick={onRemove}
         >
-          {operation === 'remove' ? 'Removing…' : 'Remove from Google Drive'}
+          <LibraryManagementActionIcon kind="cloud" />
+          <span>
+            {operation === 'remove' ? 'Removing…' : 'Remove from Google Drive'}
+          </span>
         </button>
       </div>
     </article>
@@ -1976,8 +2369,44 @@ function createExcerpt(value: string, maximumLength: number): string {
     : normalizedValue;
 }
 
+function LibraryManagementActionIcon({
+  kind,
+}: {
+  kind: 'cloud' | 'source' | 'device';
+}) {
+  return (
+    <svg
+      aria-hidden="true"
+      className="library-management-icon"
+      focusable="false"
+      viewBox="0 0 24 24"
+    >
+      {kind === 'cloud' ? (
+        <>
+          <path d="M6.5 18h10a4.5 4.5 0 0 0 .5-8.97A6 6 0 0 0 5.6 7.4 4.5 4.5 0 0 0 6.5 18Z" />
+          <path d="M9 13h6" />
+        </>
+      ) : kind === 'source' ? (
+        <>
+          <path d="M7 3.5h6l4 4v13H7Z" />
+          <path d="M13 3.5v4h4M9.5 14.5h5" />
+        </>
+      ) : (
+        <>
+          <rect width="16" height="11" x="4" y="5" rx="2" />
+          <path d="M2.5 19.5h19M9 10.5h6" />
+        </>
+      )}
+    </svg>
+  );
+}
+
 function formatDocumentTypeLabel(documentType: DocumentType): string {
   return documentType.toLocaleUpperCase('en-US');
+}
+
+function formatCount(count: number, singularLabel: string): string {
+  return `${count} ${singularLabel}${count === 1 ? '' : 's'}`;
 }
 
 function getDocumentAccept(documentType: DocumentType): string {

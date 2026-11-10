@@ -1,7 +1,4 @@
-export function isValidPageCitation(
-  pageNumber: number,
-  pageCount: number,
-): boolean {
+export function isValidPageCitation(pageNumber: number, pageCount: number): boolean {
   return (
     Number.isInteger(pageNumber) &&
     Number.isInteger(pageCount) &&

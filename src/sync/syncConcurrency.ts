@@ -1,6 +1,8 @@
 export const PAPER_METADATA_CONCURRENCY = 4;
 export const PAPER_TRANSFER_CONCURRENCY = 2;
-/** Shared cap for manifest, payload, and source-PDF media reads in one repository. */
+/** Tiny immutable manifest JSON reads have their own bounded lane. */
+export const PAPER_MANIFEST_READ_CONCURRENCY = 12;
+/** Shared cap for payload and source-document media reads in one repository. */
 export const PAPER_MEDIA_CONCURRENCY = 4;
 
 export async function mapWithConcurrency<T, R>(
@@ -16,22 +18,29 @@ export async function mapWithConcurrency<T, R>(
   const output = new Array<R>(values.length);
   let nextIndex = 0;
   let failure: unknown;
+  let failed = false;
   const worker = async () => {
-    while (failure === undefined) {
+    while (!failed) {
       const index = nextIndex;
       nextIndex += 1;
       if (index >= values.length) return;
       try {
         output[index] = await mapper(values[index], index);
       } catch (error) {
-        failure = error;
+        // Multiple in-flight workers can reject before they observe the shared
+        // stop flag. Preserve the first failure so a later settlement cannot
+        // replace the operation's original abort or integrity boundary.
+        if (!failed) {
+          failed = true;
+          failure = error;
+        }
       }
     }
   };
   await Promise.all(
     Array.from({ length: Math.min(limit, values.length) }, () => worker()),
   );
-  if (failure !== undefined) throw failure;
+  if (failed) throw failure;
   return output;
 }
 

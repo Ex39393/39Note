@@ -26,7 +26,8 @@ export function getRectangleSetOverlap(
   }
   const intersection = firstRects.reduce(
     (total, first) =>
-      total + secondRects.reduce(
+      total +
+      secondRects.reduce(
         (subtotal, second) => subtotal + intersectionArea(first, second),
         0,
       ),
@@ -44,19 +45,28 @@ export function isSameLogicalPdfSource(
 ): boolean {
   if (first.pageNumber !== second.pageNumber) return false;
   const overlap = getRectangleSetOverlap(first.rects, second.rects);
-  const textMatches = normalizePdfSourceText(first.text) === normalizePdfSourceText(second.text);
+  const textMatches =
+    normalizePdfSourceText(first.text) === normalizePdfSourceText(second.text);
   return (
     overlap.firstCoverage >= 0.72 &&
     overlap.secondCoverage >= 0.72 &&
-    (textMatches || (
-      overlap.firstCoverage >= 0.9 && overlap.secondCoverage >= 0.9
-    ))
+    (textMatches || (overlap.firstCoverage >= 0.9 && overlap.secondCoverage >= 0.9))
   );
 }
 
 export function getPdfSourcePosition(
-  source: Pick<PdfSourceGeometry, 'pageNumber' | 'rects' | 'startOffset' | 'createdAt' | 'id'>,
-): { pageNumber: number; y: number; x: number; startOffset: number; createdAt: number; id: string } {
+  source: Pick<
+    PdfSourceGeometry,
+    'pageNumber' | 'rects' | 'startOffset' | 'createdAt' | 'id'
+  >,
+): {
+  pageNumber: number;
+  y: number;
+  x: number;
+  startOffset: number;
+  createdAt: number;
+  id: string;
+} {
   const position = source.rects.reduce(
     (current, rectangle) => ({
       x: Math.min(current.x, rectangle.x),
@@ -75,8 +85,14 @@ export function getPdfSourcePosition(
 }
 
 export function comparePdfSourcePosition(
-  first: Pick<PdfSourceGeometry, 'pageNumber' | 'rects' | 'startOffset' | 'createdAt' | 'id'>,
-  second: Pick<PdfSourceGeometry, 'pageNumber' | 'rects' | 'startOffset' | 'createdAt' | 'id'>,
+  first: Pick<
+    PdfSourceGeometry,
+    'pageNumber' | 'rects' | 'startOffset' | 'createdAt' | 'id'
+  >,
+  second: Pick<
+    PdfSourceGeometry,
+    'pageNumber' | 'rects' | 'startOffset' | 'createdAt' | 'id'
+  >,
 ): number {
   const firstPosition = getPdfSourcePosition(first);
   const secondPosition = getPdfSourcePosition(second);
@@ -104,11 +120,13 @@ function intersectionArea(
 ): number {
   const width = Math.max(
     0,
-    Math.min(first.x + first.width, second.x + second.width) - Math.max(first.x, second.x),
+    Math.min(first.x + first.width, second.x + second.width) -
+      Math.max(first.x, second.x),
   );
   const height = Math.max(
     0,
-    Math.min(first.y + first.height, second.y + second.height) - Math.max(first.y, second.y),
+    Math.min(first.y + first.height, second.y + second.height) -
+      Math.max(first.y, second.y),
   );
   return width * height;
 }

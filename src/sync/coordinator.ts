@@ -3,6 +3,7 @@ import {
   flushLocalPersistence,
   subscribeToPersistentChanges,
 } from '../services/persistentChange.ts';
+import type { WorkspaceRestoreLease } from '../services/workspaceRestoreLock.ts';
 import {
   DriveRootUnavailableError,
   GoogleDrivePayloadIntegrityError,
@@ -232,7 +233,8 @@ export class GoogleDriveSyncCoordinator {
       { notify: false },
     );
     this.removePersistentListener = subscribeToPersistentChanges(
-      () => void this.markDirty().catch(() => undefined),
+      (_detail, workspaceLease) =>
+        this.markDirty(workspaceLease).catch(() => undefined),
     );
     window.addEventListener('online', this.handleOnline);
     window.addEventListener('offline', this.handleOffline);
@@ -1045,7 +1047,7 @@ export class GoogleDriveSyncCoordinator {
     }
   }
 
-  private async markDirty(): Promise<void> {
+  private async markDirty(workspaceLease?: WorkspaceRestoreLease): Promise<void> {
     const state = this.requireState();
     state.dirty = true;
     state.dirtyGeneration += 1;
@@ -1054,7 +1056,7 @@ export class GoogleDriveSyncCoordinator {
     );
     this.updateView({ dirty: true });
     this.scheduleAutoSync();
-    await this.persistState(state);
+    await this.persistState(state, workspaceLease);
   }
 
   private async performReadOnlyIntegrityVerification(
@@ -1365,9 +1367,12 @@ export class GoogleDriveSyncCoordinator {
     );
   }
 
-  private async persistState(state: SyncDeviceState): Promise<void> {
+  private async persistState(
+    state: SyncDeviceState,
+    workspaceLease?: WorkspaceRestoreLease,
+  ): Promise<void> {
     try {
-      await saveSyncDeviceState(state);
+      await saveSyncDeviceState(state, workspaceLease);
     } catch (error) {
       const persistenceError =
         error instanceof LocalSyncPersistenceError

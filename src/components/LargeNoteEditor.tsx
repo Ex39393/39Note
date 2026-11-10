@@ -8,6 +8,7 @@ interface LargeNoteEditorProps {
   onClose: () => void;
   onUpdate: (noteId: string, content: string) => void;
   onUpdateDisplayNumber: (noteId: string, displayNumber: string) => void;
+  onCommitNoteEdit: (noteId: string) => void;
 }
 
 export function LargeNoteEditor({
@@ -16,6 +17,7 @@ export function LargeNoteEditor({
   onClose,
   onUpdate,
   onUpdateDisplayNumber,
+  onCommitNoteEdit,
 }: LargeNoteEditorProps) {
   const contentEditorRef = useRef<HTMLTextAreaElement>(null);
   const onCloseRef = useRef(onClose);
@@ -44,20 +46,30 @@ export function LargeNoteEditor({
 
   return (
     <div className="large-note-editor-overlay" role="presentation">
-      <section className="large-note-editor" aria-label="Large Note editor" role="dialog" aria-modal="true">
+      <section
+        className="large-note-editor"
+        aria-label="Large Note editor"
+        role="dialog"
+        aria-modal="true"
+      >
         <header>
           <div>
             <p>{documentTitle}</p>
             <h2>Note editor</h2>
           </div>
-          <button type="button" onClick={onClose}>Done</button>
+          <button type="button" onClick={onClose}>
+            Done
+          </button>
         </header>
         <div className="large-note-editor-meta">
           <label>
             <span>Note label</span>
             <input
+              data-reader-history-input="note"
+              data-reader-history-note-id={note.id}
               value={displayNumber}
               onBlur={() => {
+                onCommitNoteEdit(note.id);
                 const normalizedValue = displayNumber.trim();
                 if (normalizedValue.length === 0) {
                   setDisplayNumber(note.displayNumber);
@@ -77,14 +89,20 @@ export function LargeNoteEditor({
         </div>
         <section className="large-note-source" aria-label="Selected source text">
           <h3>Selected source text</h3>
-          <blockquote>{formatPdfSourceTextForDisplay(note.selectedText) || 'Source text unavailable'}</blockquote>
+          <blockquote>
+            {formatPdfSourceTextForDisplay(note.selectedText) ||
+              'Source text unavailable'}
+          </blockquote>
         </section>
         <label className="large-note-content">
           <span>Your note</span>
           <textarea
             ref={contentEditorRef}
+            data-reader-history-input="note"
+            data-reader-history-note-id={note.id}
             value={note.content}
             placeholder="Write a note…"
+            onBlur={() => onCommitNoteEdit(note.id)}
             onChange={(event) => onUpdate(note.id, event.target.value)}
           />
         </label>

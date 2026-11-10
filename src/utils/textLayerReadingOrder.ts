@@ -47,9 +47,7 @@ export function correctTextLayerReadingOrder(textLayer: HTMLElement): boolean {
     ...sortInReadingOrder(afterColumns),
   ];
 
-  textLayer.replaceChildren(
-    ...orderedUnits.flatMap((unit) => unit.nodes),
-  );
+  textLayer.replaceChildren(...orderedUnits.flatMap((unit) => unit.nodes));
   textLayer.dataset.readingOrderCorrected = 'true';
 
   return true;
@@ -99,17 +97,16 @@ function detectTwoColumnLayout(
   }
 
   const gutter = layerRectangle.width * 0.025;
-  const candidates = Array.from({ length: 17 }, (_, index) =>
-    layerRectangle.left + layerRectangle.width * (0.34 + index * 0.02),
+  const candidates = Array.from(
+    { length: 17 },
+    (_, index) => layerRectangle.left + layerRectangle.width * (0.34 + index * 0.02),
   );
 
   const splitCandidates = candidates.flatMap((candidate) => {
     const split = classifyAtSplit(bodyUnits, candidate, gutter);
     return split ? [split] : [];
   });
-  const split = splitCandidates.sort(
-    (first, second) => second.score - first.score,
-  )[0];
+  const split = splitCandidates.sort((first, second) => second.score - first.score)[0];
 
   if (!split || !columnsShareVerticalBody(split.left, split.right, layerRectangle)) {
     return null;

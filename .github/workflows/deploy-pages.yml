@@ -8,8 +8,6 @@ on:
 
 permissions:
   contents: read
-  pages: write
-  id-token: write
 
 concurrency:
   group: pages
@@ -36,11 +34,30 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Audit high-severity dependency vulnerabilities
+        run: npm audit --audit-level=high
+
       - name: Run tests
         run: npm test
 
       - name: Run lint
         run: npm run lint
+
+      - name: Check formatting
+        run: npm run format:check
+
+      - name: Run isolated paper recovery browser checks
+        run: npm run targeted-purge:native
+
+      - name: Validate production Sync Worker origin
+        shell: bash
+        env:
+          SYNC_AUTH_URL: ${{ vars.VITE_39NOTE_SYNC_AUTH_URL }}
+        run: |
+          if [[ "$SYNC_AUTH_URL" != "https://39note-sync-auth.39note.workers.dev" ]]; then
+            echo "::error::VITE_39NOTE_SYNC_AUTH_URL must equal the verified production Worker origin."
+            exit 1
+          fi
 
       - name: Build static application
         run: npm run build
@@ -48,6 +65,9 @@ jobs:
           VITE_BASE_PATH: ${{ github.event.repository.name == format('{0}.github.io', github.repository_owner) && '/' || format('/{0}/', github.event.repository.name) }}
           VITE_WEB_DEPLOYMENT: 'true'
           VITE_39NOTE_SYNC_AUTH_URL: ${{ vars.VITE_39NOTE_SYNC_AUTH_URL }}
+
+      - name: Smoke-test the production application
+        run: npm run production-app:native
 
       - name: Verify bundled Office converter
         run: npm run office-worker:verify-built
@@ -57,12 +77,40 @@ jobs:
         with:
           path: ./dist
 
+  browser-matrix:
+    permissions:
+      contents: read
+    runs-on: windows-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run Chrome and Edge recovery/browser matrix
+        run: npm run browser-matrix:native
+
   deploy:
+    if: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/master' }}
+    permissions:
+      pages: write
+      id-token: write
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     runs-on: ubuntu-latest
-    needs: build
+    needs:
+      - build
+      - browser-matrix
     timeout-minutes: 10
 
     steps:

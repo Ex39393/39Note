@@ -25,7 +25,10 @@ export class NcbiRequestQueue {
   constructor(
     minimumIntervalMs = 350,
     now: () => number = Date.now,
-    delay: (milliseconds: number, signal: AbortSignal) => Promise<void> = abortableDelay,
+    delay: (
+      milliseconds: number,
+      signal: AbortSignal,
+    ) => Promise<void> = abortableDelay,
   ) {
     this.minimumIntervalMs = minimumIntervalMs;
     this.now = now;
@@ -104,7 +107,10 @@ export async function runBoundedRetry<T>(
   throw lastError;
 }
 
-export function abortableDelay(milliseconds: number, signal: AbortSignal): Promise<void> {
+export function abortableDelay(
+  milliseconds: number,
+  signal: AbortSignal,
+): Promise<void> {
   if (signal.aborted) return Promise.reject(createAbortError(signal.reason));
   return new Promise((resolve, reject) => {
     const handleAbort = () => {

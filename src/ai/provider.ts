@@ -307,6 +307,11 @@ function resolveEndpoint(config: AiProviderConfig, endpointPath: string): URL {
   if (!/^https?:$/.test(base.protocol) || base.username || base.password) {
     throw new Error('Use an HTTP(S) Base URL without credentials in the URL.');
   }
+  if (base.protocol === 'http:' && !isStrictLoopbackHostname(base.hostname)) {
+    throw new Error(
+      'Use HTTPS for remote Base URLs. Plain HTTP is allowed only for localhost, 127.0.0.1, or [::1].',
+    );
+  }
   const resolvedPath = endpointPath.replace(
     /\{model\}/g,
     encodeURIComponent(config.model.trim()),
@@ -318,6 +323,13 @@ function resolveEndpoint(config: AiProviderConfig, endpointPath: string): URL {
   } catch {
     throw new Error('The API endpoint path is invalid.');
   }
+}
+
+function isStrictLoopbackHostname(hostname: string): boolean {
+  const normalized = hostname.toLocaleLowerCase('en-US');
+  return (
+    normalized === 'localhost' || normalized === '127.0.0.1' || normalized === '[::1]'
+  );
 }
 
 async function readJsonResponse(

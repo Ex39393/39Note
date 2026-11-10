@@ -13,6 +13,7 @@ export const PAPER_V3_CONTROL_ROLE = 'paper-v3-control';
 export const PAPER_V3_DESCRIPTOR_ROLE = 'paper-v3-layout-descriptor';
 export const PAPER_PRESENCE_ROLE = 'paper-presence-generation';
 export const PAPER_V3_MIGRATION_ROLE = 'paper-v3-migration-completion';
+export const PAPER_PROTOCOL_MIGRATION_ROLE = 'paper-protocol-migration-completion';
 
 export type PaperPresenceState = 'present' | 'removed';
 export type PaperPresenceIntent = 'migration' | 'upload' | 'remove' | 'restore';
@@ -59,13 +60,66 @@ export interface ResolvedPaperPresence {
   displayName: string;
 }
 
+export type PaperPresenceAncestryFailureCode =
+  | 'none'
+  | 'presence-malformed-json'
+  | 'presence-noncanonical'
+  | 'presence-empty'
+  | 'presence-record-invalid'
+  | 'presence-record-integrity-failed'
+  | 'presence-identity-boundary-crossed'
+  | 'presence-generation-conflict'
+  | 'presence-missing-parent'
+  | 'presence-cycle'
+  | 'presence-remove-without-present-parent'
+  | 'presence-restore-without-removed-parent'
+  | 'presence-no-authoritative-head'
+  | 'presence-present-folder-conflict'
+  | 'presence-ambiguous-initial-ancestry'
+  | 'presence-unexpected-validation-error';
+
+export interface PaperPresenceRecordTopologyDiagnostic {
+  /** Stable only within this inspection. Never a Drive or generation identity. */
+  ordinal: number;
+  state: PaperPresenceState;
+  intent: PaperPresenceIntent;
+  parentOrdinals: number[];
+  missingParentCount: number;
+  childCount: number;
+  root: boolean;
+  structuralHead: boolean;
+}
+
+export interface PaperPresenceAncestryDiagnostic {
+  status: 'valid' | 'invalid';
+  failureCode: PaperPresenceAncestryFailureCode;
+  recordCount: number;
+  uniqueGenerationCount: number;
+  rootCount: number;
+  structuralHeadCount: number;
+  weakComponentCount: number;
+  missingParentReferenceCount: number;
+  records: PaperPresenceRecordTopologyDiagnostic[];
+}
+
+export interface PaperPresenceAncestryInspection {
+  diagnostic: PaperPresenceAncestryDiagnostic;
+  resolved?: ResolvedPaperPresence;
+}
+
 export class PaperPresenceIntegrityError extends Error {
   readonly documentId?: string;
+  readonly code: PaperPresenceAncestryFailureCode;
 
-  constructor(message: string, documentId?: string) {
+  constructor(
+    message: string,
+    documentId?: string,
+    code: PaperPresenceAncestryFailureCode = 'presence-record-invalid',
+  ) {
     super(message);
     this.name = 'PaperPresenceIntegrityError';
     this.documentId = documentId;
+    this.code = code;
   }
 }
 
@@ -100,6 +154,8 @@ export function parsePaperPresenceGeneration(text: string): PaperPresenceGenerat
   } catch {
     throw new PaperPresenceIntegrityError(
       'A Drive paper-presence record contains malformed JSON.',
+      undefined,
+      'presence-malformed-json',
     );
   }
   assertPaperPresenceGeneration(value);
@@ -107,6 +163,7 @@ export function parsePaperPresenceGeneration(text: string): PaperPresenceGenerat
     throw new PaperPresenceIntegrityError(
       'A Drive paper-presence record is not canonical.',
       value.documentId,
+      'presence-noncanonical',
     );
   }
   return value;
@@ -132,7 +189,11 @@ export async function resolvePaperPresence(
   input: readonly PaperPresenceGeneration[],
 ): Promise<ResolvedPaperPresence> {
   if (input.length === 0) {
-    throw new PaperPresenceIntegrityError('A v3 paper has no presence generation.');
+    throw new PaperPresenceIntegrityError(
+      'A v3 paper has no presence generation.',
+      undefined,
+      'presence-empty',
+    );
   }
   const documentId = input[0].documentId;
   const rootFolderId = input[0].rootFolderId;
@@ -144,6 +205,7 @@ export async function resolvePaperPresence(
       throw new PaperPresenceIntegrityError(
         'A Drive paper-presence record failed integrity verification.',
         record.documentId,
+        'presence-record-integrity-failed',
       );
     }
     if (
@@ -154,6 +216,7 @@ export async function resolvePaperPresence(
       throw new PaperPresenceIntegrityError(
         'Paper-presence records cross an identity or control boundary.',
         documentId,
+        'presence-identity-boundary-crossed',
       );
     }
     const existing = byId.get(record.generation.id);
@@ -161,6 +224,7 @@ export async function resolvePaperPresence(
       throw new PaperPresenceIntegrityError(
         'Conflicting paper-presence records claim the same generation.',
         documentId,
+        'presence-generation-conflict',
       );
     }
     byId.set(record.generation.id, record);
@@ -172,6 +236,7 @@ export async function resolvePaperPresence(
         throw new PaperPresenceIntegrityError(
           'A paper-presence generation references a missing parent.',
           documentId,
+          'presence-missing-parent',
         );
       }
     }
@@ -191,6 +256,7 @@ export async function resolvePaperPresence(
     throw new PaperPresenceIntegrityError(
       'The paper-presence graph has no authoritative head.',
       documentId,
+      'presence-no-authoritative-head',
     );
   }
 
@@ -204,6 +270,7 @@ export async function resolvePaperPresence(
     throw new PaperPresenceIntegrityError(
       'Concurrent present generations identify different paper folders.',
       documentId,
+      'presence-present-folder-conflict',
     );
   }
   const initialRoots = [...byId.values()].filter(
@@ -213,6 +280,7 @@ export async function resolvePaperPresence(
     throw new PaperPresenceIntegrityError(
       'The paper-presence graph has ambiguous initial ancestry.',
       documentId,
+      'presence-ambiguous-initial-ancestry',
     );
   }
 
@@ -224,6 +292,64 @@ export async function resolvePaperPresence(
     generationIds: [...byId.keys()].sort(compareCanonicalStrings),
     ...(folderIds.size === 1 ? { paperFolderId: [...folderIds][0] } : {}),
     displayName: effectiveHeads[0].displayName,
+  };
+}
+
+/**
+ * Strictly read-only graph inspection. It exposes only inspection-local aliases
+ * and structural counts; document, Drive, generation, folder, writer, timestamp,
+ * and display-name identities never leave this boundary.
+ */
+export async function inspectPaperPresenceAncestry(
+  input: readonly PaperPresenceGeneration[],
+): Promise<PaperPresenceAncestryInspection> {
+  let resolved: ResolvedPaperPresence | undefined;
+  let failureCode: PaperPresenceAncestryFailureCode = 'none';
+  try {
+    resolved = await resolvePaperPresence(input);
+  } catch (error) {
+    failureCode =
+      error instanceof PaperPresenceIntegrityError
+        ? error.code
+        : 'presence-unexpected-validation-error';
+  }
+
+  let topology: Omit<PaperPresenceAncestryDiagnostic, 'status' | 'failureCode'>;
+  try {
+    topology = redactedPresenceTopology(input);
+  } catch {
+    return {
+      diagnostic: {
+        status: 'invalid',
+        failureCode:
+          failureCode === 'none' ? 'presence-unexpected-validation-error' : failureCode,
+        recordCount: Array.isArray(input) ? input.length : 0,
+        uniqueGenerationCount: 0,
+        rootCount: 0,
+        structuralHeadCount: 0,
+        weakComponentCount: 0,
+        missingParentReferenceCount: 0,
+        records: [],
+      },
+    };
+  }
+
+  if (!resolved) {
+    return {
+      diagnostic: {
+        status: 'invalid',
+        failureCode,
+        ...topology,
+      },
+    };
+  }
+  return {
+    diagnostic: {
+      status: 'valid',
+      failureCode: 'none',
+      ...topology,
+    },
+    resolved,
   };
 }
 
@@ -282,6 +408,7 @@ function assertValidPresenceTransitions(
         throw new PaperPresenceIntegrityError(
           'A removal generation does not acknowledge a present parent.',
           documentId,
+          'presence-remove-without-present-parent',
         );
       }
     }
@@ -291,6 +418,7 @@ function assertValidPresenceTransitions(
         throw new PaperPresenceIntegrityError(
           'A restore generation does not acknowledge a removal parent.',
           documentId,
+          'presence-restore-without-removed-parent',
         );
       }
     }
@@ -308,6 +436,7 @@ function assertAcyclic(
       throw new PaperPresenceIntegrityError(
         'The paper-presence ancestry contains a cycle.',
         documentId,
+        'presence-cycle',
       );
     }
     if (visited.has(id)) return;
@@ -323,7 +452,87 @@ function invalidPresence(documentId?: string): PaperPresenceIntegrityError {
   return new PaperPresenceIntegrityError(
     'A Drive paper-presence record is invalid or unsupported.',
     documentId,
+    'presence-record-invalid',
   );
+}
+
+function redactedPresenceTopology(
+  input: readonly PaperPresenceGeneration[],
+): Omit<PaperPresenceAncestryDiagnostic, 'status' | 'failureCode'> {
+  const byId = new Map<string, PaperPresenceGeneration>();
+  for (const record of input) {
+    if (typeof record?.generation?.id === 'string' && !byId.has(record.generation.id)) {
+      byId.set(record.generation.id, record);
+    }
+  }
+  const ordered = [...byId.values()].sort((first, second) =>
+    compareCanonicalStrings(first.generation.id, second.generation.id),
+  );
+  const ordinalById = new Map(
+    ordered.map((record, index) => [record.generation.id, index + 1]),
+  );
+  const childCounts = new Map<string, number>();
+  const referenced = new Set<string>();
+  let missingParentReferenceCount = 0;
+  const adjacency = new Map<string, Set<string>>(
+    ordered.map((record) => [record.generation.id, new Set<string>()]),
+  );
+
+  for (const record of ordered) {
+    for (const parentId of record.generation.parents) {
+      referenced.add(parentId);
+      if (!byId.has(parentId)) {
+        missingParentReferenceCount += 1;
+        continue;
+      }
+      childCounts.set(parentId, (childCounts.get(parentId) ?? 0) + 1);
+      adjacency.get(record.generation.id)?.add(parentId);
+      adjacency.get(parentId)?.add(record.generation.id);
+    }
+  }
+
+  let weakComponentCount = 0;
+  const visited = new Set<string>();
+  for (const record of ordered) {
+    if (visited.has(record.generation.id)) continue;
+    weakComponentCount += 1;
+    const pending = [record.generation.id];
+    while (pending.length > 0) {
+      const next = pending.pop()!;
+      if (visited.has(next)) continue;
+      visited.add(next);
+      pending.push(...(adjacency.get(next) ?? []));
+    }
+  }
+
+  const records = ordered.map((record, index) => {
+    const parentOrdinals = record.generation.parents
+      .flatMap((parentId) => {
+        const ordinal = ordinalById.get(parentId);
+        return ordinal === undefined ? [] : [ordinal];
+      })
+      .sort((first, second) => first - second);
+    return {
+      ordinal: index + 1,
+      state: record.state,
+      intent: record.intent,
+      parentOrdinals,
+      missingParentCount: record.generation.parents.length - parentOrdinals.length,
+      childCount: childCounts.get(record.generation.id) ?? 0,
+      root: record.generation.parents.length === 0,
+      structuralHead: !referenced.has(record.generation.id),
+    };
+  });
+
+  return {
+    recordCount: input.length,
+    uniqueGenerationCount: ordered.length,
+    rootCount: records.filter(({ root }) => root).length,
+    structuralHeadCount: records.filter(({ structuralHead }) => structuralHead).length,
+    weakComponentCount,
+    missingParentReferenceCount,
+    records,
+  };
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

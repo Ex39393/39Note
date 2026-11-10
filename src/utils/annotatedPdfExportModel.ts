@@ -215,11 +215,14 @@ export function buildAnnotationExportReferences(
       const annotation = sourceById.get(note.annotationId);
       return annotation ? [{ annotation, note }] : [];
     })
-    .sort((first, second) =>
-      first.annotation.pageNumber - second.annotation.pageNumber ||
-      getAnnotationPosition(first.annotation).y - getAnnotationPosition(second.annotation).y ||
-      getAnnotationPosition(first.annotation).x - getAnnotationPosition(second.annotation).x ||
-      first.annotation.id.localeCompare(second.annotation.id),
+    .sort(
+      (first, second) =>
+        first.annotation.pageNumber - second.annotation.pageNumber ||
+        getAnnotationPosition(first.annotation).y -
+          getAnnotationPosition(second.annotation).y ||
+        getAnnotationPosition(first.annotation).x -
+          getAnnotationPosition(second.annotation).x ||
+        first.annotation.id.localeCompare(second.annotation.id),
     )
     .map((reference, index) => ({
       ...reference,
@@ -241,15 +244,23 @@ export function sanitizeAnnotatedPdfFilename(documentTitle: string): string {
   return `${sanitizedTitle || '39Note'} - annotated.pdf`;
 }
 
-export function findUnsupportedAppendixCharacters(text: string): string[] {
+export function findUnsupportedAppendixCharacters(
+  text: string,
+  supportedCodePoints?: ReadonlySet<number>,
+): string[] {
   return [
     ...new Set(
       Array.from(text).filter((character) => {
         const codePoint = character.codePointAt(0) ?? 0;
+        const isLayoutCharacter =
+          character === '\n' || character === '\r' || character === '\t';
+        if (isLayoutCharacter) {
+          return false;
+        }
+        if (supportedCodePoints) {
+          return !supportedCodePoints.has(codePoint);
+        }
         return !(
-          character === '\n' ||
-          character === '\r' ||
-          character === '\t' ||
           (codePoint >= 0x20 && codePoint <= 0x7e) ||
           (codePoint >= 0x00a0 && codePoint <= 0x00ff) ||
           WIN_ANSI_EXTRA_CODE_POINTS.has(codePoint)

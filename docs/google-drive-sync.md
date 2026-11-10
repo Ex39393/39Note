@@ -5,14 +5,21 @@
 ## Security model
 
 - The only requested Google scope is `https://www.googleapis.com/auth/drive.file`.
-- The Worker uses Google's OAuth 2.0 Web Server authorization-code flow with state, PKCE S256, `access_type=offline`, and `include_granted_scopes=true`.
+- The Worker uses Google's OAuth 2.0 Web Server authorization-code flow with state,
+  PKCE S256, `access_type=offline`, and `include_granted_scopes=false`. Code exchange
+  and refresh fail closed unless Google reports exactly the single `drive.file`
+  scope; missing or broader scope evidence requires reauthorization rather than
+  returning that access token to the browser.
 - After code exchange, the Worker calls Drive `about.get(fields=user(permissionId))`. Google's opaque Drive permission ID identifies the same Google account on additional devices without requesting `openid`, email, or profile scopes.
 - The Google client secret exists only as a Cloudflare Worker secret.
 - Refresh tokens are encrypted with AES-256-GCM using a separate 32-byte secret key. D1 stores ciphertext, a random 96-bit IV, and a key version—not the encryption key.
 - A browser receives a random 256-bit device-session token once. D1 stores only its SHA-256 hash. Each device session is independently revocable.
 - Personal-device sessions may be persisted locally. Public/temporary sessions stay in browser-session storage and have a fixed server-enforced 12-hour lifetime that activity cannot extend.
 - Google access tokens are returned to an authenticated browser when needed, cached in memory only, and never written to IndexedDB, backups, sync payloads, URLs, or logs.
-- OAuth state and browser grant-exchange values are one-time, origin/device-bound, and short-lived. The grant returns in a URL fragment so it is not sent to GitHub Pages.
+- OAuth state and browser grant-exchange values are one-time, origin/device-bound,
+  and short-lived. OAuth start is independently rate-limited by both device and a
+  hashed Cloudflare client-address bucket, without trusting forwarded-address
+  headers. The grant returns in a URL fragment so it is not sent to GitHub Pages.
 - Allowed browser origins are exactly `http://127.0.0.1:5173`, `http://localhost:5173`, and `https://ex39393.github.io`. CORS never uses `*`.
 
 Drive content is protected in transit by HTTPS and at rest by Google Drive, but it is not end-to-end encrypted by 39Note. The authentication service stores the account's encrypted refresh token and non-content session metadata. AI provider keys remain device-local and never sync.
@@ -77,7 +84,7 @@ Modification time and device labels are display information only. Correctness co
 
 ### Per-paper publication and convergence
 
-Each paper has independent dirty reasons, baselines, heads, tombstones, and conflict evidence. Publication resolves the current remote heads, deterministically reconciles them with the local paper, writes only changed immutable payloads, uploads an unchanged source PDF zero times, publishes the manifest last, re-reads the exact manifest and references by known file ID, and performs fresh head discovery. A concurrent head causes that paper to remain dirty and retry/reconcile; unrelated papers continue independently. Metadata work is limited to four concurrent operations and payload/PDF transfer to two.
+Each paper has independent dirty reasons, baselines, heads, tombstones, and conflict evidence. Publication resolves the current remote heads, deterministically reconciles them with the local paper, writes only changed immutable payloads, uploads an unchanged source PDF zero times, publishes the manifest last, re-reads the exact manifest and references by known file ID, and performs fresh head discovery. A concurrent head causes that paper to remain dirty and retry/reconcile; unrelated papers continue independently. Bounded lanes limit metadata work to four concurrent operations, tiny immutable manifest reads to twelve, payload and source-document reads to four, and per-paper publication/transfer work to two.
 
 The editable Print Draft, selected built-in template, and overrides travel with the paper. The browser print dialog does not give 39Note PDF bytes, so the app does not fabricate `Paper name - Print.pdf`. The protocol already has a distinct hashed rendered-PDF descriptor with `renderedFromDraftHash` for a future real PDF-generation path.
 
@@ -120,6 +127,15 @@ deduplicated `documentId` union of local and cloud papers; cloud-only rows are
 metadata-only until the user chooses Download. **Remove from this device** remains
 separate from **Remove from Google Drive**. Destructive cloud removal and restore
 are disabled in Public/temporary mode.
+
+**Forget inaccessible paper** is not cloud deletion. After exact single-paper
+identity verification and explicit confirmation, it stores an account/root-scoped
+local quarantine for that `documentId`. Ordinary sync, dirty queues, cloud-paper
+counts, and blocking status exclude the quarantined issue while every remote object
+and integrity record remains unchanged. Ignored issues remain reviewable under
+**Ignored cloud issues**. **Review this paper again** removes only the local
+quarantine, so the unresolved cloud record can return as **Needs attention**; the
+same exact Browse row must be verified again before it can be re-quarantined.
 
 All generation discovery, transfer, hashing, and merge work happens directly between the browser and Google Drive under `drive.file`. The OAuth Worker remains a token broker only. Tokens, authorization headers, device-session secrets, OAuth codes, AI keys, and Worker secrets are excluded from manifests, payloads, filenames, diagnostics, and logs.
 
@@ -193,7 +209,19 @@ VITE_39NOTE_SYNC_AUTH_URL=https://39note-sync-auth.39note.workers.dev
 
 For GitHub Pages, create the repository variable `VITE_39NOTE_SYNC_AUTH_URL` with that same public URL. Do not create `VITE_GOOGLE_DRIVE_CLIENT_ID`; browser-side Google client IDs and GIS token clients are not used.
 
-The Pages workflow and Worker workflow are intentionally separate. The Worker workflow deploy job runs only when repository variable `SYNC_WORKER_DEPLOY_ENABLED` equals `true`; it also needs GitHub Actions secrets `CLOUDFLARE_ACCOUNT_ID` and a narrowly scoped `CLOUDFLARE_API_TOKEN`. Google secrets remain in Cloudflare, not GitHub.
+The Pages workflow and Worker workflow are intentionally separate. Their deploy jobs
+run only for an explicit manual workflow dispatch from `master`; ordinary pushes run
+validation without publishing. The Worker deploy job additionally requires repository
+variable `SYNC_WORKER_DEPLOY_ENABLED` to equal `true` and GitHub Actions secrets
+`CLOUDFLARE_ACCOUNT_ID` plus a narrowly scoped `CLOUDFLARE_API_TOKEN`. Google secrets
+remain in Cloudflare, not GitHub.
+
+A push to `master` validates and builds Pages but does not publish it. After the
+Worker deployment, migrations, secrets, and `/health` response are verified, run the
+Pages workflow manually from `master`. Its production build fails closed unless
+`VITE_39NOTE_SYNC_AUTH_URL` exactly matches the verified 1.0.0 Worker origin shown
+above. A future Worker origin therefore requires an explicit reviewed workflow and
+configuration change rather than a silent variable-only redirect.
 
 ## 4. Real acceptance
 

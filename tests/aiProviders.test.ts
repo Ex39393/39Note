@@ -8,6 +8,7 @@ import {
   loadAiConfiguration,
   loadApiKey,
   saveAiConfiguration,
+  saveAiConfigurationWithoutCredentials,
 } from '../src/ai/configuration.ts';
 import {
   createProviderAdapterRegistry,
@@ -413,6 +414,97 @@ test('provider credentials are isolated, omitted from config, and fully cleared'
   assert.equal(loadApiKey(openAi), '');
   assert.equal(loadApiKey(anthropic), '');
   assert.equal(localStorage.getItem('39note.ai.provider.v1'), null);
+});
+
+test('synced AI settings retain private headers only for the exact credential profile', async () => {
+  installMemoryStorage();
+  const endpointA = {
+    ...configFor('custom-openai-compatible'),
+    baseUrl: 'https://a.example.test',
+    customHeaders: { 'X-Private-Token': 'secret-a' },
+    rememberApiKey: true,
+  };
+  saveAiConfiguration(endpointA, 'endpoint-a-key');
+
+  saveAiConfigurationWithoutCredentials({
+    ...endpointA,
+    model: 'synced-model-a',
+    customHeaders: {},
+    rememberApiKey: false,
+  });
+  const sameProfile = loadAiConfiguration();
+  assert.ok(sameProfile);
+  assert.deepEqual(sameProfile.customHeaders, {
+    'X-Private-Token': 'secret-a',
+  });
+  assert.equal(sameProfile.rememberApiKey, true);
+
+  saveAiConfigurationWithoutCredentials({
+    ...endpointA,
+    baseUrl: 'https://b.example.test',
+    model: 'synced-model-b',
+    customHeaders: {},
+    rememberApiKey: false,
+  });
+  const differentProfile = loadAiConfiguration();
+  assert.ok(differentProfile);
+  assert.deepEqual(differentProfile.customHeaders, {});
+  assert.equal(differentProfile.rememberApiKey, false);
+  assert.equal(loadApiKey(differentProfile), '');
+
+  let transmittedHeaders = new Headers();
+  const adapters = createProviderAdapterRegistry(async (_input, init) => {
+    transmittedHeaders = new Headers(init?.headers);
+    return jsonResponse(normalFixtures['openai-chat-completions']);
+  });
+  await adapters[differentProfile.protocol].complete({
+    ...requestFor(differentProfile),
+    apiKey: 'endpoint-b-key',
+  });
+  assert.equal(transmittedHeaders.get('X-Private-Token'), null);
+});
+
+test('AI credentials cannot be sent to non-loopback plain HTTP endpoints', async () => {
+  for (const baseUrl of [
+    'http://example.test',
+    'http://127.0.0.2:8080',
+    'http://localhost.example.test',
+  ]) {
+    const config = { ...configFor('openai'), baseUrl };
+    let requests = 0;
+    const adapter = createProviderAdapterRegistry(async () => {
+      requests += 1;
+      return jsonResponse(normalFixtures['openai-chat-completions']);
+    })[config.protocol];
+    await assert.rejects(
+      adapter.complete(requestFor(config)),
+      /Use HTTPS for remote Base URLs/u,
+    );
+    await assert.rejects(
+      adapter.testConnection(config, TEST_API_KEY),
+      /Use HTTPS for remote Base URLs/u,
+    );
+    await assert.rejects(
+      adapter.discoverModels(config, TEST_API_KEY),
+      /Use HTTPS for remote Base URLs/u,
+    );
+    assert.equal(requests, 0);
+  }
+
+  for (const baseUrl of [
+    'http://localhost:8080',
+    'http://127.0.0.1:8080',
+    'http://[::1]:8080',
+  ]) {
+    const config = { ...configFor('openai'), baseUrl };
+    let requests = 0;
+    const adapter = createProviderAdapterRegistry(async () => {
+      requests += 1;
+      return jsonResponse(normalFixtures['openai-chat-completions']);
+    })[config.protocol];
+    await adapter.complete(requestFor(config));
+    assert.equal(requests, 1);
+  }
 });
 
 function configFor(providerId: AiProviderId): AiProviderConfig {

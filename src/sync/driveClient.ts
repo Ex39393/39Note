@@ -23,6 +23,8 @@ export interface DriveFileMetadata {
   version?: string;
   size?: string;
   trashed?: boolean;
+  /** Distinguishes an explicitly trashed item from Trash inherited from a parent. */
+  explicitlyTrashed?: boolean;
   webViewLink?: string;
   ownedByMe?: boolean;
 }
@@ -145,7 +147,13 @@ export interface DriveRequestTelemetryEvent {
 
 export interface DriveClientOptions {
   onTelemetry?: (event: Readonly<DriveRequestTelemetryEvent>) => void;
+  onRequestActivity?: (activity: Readonly<DriveRequestActivity>) => void;
   now?: () => number;
+}
+
+export interface DriveRequestActivity {
+  pendingRequestCount: number;
+  completedRequestCount: number;
 }
 
 const SAFE_TELEMETRY_LABEL = /^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$/u;
@@ -276,6 +284,7 @@ export class DriveClient {
     forceRefresh?: boolean,
   ) => string | null | Promise<string | null>;
   private readonly onTelemetry?: DriveClientOptions['onTelemetry'];
+  private readonly onRequestActivity?: DriveClientOptions['onRequestActivity'];
   private readonly now: () => number;
   private telemetrySequence = 0;
   private activeTelemetryOperation?: ActiveDriveTelemetryOperation;
@@ -292,6 +301,7 @@ export class DriveClient {
   ) {
     this.getAccessToken = getAccessToken;
     this.onTelemetry = options.onTelemetry;
+    this.onRequestActivity = options.onRequestActivity;
     this.now = options.now ?? (() => performance.now());
   }
 
@@ -304,6 +314,8 @@ export class DriveClient {
       wave: 0,
       completedWave: 0,
       operationRetryCount: 0,
+      pendingRequestCount: 0,
+      completedRequestCount: 0,
       events: [],
       phaseSpans: [],
       stateTransitions: [],
@@ -424,7 +436,7 @@ export class DriveClient {
         spaces: 'drive',
         pageSize: '100',
         fields:
-          'nextPageToken,files(id,name,mimeType,parents,appProperties,modifiedTime,md5Checksum,sha256Checksum,version,size,trashed,webViewLink,ownedByMe)',
+          'nextPageToken,files(id,name,mimeType,parents,appProperties,modifiedTime,md5Checksum,sha256Checksum,version,size,trashed,explicitlyTrashed,webViewLink,ownedByMe)',
       });
       if (pageToken) parameters.set('pageToken', pageToken);
       const page = await this.requestJson<unknown>(
@@ -470,7 +482,7 @@ export class DriveClient {
         includeRemoved: 'true',
         restrictToMyDrive: 'true',
         fields:
-          'nextPageToken,newStartPageToken,changes(fileId,removed,file(id,name,mimeType,parents,appProperties,modifiedTime,md5Checksum,sha256Checksum,version,size,trashed,webViewLink,ownedByMe))',
+          'nextPageToken,newStartPageToken,changes(fileId,removed,file(id,name,mimeType,parents,appProperties,modifiedTime,md5Checksum,sha256Checksum,version,size,trashed,explicitlyTrashed,webViewLink,ownedByMe))',
       });
       const page = await this.requestJson<unknown>(
         `${DRIVE_API}/changes?${parameters.toString()}`,
@@ -496,7 +508,7 @@ export class DriveClient {
     context: DriveRequestContext = {},
   ): Promise<DriveFileMetadata> {
     const fields =
-      'id,name,mimeType,parents,appProperties,modifiedTime,md5Checksum,sha256Checksum,version,size,trashed,webViewLink,ownedByMe';
+      'id,name,mimeType,parents,appProperties,modifiedTime,md5Checksum,sha256Checksum,version,size,trashed,explicitlyTrashed,webViewLink,ownedByMe';
     const metadata = await this.requestJson<unknown>(
       `${DRIVE_API}/files/${encodeURIComponent(fileId)}?fields=${encodeURIComponent(fields)}`,
       { signal, cache: 'no-store' },
@@ -580,6 +592,19 @@ export class DriveClient {
   }
 
   /**
+   * Moves one exact, repository-verified corrupt presence artifact to Trash.
+   * The caller owns all identity, ancestry, and immutable-content validation;
+   * this client method intentionally accepts only the already selected file ID.
+   */
+  async trashManagedTargetedPurgePresence(
+    fileId: string,
+    signal: AbortSignal,
+    context: DriveRequestContext = {},
+  ): Promise<DriveFileMetadata> {
+    return this.trashManagedFile(fileId, signal, 'remove', 'presence', context);
+  }
+
+  /**
    * Restores one already verified managed paper-folder identity. The repository
    * owns identity validation; this method performs only the exact-id Drive
    * mutation and corrects the parent relationship in the same request.
@@ -623,7 +648,7 @@ export class DriveClient {
     fileId: string,
     signal: AbortSignal,
     operation: 'reset' | 'cleanup' | 'remove',
-    resource: 'reset' | 'legacy-cleanup' | 'paper-folder',
+    resource: 'reset' | 'legacy-cleanup' | 'paper-folder' | 'presence',
     context: DriveRequestContext,
   ): Promise<DriveFileMetadata> {
     const response = await this.request(
@@ -868,7 +893,7 @@ export class DriveClient {
           outcome: 'network-error',
           bytesTransferred: context.byteCount ?? 0,
         });
-        if (init.signal?.aborted) throw error;
+        if (init.signal?.aborted) throw init.signal.reason ?? error;
         if (!canRetryRequest || attempt === MAX_ATTEMPTS - 1) {
           throw new DriveNetworkError(operation);
         }
@@ -961,6 +986,8 @@ export class DriveClient {
       // independent starts, but it cannot hide a real A -> B -> C waterfall.
       parallelWave = active.completedWave + 1;
       active.wave = Math.max(active.wave, parallelWave);
+      active.pendingRequestCount += 1;
+      this.emitRequestActivity(active);
     }
     return { startedAtMs, active, parallelWave };
   }
@@ -975,6 +1002,12 @@ export class DriveClient {
         trace.active.completedWave,
         trace.parallelWave,
       );
+      trace.active.pendingRequestCount = Math.max(
+        0,
+        trace.active.pendingRequestCount - 1,
+      );
+      trace.active.completedRequestCount += 1;
+      this.emitRequestActivity(trace.active);
     }
     const operationContext = trace.active
       ? {
@@ -1045,6 +1078,19 @@ export class DriveClient {
     return correlation;
   }
 
+  private emitRequestActivity(active: ActiveDriveTelemetryOperation): void {
+    try {
+      this.onRequestActivity?.(
+        Object.freeze({
+          pendingRequestCount: active.pendingRequestCount,
+          completedRequestCount: active.completedRequestCount,
+        }),
+      );
+    } catch {
+      // Redacted diagnostics must never alter request behavior.
+    }
+  }
+
   private fileCorrelation(
     active: ActiveDriveTelemetryOperation,
     fileId: string,
@@ -1079,6 +1125,8 @@ interface ActiveDriveTelemetryOperation {
   wave: number;
   completedWave: number;
   operationRetryCount: number;
+  pendingRequestCount: number;
+  completedRequestCount: number;
   events: DriveRequestTelemetryEvent[];
   phaseSpans: DriveOperationPhaseSpan[];
   stateTransitions: DriveOperationStateTransition[];
@@ -1350,6 +1398,8 @@ function isDriveFileMetadata(value: unknown): value is DriveFileMetadata {
     isOptionalString(value.version) &&
     isOptionalString(value.size) &&
     (value.trashed === undefined || typeof value.trashed === 'boolean') &&
+    (value.explicitlyTrashed === undefined ||
+      typeof value.explicitlyTrashed === 'boolean') &&
     isOptionalString(value.webViewLink) &&
     (value.ownedByMe === undefined || typeof value.ownedByMe === 'boolean')
   );

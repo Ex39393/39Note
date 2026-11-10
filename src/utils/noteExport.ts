@@ -1,8 +1,9 @@
 import type { Note } from '../types/note';
 import type { NoteAnchor } from '../types/noteAnchor';
 import {
-  highlightColors,
-  underlineColors,
+  getAnnotationColorLabel,
+  getHighlightColorCssValue,
+  getUnderlineColorCssValue,
   type PdfAnnotation,
 } from '../types/highlight';
 import type { GlossaryEntry, NotesPrintLayout } from '../types/glossary';
@@ -116,7 +117,8 @@ export function exportNotesAsPdf(
 }
 
 function formatNoteForMarkdown(note: Note): string {
-  const sourceText = formatPdfSourceTextForDisplay(note.selectedText) || 'Source text unavailable.';
+  const sourceText =
+    formatPdfSourceTextForDisplay(note.selectedText) || 'Source text unavailable.';
   const noteContent = note.content.replaceAll('\r\n', '\n').trimEnd();
   const noteHeading = formatNoteLabel(note.displayNumber);
 
@@ -157,9 +159,11 @@ export function createNotesPrintDocument(
   layout: NotesPrintLayout,
 ): string {
   const title = escapeHtml(documentTitle.trim() || '39Note');
-  const exportDate = escapeHtml(new Intl.DateTimeFormat(undefined, {
-    dateStyle: 'medium',
-  }).format(new Date()));
+  const exportDate = escapeHtml(
+    new Intl.DateTimeFormat(undefined, {
+      dateStyle: 'medium',
+    }).format(new Date()),
+  );
   const printContent = getPrintContentItems(notes, glossaryEntries);
   const printModeContent = getPrintModeContent(
     layout,
@@ -180,20 +184,19 @@ export function createNotesPrintDocument(
     </section>`
       : '';
   const noteEntries =
-    layout === 'all-annotations'
-      ? annotationSection
-      : standardNoteEntries;
+    layout === 'all-annotations' ? annotationSection : standardNoteEntries;
   const glossary = printContent.glossaryEntries;
   const dictionaryAttribution = getDictionaryAttributionText(
     glossary.map((entry) => entry.source),
   );
-  const glossarySection = glossary.length > 0
-    ? `<section class="glossary-print-section">
+  const glossarySection =
+    glossary.length > 0
+      ? `<section class="glossary-print-section">
       <h2>Glossary</h2>
       ${glossary.map(formatGlossaryEntryForPrint).join('\n')}
       <p class="dictionary-attribution">${escapeHtml(dictionaryAttribution)}</p>
     </section>`
-    : '';
+      : '';
   const layoutCss = getPrintLayoutCss(layout);
 
   return `<!doctype html>
@@ -248,21 +251,28 @@ export function createNotesPrintDocument(
 }
 
 function formatSourceGroupForPrint(group: PrintSourceGroup): string {
-  const annotationLabel = group.annotations.length > 0
-    ? [...new Set(group.annotations.map((annotation) =>
-        annotation.type === 'highlight' ? 'Highlight' : 'Underline'
-      ))].join(' · ')
-    : 'Note';
-  const palettes = group.annotations.map((annotation) =>
-    annotation.type === 'highlight'
-      ? highlightColors[annotation.color]
-      : underlineColors[annotation.color]
-  );
-  const colourMetadata = palettes.map((palette) => palette.label).join(' · ');
-  const sourceText = formatPdfSourceTextForDisplay(group.sourceText)
-    || 'Source text unavailable.';
+  const annotationLabel =
+    group.annotations.length > 0
+      ? [
+          ...new Set(
+            group.annotations.map((annotation) =>
+              annotation.type === 'highlight' ? 'Highlight' : 'Underline',
+            ),
+          ),
+        ].join(' · ')
+      : 'Note';
+  const colours = group.annotations.map((annotation) => ({
+    label: getAnnotationColorLabel(annotation.type, annotation.color),
+    cssValue:
+      annotation.type === 'highlight'
+        ? getHighlightColorCssValue(annotation.color)
+        : getUnderlineColorCssValue(annotation.color),
+  }));
+  const colourMetadata = colours.map((colour) => colour.label).join(' · ');
+  const sourceText =
+    formatPdfSourceTextForDisplay(group.sourceText) || 'Source text unavailable.';
   const linkedNotes = group.notes.map(formatLinkedNoteForPrint).join('\n');
-  const accent = palettes[0]?.cssValue ?? '#777';
+  const accent = colours[0]?.cssValue ?? '#777';
   return `      <article class="annotation-entry" data-source-group-id="${escapeHtml(group.id)}" style="--annotation-colour: ${accent};">
         <p class="annotation-heading"><strong>${annotationLabel}</strong><span class="annotation-meta">Page ${group.pageNumber}${colourMetadata ? ` · ${escapeHtml(colourMetadata)}` : ''}</span></p>
         <blockquote class="annotation-source">${escapeHtml(sourceText)}</blockquote>
@@ -275,14 +285,17 @@ function formatLinkedNoteForPrint(note: Note): string {
 }
 
 function formatNoteForPrint(note: Note, annotation: PdfAnnotation | undefined): string {
-  const sourceText = formatPdfSourceTextForDisplay(note.selectedText) || 'Source text unavailable.';
+  const sourceText =
+    formatPdfSourceTextForDisplay(note.selectedText) || 'Source text unavailable.';
   const noteHeading = formatNoteLabel(note.displayNumber);
   const content = formatNoteContentForHtml(note.content);
 
-  const underlineStyle = annotation?.type === 'underline'
-    ? ` style="text-decoration-color: ${underlineColors[annotation.color].cssValue};"`
-    : '';
-  const sourceClass = annotation?.type === 'underline' ? 'source-text source-underlined' : 'source-text';
+  const underlineStyle =
+    annotation?.type === 'underline'
+      ? ` style="text-decoration-color: ${getUnderlineColorCssValue(annotation.color)};"`
+      : '';
+  const sourceClass =
+    annotation?.type === 'underline' ? 'source-text source-underlined' : 'source-text';
 
   return `    <article class="note-entry">
       <div class="${sourceClass}"${underlineStyle}><em>${escapeHtml(sourceText)}</em></div>

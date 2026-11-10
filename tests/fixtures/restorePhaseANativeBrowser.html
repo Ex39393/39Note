@@ -1,0 +1,745 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>BKP-03 Phase A native browser prototype</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+      }
+
+      body {
+        margin: 0;
+        background: Canvas;
+        color: CanvasText;
+      }
+
+      main {
+        box-sizing: border-box;
+        width: min(76rem, 100%);
+        margin: 0 auto;
+        padding: 2rem;
+      }
+
+      li {
+        margin-block: 0.7rem;
+      }
+
+      [data-outcome='PASS'] {
+        color: #238636;
+      }
+
+      [data-outcome='FAIL'] {
+        color: #d1242f;
+      }
+
+      pre {
+        overflow-wrap: anywhere;
+        white-space: pre-wrap;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>BKP-03 Phase A native browser prototype</h1>
+      <p>
+        Isolated synthetic IndexedDB and Web Locks checks. This page imports no 39Note
+        production module and performs no network request.
+      </p>
+      <h2 id="summary">Running…</h2>
+      <ol id="results" aria-live="polite"></ol>
+      <h2>Synthetic artifacts</h2>
+      <pre id="details"></pre>
+    </main>
+
+    <script type="module">
+      const results = [];
+      const syntheticNames = [];
+      const lockName = `39note-bkp03-prototype-lock-${crypto.randomUUID()}`;
+      const workspaceId = `prototype-workspace-${crypto.randomUUID()}`;
+
+      function deferred() {
+        let resolve;
+        let reject;
+        const promise = new Promise((resolvePromise, rejectPromise) => {
+          resolve = resolvePromise;
+          reject = rejectPromise;
+        });
+        return { promise, reject, resolve };
+      }
+
+      function assert(condition, message) {
+        if (!condition) throw new Error(message);
+      }
+
+      function transactionDone(transaction) {
+        return new Promise((resolve, reject) => {
+          transaction.oncomplete = () => resolve();
+          transaction.onabort = () => reject(transaction.error ?? new Error('Aborted'));
+          transaction.onerror = () => reject(transaction.error ?? new Error('Failed'));
+        });
+      }
+
+      function requestResult(request) {
+        return new Promise((resolve, reject) => {
+          request.onsuccess = () => resolve(request.result);
+          request.onerror = () => reject(request.error ?? new Error('Request failed'));
+        });
+      }
+
+      function openDatabase(name, version, { blocked, upgrade } = {}) {
+        return new Promise((resolve, reject) => {
+          const request = indexedDB.open(name, version);
+          request.onblocked = () => blocked?.();
+          request.onerror = () => reject(request.error ?? new Error('Open failed'));
+          request.onupgradeneeded = (event) =>
+            upgrade?.(request.result, request.transaction, event.oldVersion);
+          request.onsuccess = () => resolve(request.result);
+        });
+      }
+
+      async function putRecords(database, stores) {
+        const names = Object.keys(stores);
+        const transaction = database.transaction(names, 'readwrite');
+        for (const [storeName, records] of Object.entries(stores)) {
+          const store = transaction.objectStore(storeName);
+          for (const record of records) store.put(record);
+        }
+        await transactionDone(transaction);
+      }
+
+      async function getRecord(database, storeName, key) {
+        const transaction = database.transaction(storeName, 'readonly');
+        const value = await requestResult(transaction.objectStore(storeName).get(key));
+        await transactionDone(transaction);
+        return value;
+      }
+
+      async function sha256(blob) {
+        const bytes = blob instanceof Blob ? await blob.arrayBuffer() : blob;
+        const digest = await crypto.subtle.digest('SHA-256', bytes);
+        return [...new Uint8Array(digest)]
+          .map((value) => value.toString(16).padStart(2, '0'))
+          .join('');
+      }
+
+      async function runCase(name, task) {
+        try {
+          await task();
+          results.push({ name, outcome: 'PASS' });
+        } catch (error) {
+          results.push({
+            name,
+            outcome: 'FAIL',
+            detail:
+              error instanceof Error
+                ? `${error.name}: ${error.message}`
+                : String(error),
+          });
+        }
+      }
+
+      function createDocumentV4(database) {
+        database.createObjectStore('document-states', { keyPath: 'documentId' });
+        database.createObjectStore('pdf-files', { keyPath: 'documentId' });
+        database.createObjectStore('collections', { keyPath: 'id' });
+      }
+
+      function createProductivityV2(database) {
+        database.createObjectStore('print-drafts', { keyPath: 'documentId' });
+        database.createObjectStore('rendered-print-pdfs', { keyPath: 'documentId' });
+        const conversations = database.createObjectStore('ai-conversations', {
+          keyPath: 'id',
+        });
+        conversations.createIndex('by-document', 'documentId');
+      }
+
+      function addDocumentV5Stores(database) {
+        if (!database.objectStoreNames.contains('restore-operations')) {
+          database.createObjectStore('restore-operations', { keyPath: 'id' });
+        }
+        if (!database.objectStoreNames.contains('restore-snapshots')) {
+          database.createObjectStore('restore-snapshots', { keyPath: 'id' });
+        }
+      }
+
+      function addProductivityV3Stores(database) {
+        if (!database.objectStoreNames.contains('restore-snapshots')) {
+          database.createObjectStore('restore-snapshots', { keyPath: 'id' });
+        }
+      }
+
+      const sourceBytes = new Uint8Array([37, 80, 68, 70, 45, 49, 46, 55, 10, 65, 10]);
+      const printBytes = new Uint8Array([37, 80, 68, 70, 45, 49, 46, 55, 10, 80, 10]);
+      const documentState = {
+        documentId: 'prototype-paper',
+        schemaVersion: 9,
+        annotations: [{ id: 'annotation-1', type: 'highlight', color: 'yellow' }],
+        links: [{ id: 'link-1', documentId: 'prototype-paper', endpoints: [] }],
+        notes: [
+          { id: 'note-1', annotationId: 'annotation-1', content: 'Synthetic note' },
+        ],
+        collectionIds: ['collection-1'],
+        updatedAt: 1700000000000,
+      };
+      const collection = {
+        id: 'collection-1',
+        name: 'Synthetic Collection',
+        normalizedName: 'synthetic collection',
+        updatedAt: 1700000000000,
+      };
+      const source = {
+        documentId: 'prototype-paper',
+        blob: new Blob([sourceBytes], { type: 'application/pdf' }),
+        fileName: 'synthetic.pdf',
+        mimeType: 'application/pdf',
+        size: sourceBytes.byteLength,
+      };
+      const printDraft = {
+        documentId: 'prototype-paper',
+        title: 'Synthetic draft',
+        updatedAt: 1700000000000,
+      };
+      const conversation = {
+        id: 'conversation-1',
+        documentId: 'prototype-paper',
+        messages: [{ role: 'user', content: 'Synthetic prompt' }],
+        updatedAt: 1700000000000,
+      };
+      const renderedPrint = {
+        documentId: 'prototype-paper',
+        blob: new Blob([printBytes], { type: 'application/pdf' }),
+        fileName: 'synthetic-print.pdf',
+        sha256: await sha256(printBytes),
+        size: printBytes.byteLength,
+      };
+
+      let documentDatabase;
+      let productivityDatabase;
+
+      await runCase(
+        'Native IndexedDB v4→v5 and v2→v3 preserve exact records and Blobs',
+        async () => {
+          const suffix = crypto.randomUUID();
+          const documentName = `39note-bkp03-prototype-docs-${suffix}`;
+          const productivityName = `39note-bkp03-prototype-productivity-${suffix}`;
+          syntheticNames.push(documentName, productivityName);
+
+          const oldDocuments = await openDatabase(documentName, 4, {
+            upgrade: createDocumentV4,
+          });
+          await putRecords(oldDocuments, {
+            'document-states': [documentState],
+            'pdf-files': [source],
+            collections: [collection],
+          });
+          let documentVersionChange = false;
+          oldDocuments.onversionchange = () => {
+            documentVersionChange = true;
+            oldDocuments.close();
+          };
+
+          const oldProductivity = await openDatabase(productivityName, 2, {
+            upgrade: createProductivityV2,
+          });
+          await putRecords(oldProductivity, {
+            'print-drafts': [printDraft],
+            'rendered-print-pdfs': [renderedPrint],
+            'ai-conversations': [conversation],
+          });
+          let productivityVersionChange = false;
+          oldProductivity.onversionchange = () => {
+            productivityVersionChange = true;
+            oldProductivity.close();
+          };
+
+          documentDatabase = await openDatabase(documentName, 5, {
+            upgrade: addDocumentV5Stores,
+          });
+          productivityDatabase = await openDatabase(productivityName, 3, {
+            upgrade: addProductivityV3Stores,
+          });
+
+          assert(
+            documentVersionChange,
+            'Document legacy connection saw no versionchange',
+          );
+          assert(
+            productivityVersionChange,
+            'Productivity legacy connection saw no versionchange',
+          );
+          assert(
+            JSON.stringify(
+              await getRecord(documentDatabase, 'document-states', 'prototype-paper'),
+            ) === JSON.stringify(documentState),
+            'Document state changed during upgrade',
+          );
+          assert(
+            JSON.stringify(
+              await getRecord(documentDatabase, 'collections', 'collection-1'),
+            ) === JSON.stringify(collection),
+            'Collection changed during upgrade',
+          );
+          assert(
+            (await sha256(
+              (await getRecord(documentDatabase, 'pdf-files', 'prototype-paper')).blob,
+            )) === (await sha256(source.blob)),
+            'Source Blob changed during upgrade',
+          );
+          assert(
+            JSON.stringify(
+              await getRecord(productivityDatabase, 'print-drafts', 'prototype-paper'),
+            ) === JSON.stringify(printDraft),
+            'Print draft changed during upgrade',
+          );
+          assert(
+            JSON.stringify(
+              await getRecord(
+                productivityDatabase,
+                'ai-conversations',
+                'conversation-1',
+              ),
+            ) === JSON.stringify(conversation),
+            'Conversation changed during upgrade',
+          );
+          assert(
+            (await sha256(
+              (
+                await getRecord(
+                  productivityDatabase,
+                  'rendered-print-pdfs',
+                  'prototype-paper',
+                )
+              ).blob,
+            )) === (await sha256(renderedPrint.blob)),
+            'Print Blob changed during upgrade',
+          );
+          assert(
+            [...documentDatabase.objectStoreNames].sort().join('|') ===
+              [
+                'collections',
+                'document-states',
+                'pdf-files',
+                'restore-operations',
+                'restore-snapshots',
+              ]
+                .sort()
+                .join('|'),
+            'Unexpected document stores after upgrade',
+          );
+          assert(
+            [...productivityDatabase.objectStoreNames].sort().join('|') ===
+              [
+                'ai-conversations',
+                'print-drafts',
+                'rendered-print-pdfs',
+                'restore-snapshots',
+              ]
+                .sort()
+                .join('|'),
+            'Unexpected productivity stores after upgrade',
+          );
+        },
+      );
+
+      await runCase('Reopening upgraded databases is idempotent', async () => {
+        let upgradeCalls = 0;
+        const documentName = syntheticNames[0];
+        documentDatabase.close();
+        documentDatabase = await openDatabase(documentName, 5, {
+          upgrade: () => {
+            upgradeCalls += 1;
+          },
+        });
+        assert(upgradeCalls === 0, 'Same-version reopen reran upgrade');
+        assert(
+          documentDatabase.objectStoreNames.contains('restore-snapshots'),
+          'Restore snapshot store missing on reopen',
+        );
+      });
+
+      await runCase(
+        'Aborted native upgrade leaves the complete v4 schema and records',
+        async () => {
+          const name = `39note-bkp03-prototype-abort-${crypto.randomUUID()}`;
+          syntheticNames.push(name);
+          const versionFour = await openDatabase(name, 4, {
+            upgrade: createDocumentV4,
+          });
+          await putRecords(versionFour, { 'document-states': [documentState] });
+          versionFour.close();
+          let aborted = false;
+          try {
+            await openDatabase(name, 5, {
+              upgrade: (database, transaction) => {
+                database.createObjectStore('restore-operations', { keyPath: 'id' });
+                transaction.abort();
+              },
+            });
+          } catch (error) {
+            aborted = error instanceof DOMException && error.name === 'AbortError';
+          }
+          assert(aborted, 'Upgrade did not reject with AbortError');
+          const reopened = await openDatabase(name, 4);
+          assert(
+            reopened.version === 4,
+            'Aborted upgrade changed the database version',
+          );
+          assert(
+            !reopened.objectStoreNames.contains('restore-operations'),
+            'Aborted upgrade left a partial store',
+          );
+          assert(
+            JSON.stringify(
+              await getRecord(reopened, 'document-states', 'prototype-paper'),
+            ) === JSON.stringify(documentState),
+            'Aborted upgrade changed existing data',
+          );
+          reopened.close();
+        },
+      );
+
+      await runCase(
+        'Uncooperative old client can still write while blocking upgrade, so restore must not start',
+        async () => {
+          const name = `39note-bkp03-prototype-blocked-${crypto.randomUUID()}`;
+          syntheticNames.push(name);
+          const oldConnection = await openDatabase(name, 4, {
+            upgrade: createDocumentV4,
+          });
+          let sawVersionChange = false;
+          oldConnection.onversionchange = () => {
+            sawVersionChange = true;
+          };
+          const blocked = deferred();
+          let upgradeCompleted = false;
+          const upgradePromise = openDatabase(name, 5, {
+            blocked: () => blocked.resolve(),
+            upgrade: addDocumentV5Stores,
+          }).then((database) => {
+            upgradeCompleted = true;
+            return database;
+          });
+          await blocked.promise;
+          assert(sawVersionChange, 'Old connection received no versionchange');
+          assert(!upgradeCompleted, 'Blocked upgrade falsely completed');
+          await putRecords(oldConnection, {
+            'document-states': [{ ...documentState, updatedAt: 1700000000002 }],
+          });
+          assert(
+            !upgradeCompleted,
+            'Legacy write incorrectly made the blocked upgrade authoritative',
+          );
+          oldConnection.close();
+          const upgraded = await upgradePromise;
+          assert(upgraded.version === 5, 'Upgrade did not continue after legacy close');
+          assert(
+            (await getRecord(upgraded, 'document-states', 'prototype-paper'))
+              .updatedAt === 1700000000002,
+            'Legacy write made before authority was not preserved',
+          );
+          upgraded.close();
+
+          let oldReopenError;
+          try {
+            await openDatabase(name, 4);
+          } catch (error) {
+            oldReopenError = error;
+          }
+          assert(
+            oldReopenError instanceof DOMException &&
+              oldReopenError.name === 'VersionError',
+            'Old-version reopen did not fail with VersionError',
+          );
+        },
+      );
+
+      await runCase(
+        'A pre-upgrade native write commits before upgrade authority',
+        async () => {
+          const name = `39note-bkp03-prototype-prewrite-${crypto.randomUUID()}`;
+          syntheticNames.push(name);
+          const oldConnection = await openDatabase(name, 4, {
+            upgrade: createDocumentV4,
+          });
+          const transaction = oldConnection.transaction('document-states', 'readwrite');
+          transaction.objectStore('document-states').put({
+            ...documentState,
+            updatedAt: 1700000000001,
+          });
+          const writeFinished = transactionDone(transaction);
+          oldConnection.onversionchange = () => oldConnection.close();
+          const upgradePromise = openDatabase(name, 5, {
+            upgrade: addDocumentV5Stores,
+          });
+          await writeFinished;
+          const upgraded = await upgradePromise;
+          const written = await getRecord(
+            upgraded,
+            'document-states',
+            'prototype-paper',
+          );
+          assert(written.updatedAt === 1700000000001, 'Pre-upgrade write was lost');
+          upgraded.close();
+        },
+      );
+
+      await runCase(
+        'Shared Web Lock closes the cross-database check-then-write race',
+        async () => {
+          assert(navigator.locks, 'Web Locks is unavailable');
+          const writerChecked = deferred();
+          const permitWriterCommit = deferred();
+          const restoreAcquired = deferred();
+          const ordering = [];
+
+          const writer = navigator.locks.request(
+            lockName,
+            { mode: 'shared' },
+            async () => {
+              ordering.push('writer-acquired');
+              const barrier = await getRecord(
+                documentDatabase,
+                'restore-operations',
+                'active',
+              );
+              assert(!barrier, 'Unexpected barrier before writer');
+              writerChecked.resolve();
+              await permitWriterCommit.promise;
+              const transaction = productivityDatabase.transaction(
+                'print-drafts',
+                'readwrite',
+              );
+              transaction.objectStore('print-drafts').put({
+                ...printDraft,
+                title: 'Writer committed before restore',
+              });
+              await transactionDone(transaction);
+              ordering.push('writer-committed');
+            },
+          );
+
+          await writerChecked.promise;
+          const restore = navigator.locks.request(
+            lockName,
+            { mode: 'exclusive' },
+            async () => {
+              ordering.push('restore-acquired');
+              restoreAcquired.resolve();
+              const transaction = documentDatabase.transaction(
+                'restore-operations',
+                'readwrite',
+              );
+              transaction.objectStore('restore-operations').put({
+                id: 'active',
+                operationId: 'operation-1',
+                workspaceId,
+                phase: 'preparing',
+                barrierGeneration: 1,
+                createdAt: 1700000000000,
+                recoveryRequired: false,
+                publicationHold: false,
+              });
+              await transactionDone(transaction);
+              ordering.push('barrier-durable');
+            },
+          );
+
+          permitWriterCommit.resolve();
+          await Promise.all([writer, restore, restoreAcquired.promise]);
+          assert(
+            ordering.join('|') ===
+              'writer-acquired|writer-committed|restore-acquired|barrier-durable',
+            `Unexpected lock order: ${ordering.join('|')}`,
+          );
+        },
+      );
+
+      await runCase(
+        'A queued writer rechecks the durable barrier and fails closed',
+        async () => {
+          let committed = false;
+          let blockedByBarrier = false;
+          await navigator.locks.request(lockName, { mode: 'shared' }, async () => {
+            const barrier = await getRecord(
+              documentDatabase,
+              'restore-operations',
+              'active',
+            );
+            if (barrier) {
+              blockedByBarrier = true;
+              return;
+            }
+            committed = true;
+          });
+          assert(blockedByBarrier, 'Writer did not observe durable barrier');
+          assert(!committed, 'Writer committed while restore barrier was active');
+        },
+      );
+
+      await runCase(
+        'Multiple shared actors run concurrently and thrown callbacks release locks',
+        async () => {
+          const firstEntered = deferred();
+          const secondEntered = deferred();
+          const release = deferred();
+          const first = navigator.locks.request(
+            lockName,
+            { mode: 'shared' },
+            async () => {
+              firstEntered.resolve();
+              await release.promise;
+            },
+          );
+          const second = navigator.locks.request(
+            lockName,
+            { mode: 'shared' },
+            async () => {
+              secondEntered.resolve();
+              await release.promise;
+            },
+          );
+          await Promise.all([firstEntered.promise, secondEntered.promise]);
+          release.resolve();
+          await Promise.all([first, second]);
+
+          let threw = false;
+          try {
+            await navigator.locks.request(lockName, { mode: 'shared' }, () => {
+              throw new Error('synthetic writer failure');
+            });
+          } catch {
+            threw = true;
+          }
+          assert(threw, 'Synthetic writer error did not propagate');
+          let exclusiveAcquired = false;
+          await navigator.locks.request(lockName, { mode: 'exclusive' }, () => {
+            exclusiveAcquired = true;
+          });
+          assert(exclusiveAcquired, 'Thrown callback leaked its lock');
+        },
+      );
+
+      await runCase(
+        'Destroying a same-origin actor releases its held Web Lock',
+        async () => {
+          const actorLockName = `${lockName}-actor`;
+          const actorEntered = deferred();
+          const listener = (event) => {
+            if (event.data === `phase-a-lock-acquired:${actorLockName}`)
+              actorEntered.resolve();
+          };
+          globalThis.addEventListener('message', listener);
+          const actor = document.createElement('iframe');
+          actor.hidden = true;
+          actor.srcdoc = `<script>navigator.locks.request(${JSON.stringify(
+            actorLockName,
+          )}, { mode: 'exclusive' }, async () => { parent.postMessage(${JSON.stringify(
+            `phase-a-lock-acquired:${actorLockName}`,
+          )}, '*'); await new Promise(() => {}); });<\/script>`;
+          document.body.append(actor);
+          await actorEntered.promise;
+          actor.remove();
+          let reacquired = false;
+          await navigator.locks.request(actorLockName, { mode: 'exclusive' }, () => {
+            reacquired = true;
+          });
+          globalThis.removeEventListener('message', listener);
+          assert(reacquired, 'Destroyed actor retained its Web Lock');
+        },
+      );
+
+      await runCase(
+        'Barrier ownership and generation survive service re-instantiation',
+        async () => {
+          documentDatabase.close();
+          documentDatabase = await openDatabase(syntheticNames[0], 5);
+          const durable = await getRecord(
+            documentDatabase,
+            'restore-operations',
+            'active',
+          );
+          assert(durable.operationId === 'operation-1', 'Operation ID did not persist');
+          assert(durable.barrierGeneration === 1, 'Barrier generation did not persist');
+
+          async function transition(expectedOperationId, expectedGeneration, update) {
+            const transaction = documentDatabase.transaction(
+              'restore-operations',
+              'readwrite',
+            );
+            const store = transaction.objectStore('restore-operations');
+            const current = await requestResult(store.get('active'));
+            if (
+              current?.operationId !== expectedOperationId ||
+              current?.barrierGeneration !== expectedGeneration
+            ) {
+              transaction.abort();
+              try {
+                await transactionDone(transaction);
+              } catch {
+                // Expected ownership rejection.
+              }
+              return false;
+            }
+            store.put({
+              ...current,
+              ...update,
+              barrierGeneration: expectedGeneration + 1,
+            });
+            await transactionDone(transaction);
+            return true;
+          }
+
+          assert(
+            !(await transition('stale-operation', 1, { phase: 'idle' })),
+            'Stale operation changed the barrier',
+          );
+          assert(
+            await transition('operation-1', 1, {
+              phase: 'committed',
+              publicationHold: true,
+            }),
+            'Owner could not transition the barrier',
+          );
+          const held = await getRecord(
+            documentDatabase,
+            'restore-operations',
+            'active',
+          );
+          assert(held.publicationHold === true, 'Publication hold did not persist');
+          assert(held.barrierGeneration === 2, 'Barrier generation did not advance');
+        },
+      );
+
+      documentDatabase?.close();
+      productivityDatabase?.close();
+
+      const failures = results.filter((result) => result.outcome === 'FAIL');
+      const summary = document.querySelector('#summary');
+      const list = document.querySelector('#results');
+      for (const result of results) {
+        const item = document.createElement('li');
+        item.dataset.outcome = result.outcome;
+        item.textContent = `${result.outcome}: ${result.name}${result.detail ? ` — ${result.detail}` : ''}`;
+        list.append(item);
+      }
+      summary.dataset.outcome = failures.length === 0 ? 'PASS' : 'FAIL';
+      summary.textContent =
+        failures.length === 0
+          ? `PASS — ${results.length}/${results.length} native checks`
+          : `FAIL — ${results.length - failures.length}/${results.length} native checks`;
+      document.querySelector('#details').textContent = JSON.stringify(
+        {
+          databaseNames: syntheticNames,
+          lockName,
+          note: 'Synthetic databases intentionally remain on this isolated localhost origin.',
+        },
+        null,
+        2,
+      );
+      document.title = `${failures.length === 0 ? 'PASS' : 'FAIL'} — BKP-03 Phase A native prototype`;
+    </script>
+  </body>
+</html>

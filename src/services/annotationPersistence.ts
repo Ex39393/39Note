@@ -1,13 +1,14 @@
-import { openDB, type DBSchema, type IDBPDatabase } from 'idb';
+import { type DBSchema, type IDBPDatabase } from 'idb';
 import {
-  highlightColors,
-  underlineColors,
+  normalizeHighlightColor,
+  normalizeUnderlineColor,
   type HighlightColor,
   type PdfAnnotation,
   type UnderlineColor,
 } from '../types/highlight';
 import type { Note } from '../types/note';
 import type { NoteAnchor } from '../types/noteAnchor';
+import type { DocumentLink } from '../types/documentLink.ts';
 import type { GlossaryEntry } from '../types/glossary';
 import type { DocumentIdentity } from '../types/persistence';
 import {
@@ -24,12 +25,17 @@ import type {
   CollectionRecord,
   DocumentLibraryMetadata,
   ReadingPosition,
-  TagRecord,
 } from '../types/library';
 import { isValidDocumentId } from '../utils/documentId';
 import { sanitizePersistedGlossaryEntries } from '../utils/glossaryPersistence';
 import {
-  notifyPersistentChange,
+  DOCUMENT_LINK_PERSISTENCE_SCHEMA_VERSION,
+  isValidNextDocumentLinkNumber,
+  repairDocumentLinkNumberCollisions,
+  sanitizeDocumentLinks,
+} from '../utils/documentLinks.ts';
+import {
+  dispatchPersistentChange,
   type PersistentChangeCategory,
 } from './persistentChange.ts';
 import {
@@ -41,14 +47,38 @@ import {
   inspectStoredDocumentSourceMetadata,
   validateStoredDocumentSource,
 } from './documentSourceValidation.ts';
+import { openDatabaseWithLifecycleSafety } from './indexedDbLifecycle.ts';
+import {
+  RESTORE_ACTION_STORE,
+  RESTORE_OPERATION_STORE,
+  RESTORE_SNAPSHOT_STORE,
+  RestoreStartupBlockedError,
+  WorkspaceRestoreBarrierError,
+  canTransitionRestorePhase,
+  isDurableRestoreOperation,
+  type DurableRestoreOperation,
+  type RestoreCommitEvidenceV1,
+  type RestoreAppliedAction,
+  type RestoreLifecyclePhase,
+  type RestoreSnapshotEnvelope,
+} from './restoreSafety.ts';
+import {
+  assertWorkspaceRestoreLease,
+  browserSupportsWorkspaceRestoreLocks,
+  currentWorkspaceRestoreIdentity,
+  WorkspaceLocksUnavailableError,
+  withSharedWorkspaceRestoreLease,
+  type WorkspaceRestoreLease,
+} from './workspaceRestoreLock.ts';
 
 const DATABASE_NAME = PERSONAL_ANNOTATION_DATABASE_NAME;
-const DATABASE_VERSION = 3;
+export const ANNOTATION_DATABASE_VERSION = 5;
 const DOCUMENT_STATE_STORE = 'document-states';
 const PDF_FILE_STORE = 'pdf-files';
 const COLLECTION_STORE = 'collections';
-const TAG_STORE = 'tags';
-export const PERSISTENCE_SCHEMA_VERSION = 8;
+/** Schema 9 makes released schema-8 clients fail closed before dropping Links. */
+export const PERSISTENCE_SCHEMA_VERSION =
+  9 satisfies typeof DOCUMENT_LINK_PERSISTENCE_SCHEMA_VERSION;
 const LEGACY_SCHEMA_VERSION = 1;
 const PREVIOUS_SCHEMA_VERSION = 2;
 const HIGHLIGHT_NOTE_SCHEMA_VERSION = 3;
@@ -56,6 +86,7 @@ const DOCUMENT_METADATA_SCHEMA_VERSION = 4;
 const PREVIOUS_PERSISTENCE_SCHEMA_VERSION = 5;
 const NOTE_ANCHOR_PREVIOUS_SCHEMA_VERSION = 6;
 const PDF_DOCUMENT_SCHEMA_VERSION = 7;
+export const FORMAT_GENERIC_PERSISTENCE_SCHEMA_VERSION = 8;
 
 export interface PersistedDocumentState
   extends DocumentIdentity, DocumentLibraryMetadata {
@@ -64,12 +95,16 @@ export interface PersistedDocumentState
   originalFileName: string;
   displayTitle: string;
   annotations: PdfAnnotation[];
+  /** Same-document, at-most-two-endpoint PDF text relationships. */
+  links: DocumentLink[];
   /** Format-native semantic marks. Existing PDF geometry remains in annotations. */
   officeAnnotations: OfficeDocumentAnnotation[];
   noteAnchors: NoteAnchor[];
   notes: Note[];
   glossaryEntries: GlossaryEntry[];
   nextNoteNumber: number;
+  /** Monotonic document-scoped allocation high-water mark; deleted numbers stay used. */
+  nextLinkNumber: number;
   updatedAt: number;
   documentReadingPosition?: DocumentReadingPosition;
 }
@@ -92,7 +127,6 @@ export interface LibraryDocument {
   /** @deprecated PDF compatibility alias. */
   pdfSize: number | null;
   collectionIds: string[];
-  tagIds: string[];
   isPinned: boolean;
   pinnedAt?: number;
   lastReadAt?: number;
@@ -147,7 +181,6 @@ export interface AnnotationStorageFootprint {
   pdfDocumentIds: string[];
   sourceDocumentIds: string[];
   collectionIds: string[];
-  tagIds: string[];
 }
 
 interface AnnotationDatabase extends DBSchema {
@@ -164,9 +197,17 @@ interface AnnotationDatabase extends DBSchema {
     key: string;
     value: CollectionRecord;
   };
-  [TAG_STORE]: {
+  [RESTORE_OPERATION_STORE]: {
     key: string;
-    value: TagRecord;
+    value: DurableRestoreOperation;
+  };
+  [RESTORE_SNAPSHOT_STORE]: {
+    key: string;
+    value: RestoreSnapshotEnvelope;
+  };
+  [RESTORE_ACTION_STORE]: {
+    key: string;
+    value: RestoreAppliedAction;
   };
 }
 
@@ -283,7 +324,6 @@ export async function listLibraryDocuments(): Promise<LibraryDocument[]> {
             pdfSize:
               matchingSource?.documentType === 'pdf' ? matchingSource.size : null,
             collectionIds: sanitizedState.collectionIds,
-            tagIds: sanitizedState.tagIds,
             isPinned: sanitizedState.isPinned,
             pinnedAt: sanitizedState.pinnedAt,
             lastReadAt: sanitizedState.lastReadAt,
@@ -311,6 +351,7 @@ export async function getLibraryStorageSummary(): Promise<LibraryStorageSummary>
       annotationCount:
         currentSummary.annotationCount +
         state.annotations.length +
+        state.links.length +
         state.officeAnnotations.length,
       noteCount:
         currentSummary.noteCount +
@@ -353,14 +394,13 @@ export async function inspectAnnotationStorageFootprintStrict(): Promise<Annotat
   const database = await getDatabase();
   if (!database) throw new Error('Local Library storage is unavailable.');
   const transaction = database.transaction(
-    [DOCUMENT_STATE_STORE, PDF_FILE_STORE, COLLECTION_STORE, TAG_STORE],
+    [DOCUMENT_STATE_STORE, PDF_FILE_STORE, COLLECTION_STORE],
     'readonly',
   );
-  const [states, pdfs, collections, tags] = await Promise.all([
+  const [states, pdfs, collections] = await Promise.all([
     transaction.objectStore(DOCUMENT_STATE_STORE).getAll(),
     transaction.objectStore(PDF_FILE_STORE).getAll(),
     transaction.objectStore(COLLECTION_STORE).getAll(),
-    transaction.objectStore(TAG_STORE).getAll(),
   ]);
   await transaction.done;
   for (const state of states) {
@@ -378,8 +418,8 @@ export async function inspectAnnotationStorageFootprintStrict(): Promise<Annotat
     }
     sourceMetadata.push(metadata);
   }
-  if (!collections.every(isValidNamedRecord) || !tags.every(isValidNamedRecord)) {
-    throw new Error('Local collection or tag storage could not be inspected safely.');
+  if (!collections.every(isValidNamedRecord)) {
+    throw new Error('Local Collection storage could not be inspected safely.');
   }
   return {
     documentIds: states.map((state) => state.documentId),
@@ -388,7 +428,6 @@ export async function inspectAnnotationStorageFootprintStrict(): Promise<Annotat
       .map((source) => source.documentId),
     sourceDocumentIds: sourceMetadata.map((source) => source.documentId),
     collectionIds: collections.map((collection) => collection.id),
-    tagIds: tags.map((tag) => tag.id),
   };
 }
 
@@ -474,33 +513,46 @@ async function readBackupDocumentData(
   ).flatMap((entry) => (entry ? [entry] : []));
 }
 
-export async function removeStoredPdfCopy(documentId: string): Promise<boolean> {
-  const source = await loadStoredDocumentSource(documentId);
-  if (source && source.documentType !== 'pdf') return false;
-  return removeStoredDocumentSource(documentId, 'pdf');
+export async function removeStoredPdfCopy(
+  documentId: string,
+  workspaceLease?: WorkspaceRestoreLease,
+): Promise<boolean> {
+  return withWorkspaceMutation(async (lease) => {
+    const source = await loadStoredDocumentSource(documentId);
+    if (source && source.documentType !== 'pdf') return false;
+    return removeStoredDocumentSource(documentId, 'pdf', lease);
+  }, workspaceLease);
 }
 
 export async function removeStoredDocumentSource(
   documentId: string,
   expectedDocumentType?: DocumentType,
+  workspaceLease?: WorkspaceRestoreLease,
 ): Promise<boolean> {
   try {
-    const database = await getDatabase();
-    if (!database || !(await database.get(DOCUMENT_STATE_STORE, documentId))) {
-      return false;
-    }
-    const rawSource = await database.get(PDF_FILE_STORE, documentId);
-    if (rawSource && expectedDocumentType) {
-      const metadata = inspectStoredDocumentSourceMetadata(rawSource, documentId);
-      if (metadata?.documentType !== expectedDocumentType) return false;
-    }
-    await database.delete(PDF_FILE_STORE, documentId);
-    notifyPersistentChange({
-      kind: expectedDocumentType === 'pdf' ? 'pdf' : 'document-source',
-      documentId,
-      categories: [expectedDocumentType === 'pdf' ? 'source-pdf' : 'source-document'],
-    });
-    return true;
+    return await withWorkspaceMutation(async (lease) => {
+      const database = await getDatabase();
+      if (!database || !(await database.get(DOCUMENT_STATE_STORE, documentId))) {
+        return false;
+      }
+      const rawSource = await database.get(PDF_FILE_STORE, documentId);
+      if (rawSource && expectedDocumentType) {
+        const metadata = inspectStoredDocumentSourceMetadata(rawSource, documentId);
+        if (metadata?.documentType !== expectedDocumentType) return false;
+      }
+      await database.delete(PDF_FILE_STORE, documentId);
+      await dispatchPersistentChange(
+        {
+          kind: expectedDocumentType === 'pdf' ? 'pdf' : 'document-source',
+          documentId,
+          categories: [
+            expectedDocumentType === 'pdf' ? 'source-pdf' : 'source-document',
+          ],
+        },
+        lease,
+      );
+      return true;
+    }, workspaceLease);
   } catch (error) {
     reportPersistenceError('source copy removal', error);
     return false;
@@ -513,6 +565,7 @@ export async function restoreBackupDocument(
   replaceExisting: boolean,
   notifyChange = true,
   signal?: AbortSignal,
+  workspaceLease?: WorkspaceRestoreLease,
 ): Promise<boolean> {
   signal?.throwIfAborted();
   if (!isRecord(rawState) || typeof rawState.documentId !== 'string') {
@@ -532,44 +585,49 @@ export async function restoreBackupDocument(
     return false;
   }
   try {
-    const database = await getDatabase();
-    if (!database) {
-      return false;
-    }
-    const transaction = database.transaction(
-      [DOCUMENT_STATE_STORE, PDF_FILE_STORE],
-      'readwrite',
-    );
-    let previous: PersistedDocumentState | null = null;
-    const releaseAbort = abortTransactionOnSignal(transaction, signal);
-    try {
-      const states = transaction.objectStore(DOCUMENT_STATE_STORE);
-      const pdfs = transaction.objectStore(PDF_FILE_STORE);
-      const existing = await states.get(state.documentId);
-      previous = sanitizeDocumentState(existing, state.documentId);
-      signal?.throwIfAborted();
-      if (existing && !replaceExisting) {
+    return await withWorkspaceMutation(async (lease) => {
+      const database = await getDatabase();
+      if (!database) {
+        return false;
+      }
+      const transaction = database.transaction(
+        [DOCUMENT_STATE_STORE, PDF_FILE_STORE],
+        'readwrite',
+      );
+      let previous: PersistedDocumentState | null = null;
+      const releaseAbort = abortTransactionOnSignal(transaction, signal);
+      try {
+        const states = transaction.objectStore(DOCUMENT_STATE_STORE);
+        const pdfs = transaction.objectStore(PDF_FILE_STORE);
+        const existing = await states.get(state.documentId);
+        previous = sanitizeDocumentState(existing, state.documentId);
+        signal?.throwIfAborted();
+        if (existing && !replaceExisting) {
+          await transaction.done;
+          return true;
+        }
+        await states.put(state);
+        if (source) {
+          await pdfs.put(source);
+        } else if (replaceExisting) {
+          await pdfs.delete(state.documentId);
+        }
         await transaction.done;
-        return true;
+      } finally {
+        releaseAbort();
       }
-      await states.put(state);
-      if (source) {
-        await pdfs.put(source);
-      } else if (replaceExisting) {
-        await pdfs.delete(state.documentId);
+      if (notifyChange) {
+        await dispatchPersistentChange(
+          {
+            kind: 'document',
+            documentId: state.documentId,
+            categories: documentChangeCategories(previous, state, source?.documentType),
+          },
+          lease,
+        );
       }
-      await transaction.done;
-    } finally {
-      releaseAbort();
-    }
-    if (notifyChange) {
-      notifyPersistentChange({
-        kind: 'document',
-        documentId: state.documentId,
-        categories: documentChangeCategories(previous, state, source?.documentType),
-      });
-    }
-    return true;
+      return true;
+    }, workspaceLease);
   } catch (error) {
     if (signal?.aborted) throw signal.reason ?? error;
     reportPersistenceError('backup restore', error);
@@ -586,8 +644,8 @@ export async function restoreDownloadedPaperBundle(
   rawState: unknown,
   rawSource: StoredPdfFile | StoredDocumentSource | null,
   collections: readonly CollectionRecord[],
-  tags: readonly TagRecord[],
   signal?: AbortSignal,
+  workspaceLease?: WorkspaceRestoreLease,
 ): Promise<boolean> {
   signal?.throwIfAborted();
   if (!isRecord(rawState) || typeof rawState.documentId !== 'string') return false;
@@ -601,44 +659,41 @@ export async function restoreDownloadedPaperBundle(
     !state ||
     (rawSource && !source) ||
     (source && source.documentType !== state.documentType) ||
-    !validateLibraryEntities(collections, tags)
+    !validateLibraryEntities(collections)
   ) {
     return false;
   }
   try {
-    const database = await getDatabase();
-    if (!database) return false;
-    const transaction = database.transaction(
-      [DOCUMENT_STATE_STORE, PDF_FILE_STORE, COLLECTION_STORE, TAG_STORE],
-      'readwrite',
-    );
-    const releaseAbort = abortTransactionOnSignal(transaction, signal);
-    try {
-      const states = transaction.objectStore(DOCUMENT_STATE_STORE);
-      const pdfs = transaction.objectStore(PDF_FILE_STORE);
-      const collectionStore = transaction.objectStore(COLLECTION_STORE);
-      const tagStore = transaction.objectStore(TAG_STORE);
-      await states.put(state);
-      if (source) await pdfs.put(source);
-      else await pdfs.delete(state.documentId);
-      signal?.throwIfAborted();
-      const [existingCollections, existingTags] = await Promise.all([
-        Promise.all(collections.map(({ id }) => collectionStore.get(id))),
-        Promise.all(tags.map(({ id }) => tagStore.get(id))),
-      ]);
-      await Promise.all([
-        ...collections.flatMap((collection, index) =>
-          existingCollections[index] ? [] : [collectionStore.put(collection)],
-        ),
-        ...tags.flatMap((tag, index) =>
-          existingTags[index] ? [] : [tagStore.put(tag)],
-        ),
-      ]);
-      await transaction.done;
-    } finally {
-      releaseAbort();
-    }
-    return true;
+    return await withWorkspaceMutation(async () => {
+      const database = await getDatabase();
+      if (!database) return false;
+      const transaction = database.transaction(
+        [DOCUMENT_STATE_STORE, PDF_FILE_STORE, COLLECTION_STORE],
+        'readwrite',
+      );
+      const releaseAbort = abortTransactionOnSignal(transaction, signal);
+      try {
+        const states = transaction.objectStore(DOCUMENT_STATE_STORE);
+        const pdfs = transaction.objectStore(PDF_FILE_STORE);
+        const collectionStore = transaction.objectStore(COLLECTION_STORE);
+        await states.put(state);
+        if (source) await pdfs.put(source);
+        else await pdfs.delete(state.documentId);
+        signal?.throwIfAborted();
+        const existingCollections = await Promise.all(
+          collections.map(({ id }) => collectionStore.get(id)),
+        );
+        await Promise.all(
+          collections.flatMap((collection, index) =>
+            existingCollections[index] ? [] : [collectionStore.put(collection)],
+          ),
+        );
+        await transaction.done;
+      } finally {
+        releaseAbort();
+      }
+      return true;
+    }, workspaceLease);
   } catch (error) {
     if (signal?.aborted) throw signal.reason ?? error;
     reportPersistenceError('paper download bundle', error);
@@ -653,8 +708,29 @@ export function validateBackupDocumentState(
     return null;
   }
 
+  const carriesLibraryMetadata =
+    typeof value.schemaVersion === 'number' &&
+    value.schemaVersion >= DOCUMENT_METADATA_SCHEMA_VERSION;
+  const collectionIds = value.collectionIds;
+  if (
+    carriesLibraryMetadata &&
+    (!Array.isArray(collectionIds) ||
+      collectionIds.some(
+        (collectionId) =>
+          typeof collectionId !== 'string' ||
+          collectionId.length === 0 ||
+          collectionId.length > 128,
+      ) ||
+      new Set(collectionIds).size !== collectionIds.length)
+  ) {
+    return null;
+  }
+
   if (
     !Array.isArray(value.annotations) ||
+    (value.schemaVersion === PERSISTENCE_SCHEMA_VERSION &&
+      !Array.isArray(value.links)) ||
+    (value.schemaVersion !== PERSISTENCE_SCHEMA_VERSION && value.links !== undefined) ||
     (value.officeAnnotations !== undefined &&
       !Array.isArray(value.officeAnnotations)) ||
     (value.noteAnchors !== undefined && !Array.isArray(value.noteAnchors)) ||
@@ -673,6 +749,7 @@ export function validateBackupDocumentState(
   if (
     !state ||
     state.annotations.length !== value.annotations.length ||
+    state.links.length !== (Array.isArray(value.links) ? value.links.length : 0) ||
     state.officeAnnotations.length !==
       (Array.isArray(value.officeAnnotations) ? value.officeAnnotations.length : 0) ||
     state.noteAnchors.length !==
@@ -694,43 +771,49 @@ export async function deleteDocumentState(
   documentId: string,
   notifyChange = true,
   signal?: AbortSignal,
+  workspaceLease?: WorkspaceRestoreLease,
 ): Promise<boolean> {
   signal?.throwIfAborted();
   try {
-    const database = await getDatabase();
-    if (!database) {
-      return false;
-    }
+    return await withWorkspaceMutation(async (lease) => {
+      const database = await getDatabase();
+      if (!database) {
+        return false;
+      }
 
-    const transaction = database.transaction(
-      [DOCUMENT_STATE_STORE, PDF_FILE_STORE],
-      'readwrite',
-    );
-    const releaseAbort = abortTransactionOnSignal(transaction, signal);
-    try {
-      await Promise.all([
-        transaction.objectStore(DOCUMENT_STATE_STORE).delete(documentId),
-        transaction.objectStore(PDF_FILE_STORE).delete(documentId),
-      ]);
-      signal?.throwIfAborted();
-      await transaction.done;
-    } finally {
-      releaseAbort();
-    }
-    if (notifyChange)
-      notifyPersistentChange({
-        kind: 'document',
-        documentId,
-        categories: [
-          'deleted',
-          'metadata',
-          'notes',
-          'annotations',
-          'glossary',
-          'reading-state',
-        ],
-      });
-    return true;
+      const transaction = database.transaction(
+        [DOCUMENT_STATE_STORE, PDF_FILE_STORE],
+        'readwrite',
+      );
+      const releaseAbort = abortTransactionOnSignal(transaction, signal);
+      try {
+        await Promise.all([
+          transaction.objectStore(DOCUMENT_STATE_STORE).delete(documentId),
+          transaction.objectStore(PDF_FILE_STORE).delete(documentId),
+        ]);
+        signal?.throwIfAborted();
+        await transaction.done;
+      } finally {
+        releaseAbort();
+      }
+      if (notifyChange)
+        await dispatchPersistentChange(
+          {
+            kind: 'document',
+            documentId,
+            categories: [
+              'deleted',
+              'metadata',
+              'notes',
+              'annotations',
+              'glossary',
+              'reading-state',
+            ],
+          },
+          lease,
+        );
+      return true;
+    }, workspaceLease);
   } catch (error) {
     if (signal?.aborted) throw signal.reason ?? error;
     reportPersistenceError('delete', error);
@@ -741,83 +824,87 @@ export async function deleteDocumentState(
 export async function deleteDocumentStateStrict(
   documentId: string,
   signal?: AbortSignal,
+  workspaceLease?: WorkspaceRestoreLease,
 ): Promise<void> {
-  if (!isValidDocumentId(documentId))
-    throw new Error('A temporary paper identifier is invalid.');
-  if (!(await deleteDocumentState(documentId, false, signal))) {
-    throw new Error('39Note could not clear a temporary paper.');
-  }
-  const database = await getDatabase();
-  if (!database) throw new Error('Local Library storage is unavailable.');
-  const [state, pdf] = await Promise.all([
-    database.get(DOCUMENT_STATE_STORE, documentId),
-    database.get(PDF_FILE_STORE, documentId),
-  ]);
-  if (state !== undefined || pdf !== undefined) {
-    throw new Error('39Note could not verify temporary paper cleanup.');
-  }
+  await withWorkspaceMutation(async (lease) => {
+    if (!isValidDocumentId(documentId))
+      throw new Error('A temporary paper identifier is invalid.');
+    if (!(await deleteDocumentState(documentId, false, signal, lease))) {
+      throw new Error('39Note could not clear a temporary paper.');
+    }
+    const database = await getDatabase();
+    if (!database) throw new Error('Local Library storage is unavailable.');
+    const [state, pdf] = await Promise.all([
+      database.get(DOCUMENT_STATE_STORE, documentId),
+      database.get(PDF_FILE_STORE, documentId),
+    ]);
+    if (state !== undefined || pdf !== undefined) {
+      throw new Error('39Note could not verify temporary paper cleanup.');
+    }
+  }, workspaceLease);
 }
 
 export async function deleteLibraryEntitiesStrict(
   collectionIds: readonly string[],
-  tagIds: readonly string[],
+  workspaceLease?: WorkspaceRestoreLease,
 ): Promise<void> {
-  const database = await getDatabase();
-  if (!database) throw new Error('Local Library storage is unavailable.');
-  const transaction = database.transaction([COLLECTION_STORE, TAG_STORE], 'readwrite');
-  for (const id of new Set(collectionIds))
-    await transaction.objectStore(COLLECTION_STORE).delete(id);
-  for (const id of new Set(tagIds)) await transaction.objectStore(TAG_STORE).delete(id);
-  await transaction.done;
-  const [collections, tags] = await Promise.all([
-    database.getAll(COLLECTION_STORE),
-    database.getAll(TAG_STORE),
-  ]);
-  if (
-    collections.some((item) => collectionIds.includes(item.id)) ||
-    tags.some((item) => tagIds.includes(item.id))
-  ) {
-    throw new Error('39Note could not verify temporary collection cleanup.');
-  }
+  await withWorkspaceMutation(async () => {
+    const database = await getDatabase();
+    if (!database) throw new Error('Local Library storage is unavailable.');
+    const transaction = database.transaction(COLLECTION_STORE, 'readwrite');
+    for (const id of new Set(collectionIds))
+      await transaction.objectStore(COLLECTION_STORE).delete(id);
+    await transaction.done;
+    const collections = await database.getAll(COLLECTION_STORE);
+    if (collections.some((item) => collectionIds.includes(item.id))) {
+      throw new Error('39Note could not verify temporary collection cleanup.');
+    }
+  }, workspaceLease);
 }
 
 export async function deleteDocumentStates(
   documentIds: string[],
   notifyChange = true,
+  workspaceLease?: WorkspaceRestoreLease,
 ): Promise<{ deleted: string[]; failed: string[] }> {
   const uniqueIds = [...new Set(documentIds.filter(isValidDocumentId))];
   if (uniqueIds.length === 0) return { deleted: [], failed: [] };
   try {
-    const database = await getDatabase();
-    if (!database) return { deleted: [], failed: uniqueIds };
-    const transaction = database.transaction(
-      [DOCUMENT_STATE_STORE, PDF_FILE_STORE],
-      'readwrite',
-    );
-    const states = transaction.objectStore(DOCUMENT_STATE_STORE);
-    const pdfs = transaction.objectStore(PDF_FILE_STORE);
-    for (const documentId of uniqueIds) {
-      await states.delete(documentId);
-      await pdfs.delete(documentId);
-    }
-    await transaction.done;
-    if (notifyChange) {
+    return await withWorkspaceMutation(async (lease) => {
+      const database = await getDatabase();
+      if (!database) return { deleted: [], failed: uniqueIds };
+      const transaction = database.transaction(
+        [DOCUMENT_STATE_STORE, PDF_FILE_STORE],
+        'readwrite',
+      );
+      const states = transaction.objectStore(DOCUMENT_STATE_STORE);
+      const pdfs = transaction.objectStore(PDF_FILE_STORE);
       for (const documentId of uniqueIds) {
-        notifyPersistentChange({
-          kind: 'document',
-          documentId,
-          categories: [
-            'deleted',
-            'metadata',
-            'notes',
-            'annotations',
-            'glossary',
-            'reading-state',
-          ],
-        });
+        await states.delete(documentId);
+        await pdfs.delete(documentId);
       }
-    }
-    return { deleted: uniqueIds, failed: [] };
+      await transaction.done;
+      if (notifyChange) {
+        for (const documentId of uniqueIds) {
+          await dispatchPersistentChange(
+            {
+              kind: 'document',
+              documentId,
+              categories: [
+                'deleted',
+                'metadata',
+                'notes',
+                'annotations',
+                'glossary',
+                'reading-state',
+              ],
+            },
+            lease,
+          );
+        }
+      }
+      return { deleted: uniqueIds, failed: [] };
+    }, workspaceLease);
   } catch (error) {
     reportPersistenceError('batch delete', error);
     return { deleted: [], failed: uniqueIds };
@@ -827,71 +914,85 @@ export async function deleteDocumentStates(
 export async function storePdfFile(
   identity: DocumentIdentity,
   file: File,
+  workspaceLease?: WorkspaceRestoreLease,
 ): Promise<boolean> {
-  return storeDocumentSource(identity, file, 'pdf');
+  return storeDocumentSource(identity, file, 'pdf', workspaceLease);
 }
 
 export async function storeDocumentSource(
   identity: DocumentIdentity,
   file: File,
   expectedDocumentType?: DocumentType,
+  workspaceLease?: WorkspaceRestoreLease,
 ): Promise<boolean> {
   if (!isValidDocumentId(identity.documentId)) {
     return false;
   }
 
   try {
-    const source = await createStoredDocumentSource(
-      identity.documentId,
-      file,
-      expectedDocumentType,
-    );
-    if (!source) return false;
-    const database = await getDatabase();
-    if (!database) {
-      return false;
-    }
-
-    const transaction = database.transaction(
-      [DOCUMENT_STATE_STORE, PDF_FILE_STORE],
-      'readwrite',
-    );
-    const sourceFiles = transaction.objectStore(PDF_FILE_STORE);
-    const documentStates = transaction.objectStore(DOCUMENT_STATE_STORE);
-    const [existingFile, existingDocumentState] = await Promise.all([
-      sourceFiles.get(identity.documentId),
-      documentStates.get(identity.documentId),
-    ]);
-    if (existingFile) {
-      const existingMetadata = inspectStoredDocumentSourceMetadata(
-        existingFile,
+    return await withWorkspaceMutation(async (lease) => {
+      const source = await createStoredDocumentSource(
         identity.documentId,
+        file,
+        expectedDocumentType,
       );
-      if (!existingMetadata || existingMetadata.documentType !== source.documentType) {
-        await transaction.done;
+      if (!source) return false;
+      const database = await getDatabase();
+      if (!database) {
         return false;
       }
-    }
-    if (existingDocumentState) {
-      const state = sanitizeDocumentState(existingDocumentState, identity.documentId);
-      if (!state || state.documentType !== source.documentType) {
-        await transaction.done;
-        return false;
+
+      const transaction = database.transaction(
+        [DOCUMENT_STATE_STORE, PDF_FILE_STORE],
+        'readwrite',
+      );
+      const sourceFiles = transaction.objectStore(PDF_FILE_STORE);
+      const documentStates = transaction.objectStore(DOCUMENT_STATE_STORE);
+      const [existingFile, existingDocumentState] = await Promise.all([
+        sourceFiles.get(identity.documentId),
+        documentStates.get(identity.documentId),
+      ]);
+      if (existingFile) {
+        const existingMetadata = inspectStoredDocumentSourceMetadata(
+          existingFile,
+          identity.documentId,
+        );
+        if (
+          !existingMetadata ||
+          existingMetadata.documentType !== source.documentType
+        ) {
+          await transaction.done;
+          return false;
+        }
       }
-    }
+      if (existingDocumentState) {
+        const state = sanitizeDocumentState(existingDocumentState, identity.documentId);
+        if (!state || state.documentType !== source.documentType) {
+          await transaction.done;
+          return false;
+        }
+      }
 
-    if (!existingFile) await sourceFiles.put(source);
-    if (!existingDocumentState) {
-      await documentStates.put(createEmptyDocumentState(identity, source.documentType));
-    }
+      if (!existingFile) await sourceFiles.put(source);
+      if (!existingDocumentState) {
+        await documentStates.put(
+          createEmptyDocumentState(identity, source.documentType),
+        );
+      }
 
-    await transaction.done;
-    notifyPersistentChange({
-      kind: source.documentType === 'pdf' ? 'pdf' : 'document-source',
-      documentId: identity.documentId,
-      categories: [source.documentType === 'pdf' ? 'source-pdf' : 'source-document'],
-    });
-    return true;
+      await transaction.done;
+      await dispatchPersistentChange(
+        {
+          kind: source.documentType === 'pdf' ? 'pdf' : 'document-source',
+          documentId: identity.documentId,
+          categories: [
+            source.documentType === 'pdf' ? 'source-pdf' : 'source-document',
+          ],
+        },
+        lease,
+      );
+      return true;
+    }, workspaceLease);
   } catch (error) {
     reportPersistenceError('source document write', error);
     return false;
@@ -934,6 +1035,7 @@ export async function loadStoredDocumentSource(
 export async function updateDocumentDisplayTitle(
   documentId: string,
   displayTitle: string,
+  workspaceLease?: WorkspaceRestoreLease,
 ): Promise<boolean> {
   const normalizedTitle = displayTitle.trim();
   if (!isValidDocumentId(documentId) || normalizedTitle.length === 0) {
@@ -941,28 +1043,29 @@ export async function updateDocumentDisplayTitle(
   }
 
   try {
-    const database = await getDatabase();
-    if (!database) {
-      return false;
-    }
+    return await withWorkspaceMutation(async (lease) => {
+      const database = await getDatabase();
+      if (!database) {
+        return false;
+      }
 
-    const existingState = await database.get(DOCUMENT_STATE_STORE, documentId);
-    const sanitizedState = sanitizeDocumentState(existingState, documentId);
-    if (!sanitizedState) {
-      return false;
-    }
+      const existingState = await database.get(DOCUMENT_STATE_STORE, documentId);
+      const sanitizedState = sanitizeDocumentState(existingState, documentId);
+      if (!sanitizedState) {
+        return false;
+      }
 
-    await database.put(DOCUMENT_STATE_STORE, {
-      ...sanitizedState,
-      displayTitle: normalizedTitle,
-      updatedAt: Date.now(),
-    });
-    notifyPersistentChange({
-      kind: 'document',
-      documentId,
-      categories: ['metadata'],
-    });
-    return true;
+      await database.put(DOCUMENT_STATE_STORE, {
+        ...sanitizedState,
+        displayTitle: normalizedTitle,
+        updatedAt: Date.now(),
+      });
+      await dispatchPersistentChange(
+        { kind: 'document', documentId, categories: ['metadata'] },
+        lease,
+      );
+      return true;
+    }, workspaceLease);
   } catch (error) {
     reportPersistenceError('title update', error);
     return false;
@@ -972,27 +1075,29 @@ export async function updateDocumentDisplayTitle(
 export async function saveReadingPosition(
   documentId: string,
   readingPosition: ReadingPosition,
+  workspaceLease?: WorkspaceRestoreLease,
 ): Promise<boolean> {
   if (!isValidDocumentId(documentId)) return false;
   try {
-    const database = await getDatabase();
-    if (!database) return false;
-    const existing = sanitizeDocumentState(
-      await database.get(DOCUMENT_STATE_STORE, documentId),
-      documentId,
-    );
-    if (!existing) return false;
-    await database.put(DOCUMENT_STATE_STORE, {
-      ...existing,
-      readingPosition,
-      lastReadAt: Date.now(),
-    });
-    notifyPersistentChange({
-      kind: 'document',
-      documentId,
-      categories: ['reading-state'],
-    });
-    return true;
+    return await withWorkspaceMutation(async (lease) => {
+      const database = await getDatabase();
+      if (!database) return false;
+      const existing = sanitizeDocumentState(
+        await database.get(DOCUMENT_STATE_STORE, documentId),
+        documentId,
+      );
+      if (!existing) return false;
+      await database.put(DOCUMENT_STATE_STORE, {
+        ...existing,
+        readingPosition,
+        lastReadAt: Date.now(),
+      });
+      await dispatchPersistentChange(
+        { kind: 'document', documentId, categories: ['reading-state'] },
+        lease,
+      );
+      return true;
+    }, workspaceLease);
   } catch (error) {
     reportPersistenceError('reading position write', error);
     return false;
@@ -1002,30 +1107,32 @@ export async function saveReadingPosition(
 export async function saveDocumentReadingPosition(
   documentId: string,
   readingPosition: DocumentReadingPosition,
+  workspaceLease?: WorkspaceRestoreLease,
 ): Promise<boolean> {
   if (!isValidDocumentId(documentId)) return false;
   try {
-    const database = await getDatabase();
-    if (!database) return false;
-    const existing = sanitizeDocumentState(
-      await database.get(DOCUMENT_STATE_STORE, documentId),
-      documentId,
-    );
-    const sanitized = existing
-      ? sanitizeDocumentReadingPosition(readingPosition, existing.documentType)
-      : undefined;
-    if (!existing || !sanitized) return false;
-    await database.put(DOCUMENT_STATE_STORE, {
-      ...existing,
-      documentReadingPosition: sanitized,
-      lastReadAt: Date.now(),
-    });
-    notifyPersistentChange({
-      kind: 'document',
-      documentId,
-      categories: ['reading-state'],
-    });
-    return true;
+    return await withWorkspaceMutation(async (lease) => {
+      const database = await getDatabase();
+      if (!database) return false;
+      const existing = sanitizeDocumentState(
+        await database.get(DOCUMENT_STATE_STORE, documentId),
+        documentId,
+      );
+      const sanitized = existing
+        ? sanitizeDocumentReadingPosition(readingPosition, existing.documentType)
+        : undefined;
+      if (!existing || !sanitized) return false;
+      await database.put(DOCUMENT_STATE_STORE, {
+        ...existing,
+        documentReadingPosition: sanitized,
+        lastReadAt: Date.now(),
+      });
+      await dispatchPersistentChange(
+        { kind: 'document', documentId, categories: ['reading-state'] },
+        lease,
+      );
+      return true;
+    }, workspaceLease);
   } catch (error) {
     reportPersistenceError('document reading position write', error);
     return false;
@@ -1035,41 +1142,47 @@ export async function saveDocumentReadingPosition(
 export async function saveOfficeDocumentAnnotations(
   documentId: string,
   annotations: readonly OfficeDocumentAnnotation[],
+  workspaceLease?: WorkspaceRestoreLease,
 ): Promise<boolean> {
   if (!isValidDocumentId(documentId)) return false;
   const sanitized = sanitizeOfficeDocumentAnnotations(annotations);
   if (sanitized.length !== annotations.length) return false;
   try {
-    const database = await getDatabase();
-    if (!database) return false;
-    const existing = sanitizeDocumentState(
-      await database.get(DOCUMENT_STATE_STORE, documentId),
-      documentId,
-    );
-    if (!existing || existing.documentType === 'pdf') return false;
-    if (
-      sanitized.some(
-        (annotation) =>
-          annotation.documentId !== documentId ||
-          (existing.documentType === 'pptx'
-            ? annotation.anchor.kind !== 'pptx-text'
-            : annotation.anchor.kind !== 'docx-text'),
-      )
-    ) {
-      return false;
-    }
-    const nextState = {
-      ...existing,
-      officeAnnotations: sanitized,
-      updatedAt: Date.now(),
-    };
-    await database.put(DOCUMENT_STATE_STORE, nextState);
-    notifyPersistentChange({
-      kind: 'document',
-      documentId,
-      categories: documentChangeCategories(existing, nextState, undefined),
-    });
-    return true;
+    return await withWorkspaceMutation(async (lease) => {
+      const database = await getDatabase();
+      if (!database) return false;
+      const existing = sanitizeDocumentState(
+        await database.get(DOCUMENT_STATE_STORE, documentId),
+        documentId,
+      );
+      if (!existing || existing.documentType === 'pdf') return false;
+      if (
+        sanitized.some(
+          (annotation) =>
+            annotation.documentId !== documentId ||
+            (existing.documentType === 'pptx'
+              ? annotation.anchor.kind !== 'pptx-text'
+              : annotation.anchor.kind !== 'docx-text'),
+        )
+      ) {
+        return false;
+      }
+      const nextState = {
+        ...existing,
+        officeAnnotations: sanitized,
+        updatedAt: Date.now(),
+      };
+      await database.put(DOCUMENT_STATE_STORE, nextState);
+      await dispatchPersistentChange(
+        {
+          kind: 'document',
+          documentId,
+          categories: documentChangeCategories(existing, nextState, undefined),
+        },
+        lease,
+      );
+      return true;
+    }, workspaceLease);
   } catch (error) {
     reportPersistenceError('Office annotation write', error);
     return false;
@@ -1082,13 +1195,6 @@ export async function listCollections(): Promise<CollectionRecord[]> {
     ? (await database.getAll(COLLECTION_STORE)).sort((a, b) =>
         a.name.localeCompare(b.name),
       )
-    : [];
-}
-
-export async function listTags(): Promise<TagRecord[]> {
-  const database = await getDatabase();
-  return database
-    ? (await database.getAll(TAG_STORE)).sort((a, b) => a.name.localeCompare(b.name))
     : [];
 }
 
@@ -1105,76 +1211,78 @@ export async function getCollectionsByIds(
   return values.filter((value): value is CollectionRecord => value !== undefined);
 }
 
-/** Exact-key reads for document-scoped sync; never enumerate unrelated Library data. */
-export async function getTagsByIds(ids: readonly string[]): Promise<TagRecord[]> {
-  const database = await getDatabase();
-  if (!database) return [];
-  const uniqueIds = [...new Set(ids)];
-  const values = await Promise.all(uniqueIds.map((id) => database.get(TAG_STORE, id)));
-  return values.filter((value): value is TagRecord => value !== undefined);
-}
-
 export async function restoreLibraryEntities(
-  collections: CollectionRecord[],
-  tags: TagRecord[],
+  collections: unknown,
   notifyChange = true,
+  workspaceLease?: WorkspaceRestoreLease,
 ): Promise<boolean> {
-  const database = await getDatabase();
-  if (!database) return false;
-  const transaction = database.transaction([COLLECTION_STORE, TAG_STORE], 'readwrite');
-  for (const collection of collections) {
-    const existing = await transaction.objectStore(COLLECTION_STORE).get(collection.id);
-    if (!existing) await transaction.objectStore(COLLECTION_STORE).put(collection);
-  }
-  for (const tag of tags) {
-    const existing = await transaction.objectStore(TAG_STORE).get(tag.id);
-    if (!existing) await transaction.objectStore(TAG_STORE).put(tag);
-  }
-  await transaction.done;
-  if (notifyChange) notifyPersistentChange({ kind: 'library' });
-  return true;
+  if (!validateLibraryEntities(collections)) return false;
+  return withWorkspaceMutation(async (lease) => {
+    const database = await getDatabase();
+    if (!database) return false;
+    const transaction = database.transaction(COLLECTION_STORE, 'readwrite');
+    for (const collection of collections) {
+      const existing = await transaction
+        .objectStore(COLLECTION_STORE)
+        .get(collection.id);
+      if (!existing) await transaction.objectStore(COLLECTION_STORE).put(collection);
+    }
+    await transaction.done;
+    if (notifyChange) {
+      await dispatchPersistentChange({ kind: 'library' }, lease);
+    }
+    return true;
+  }, workspaceLease);
 }
 
 export async function replaceLibraryEntities(
   collections: readonly CollectionRecord[],
-  tags: readonly TagRecord[],
   notifyChange = true,
   signal?: AbortSignal,
+  workspaceLease?: WorkspaceRestoreLease,
 ): Promise<boolean> {
   signal?.throwIfAborted();
-  if (!validateLibraryEntities(collections, tags)) return false;
-  const database = await getDatabase();
-  if (!database) return false;
-  const transaction = database.transaction([COLLECTION_STORE, TAG_STORE], 'readwrite');
-  const releaseAbort = abortTransactionOnSignal(transaction, signal);
-  try {
-    await transaction.objectStore(COLLECTION_STORE).clear();
-    await transaction.objectStore(TAG_STORE).clear();
-    for (const collection of collections) {
-      signal?.throwIfAborted();
-      await transaction.objectStore(COLLECTION_STORE).put(collection);
+  if (!validateLibraryEntities(collections)) return false;
+  return withWorkspaceMutation(async (lease) => {
+    const database = await getDatabase();
+    if (!database) return false;
+    const transaction = database.transaction(COLLECTION_STORE, 'readwrite');
+    const releaseAbort = abortTransactionOnSignal(transaction, signal);
+    try {
+      await transaction.objectStore(COLLECTION_STORE).clear();
+      for (const collection of collections) {
+        signal?.throwIfAborted();
+        await transaction.objectStore(COLLECTION_STORE).put(collection);
+      }
+      await transaction.done;
+    } finally {
+      releaseAbort();
     }
-    for (const tag of tags) {
-      signal?.throwIfAborted();
-      await transaction.objectStore(TAG_STORE).put(tag);
+    if (notifyChange) {
+      await dispatchPersistentChange({ kind: 'library' }, lease);
     }
-    await transaction.done;
-  } finally {
-    releaseAbort();
-  }
-  if (notifyChange) notifyPersistentChange({ kind: 'library' });
-  return true;
+    return true;
+  }, workspaceLease);
 }
 
 export function validateLibraryEntities(
-  collections: readonly CollectionRecord[],
-  tags: readonly TagRecord[],
-): boolean {
-  return collections.every(isValidNamedRecord) && tags.every(isValidNamedRecord);
+  collections: unknown,
+): collections is CollectionRecord[] {
+  return (
+    Array.isArray(collections) &&
+    collections.every(isValidNamedRecord) &&
+    new Set(collections.map(({ id }) => id)).size === collections.length
+  );
 }
 
-export async function createCollection(name: string): Promise<CollectionRecord | null> {
-  return createNamedRecord(COLLECTION_STORE, name);
+export async function createCollection(
+  name: string,
+  workspaceLease?: WorkspaceRestoreLease,
+): Promise<CollectionRecord | null> {
+  return withWorkspaceMutation(
+    (lease) => createNamedRecord(name, lease),
+    workspaceLease,
+  );
 }
 
 export interface CollectionDraftInput {
@@ -1190,6 +1298,7 @@ export interface CollectionDraftInput {
  */
 export async function saveCollectionDraft(
   input: CollectionDraftInput,
+  workspaceLease?: WorkspaceRestoreLease,
 ): Promise<CollectionRecord | null> {
   const normalizedName = normalizeLibraryEntityName(input.name);
   if (!normalizedName) return null;
@@ -1199,162 +1308,175 @@ export async function saveCollectionDraft(
   }
 
   try {
-    const database = await getDatabase();
-    if (!database) return null;
-    const transaction = database.transaction(
-      [COLLECTION_STORE, DOCUMENT_STATE_STORE],
-      'readwrite',
-    );
-    const collectionStore = transaction.objectStore(COLLECTION_STORE);
-    const documentStore = transaction.objectStore(DOCUMENT_STATE_STORE);
-    const [collections, storedDocuments] = await Promise.all([
-      collectionStore.getAll(),
-      documentStore.getAll(),
-    ]);
-    const existing = input.collectionId
-      ? collections.find((collection) => collection.id === input.collectionId)
-      : undefined;
-    if (input.collectionId && !existing) {
-      await transaction.done;
-      return null;
-    }
-    if (
-      collections.some(
-        (collection) =>
-          collection.normalizedName === normalizedName &&
-          collection.id !== input.collectionId,
-      )
-    ) {
-      await transaction.done;
-      return null;
-    }
-
-    const documents = storedDocuments
-      .map((state) => sanitizeDocumentState(state, state.documentId))
-      .filter((state): state is PersistedDocumentState => Boolean(state));
-    const documentsById = new Map(documents.map((state) => [state.documentId, state]));
-    if (requestedDocumentIds.some((documentId) => !documentsById.has(documentId))) {
-      await transaction.done;
-      return null;
-    }
-
-    const selected = new Set(requestedDocumentIds);
-    const collectionNameChanged = Boolean(
-      existing &&
-      (existing.name !== input.name.trim() ||
-        existing.normalizedName !== normalizedName),
-    );
-    const collectionMembershipChanged = existing
-      ? documents.some(
-          (document) =>
-            document.collectionIds.includes(existing.id) !==
-            selected.has(document.documentId),
-        )
-      : requestedDocumentIds.length > 0;
-    if (existing && !collectionNameChanged && !collectionMembershipChanged) {
-      await transaction.done;
-      return existing;
-    }
-
-    const timestamp = Date.now();
-    const record: CollectionRecord = existing
-      ? {
-          ...existing,
-          name: input.name.trim(),
-          normalizedName,
-          updatedAt: timestamp,
-        }
-      : {
-          id: crypto.randomUUID(),
-          name: input.name.trim(),
-          normalizedName,
-          createdAt: timestamp,
-          updatedAt: timestamp,
-        };
-    const affectedDocumentIds: string[] = [];
-    for (const document of documents) {
-      const currentlyIncluded = document.collectionIds.includes(record.id);
-      const shouldBeIncluded = selected.has(document.documentId);
-      const membershipChanged = currentlyIncluded !== shouldBeIncluded;
-      if (
-        !membershipChanged &&
-        !(collectionNameChanged && (currentlyIncluded || shouldBeIncluded))
-      ) {
-        continue;
+    return await withWorkspaceMutation(async (lease) => {
+      const database = await getDatabase();
+      if (!database) return null;
+      const transaction = database.transaction(
+        [COLLECTION_STORE, DOCUMENT_STATE_STORE],
+        'readwrite',
+      );
+      const collectionStore = transaction.objectStore(COLLECTION_STORE);
+      const documentStore = transaction.objectStore(DOCUMENT_STATE_STORE);
+      const [collections, storedDocuments] = await Promise.all([
+        collectionStore.getAll(),
+        documentStore.getAll(),
+      ]);
+      const existing = input.collectionId
+        ? collections.find((collection) => collection.id === input.collectionId)
+        : undefined;
+      if (input.collectionId && !existing) {
+        await transaction.done;
+        return null;
       }
-      const collectionIds = shouldBeIncluded
-        ? [...new Set([...document.collectionIds, record.id])]
-        : document.collectionIds.filter((id) => id !== record.id);
-      await documentStore.put({ ...document, collectionIds, updatedAt: timestamp });
-      affectedDocumentIds.push(document.documentId);
-    }
-    await collectionStore.put(record);
-    await transaction.done;
-    notifyPersistentChange({
-      kind: 'library',
-      ...(affectedDocumentIds.length ? { documentIds: affectedDocumentIds } : {}),
-      categories: ['metadata'],
-    });
-    return record;
+      if (
+        collections.some(
+          (collection) =>
+            collection.normalizedName === normalizedName &&
+            collection.id !== input.collectionId,
+        )
+      ) {
+        await transaction.done;
+        return null;
+      }
+
+      const documents = storedDocuments
+        .map((state) => sanitizeDocumentState(state, state.documentId))
+        .filter((state): state is PersistedDocumentState => Boolean(state));
+      const documentsById = new Map(
+        documents.map((state) => [state.documentId, state]),
+      );
+      if (requestedDocumentIds.some((documentId) => !documentsById.has(documentId))) {
+        await transaction.done;
+        return null;
+      }
+
+      const selected = new Set(requestedDocumentIds);
+      const collectionNameChanged = Boolean(
+        existing &&
+        (existing.name !== input.name.trim() ||
+          existing.normalizedName !== normalizedName),
+      );
+      const collectionMembershipChanged = existing
+        ? documents.some(
+            (document) =>
+              document.collectionIds.includes(existing.id) !==
+              selected.has(document.documentId),
+          )
+        : requestedDocumentIds.length > 0;
+      if (existing && !collectionNameChanged && !collectionMembershipChanged) {
+        await transaction.done;
+        return existing;
+      }
+
+      const timestamp = Date.now();
+      const record: CollectionRecord = existing
+        ? {
+            ...existing,
+            name: input.name.trim(),
+            normalizedName,
+            updatedAt: timestamp,
+          }
+        : {
+            id: crypto.randomUUID(),
+            name: input.name.trim(),
+            normalizedName,
+            createdAt: timestamp,
+            updatedAt: timestamp,
+          };
+      const affectedDocumentIds: string[] = [];
+      for (const document of documents) {
+        const currentlyIncluded = document.collectionIds.includes(record.id);
+        const shouldBeIncluded = selected.has(document.documentId);
+        const membershipChanged = currentlyIncluded !== shouldBeIncluded;
+        if (
+          !membershipChanged &&
+          !(collectionNameChanged && (currentlyIncluded || shouldBeIncluded))
+        ) {
+          continue;
+        }
+        const collectionIds = shouldBeIncluded
+          ? [...new Set([...document.collectionIds, record.id])]
+          : document.collectionIds.filter((id) => id !== record.id);
+        await documentStore.put({
+          ...document,
+          collectionIds,
+          updatedAt: timestamp,
+        });
+        affectedDocumentIds.push(document.documentId);
+      }
+      await collectionStore.put(record);
+      await transaction.done;
+      await dispatchPersistentChange(
+        {
+          kind: 'library',
+          ...(affectedDocumentIds.length ? { documentIds: affectedDocumentIds } : {}),
+          categories: ['metadata'],
+        },
+        lease,
+      );
+      return record;
+    }, workspaceLease);
   } catch (error) {
     reportPersistenceError('Collection draft write', error);
     return null;
   }
 }
 
-export async function createTag(name: string): Promise<TagRecord | null> {
-  return createNamedRecord(TAG_STORE, name);
+export async function renameCollection(
+  id: string,
+  name: string,
+  workspaceLease?: WorkspaceRestoreLease,
+): Promise<boolean> {
+  return withWorkspaceMutation(
+    (lease) => renameNamedRecord(id, name, lease),
+    workspaceLease,
+  );
 }
 
-export async function renameCollection(id: string, name: string): Promise<boolean> {
-  return renameNamedRecord(COLLECTION_STORE, id, name, 'collectionIds');
-}
-export async function renameTag(id: string, name: string): Promise<boolean> {
-  return renameNamedRecord(TAG_STORE, id, name, 'tagIds');
-}
-
-export async function deleteCollection(id: string): Promise<boolean> {
-  return deleteNamedRecord(COLLECTION_STORE, id, 'collectionIds');
-}
-export async function deleteTag(id: string): Promise<boolean> {
-  return deleteNamedRecord(TAG_STORE, id, 'tagIds');
+export async function deleteCollection(
+  id: string,
+  workspaceLease?: WorkspaceRestoreLease,
+): Promise<boolean> {
+  return withWorkspaceMutation((lease) => deleteNamedRecord(id, lease), workspaceLease);
 }
 
 export async function updateDocumentOrganization(
   documentIds: string[],
   update: Partial<
-    Pick<DocumentLibraryMetadata, 'collectionIds' | 'tagIds' | 'isPinned' | 'pinnedAt'>
+    Pick<DocumentLibraryMetadata, 'collectionIds' | 'isPinned' | 'pinnedAt'>
   >,
+  workspaceLease?: WorkspaceRestoreLease,
 ): Promise<boolean> {
-  const database = await getDatabase();
-  if (!database) return false;
-  const transaction = database.transaction(DOCUMENT_STATE_STORE, 'readwrite');
-  const store = transaction.objectStore(DOCUMENT_STATE_STORE);
-  for (const documentId of documentIds) {
-    const state = sanitizeDocumentState(await store.get(documentId), documentId);
-    if (!state) continue;
-    await store.put({ ...state, ...update, updatedAt: Date.now() });
-  }
-  await transaction.done;
-  notifyPersistentChange({
-    kind: 'library',
-    documentIds,
-    categories: ['metadata'],
-  });
-  return true;
+  return withWorkspaceMutation(async (lease) => {
+    const database = await getDatabase();
+    if (!database) return false;
+    const transaction = database.transaction(DOCUMENT_STATE_STORE, 'readwrite');
+    const store = transaction.objectStore(DOCUMENT_STATE_STORE);
+    for (const documentId of documentIds) {
+      const state = sanitizeDocumentState(await store.get(documentId), documentId);
+      if (!state) continue;
+      await store.put({ ...state, ...update, updatedAt: Date.now() });
+    }
+    await transaction.done;
+    await dispatchPersistentChange(
+      { kind: 'library', documentIds, categories: ['metadata'] },
+      lease,
+    );
+    return true;
+  }, workspaceLease);
 }
 
-async function createNamedRecord<T extends CollectionRecord | TagRecord>(
-  storeName: typeof COLLECTION_STORE | typeof TAG_STORE,
+async function createNamedRecord(
   name: string,
-): Promise<T | null> {
+  lease: WorkspaceRestoreLease,
+): Promise<CollectionRecord | null> {
   const normalizedName = normalizeLibraryEntityName(name);
   if (!normalizedName) return null;
   const database = await getDatabase();
   if (!database) return null;
-  const existing = await database.getAll(storeName);
+  const existing = await database.getAll(COLLECTION_STORE);
   const match = existing.find((item) => item.normalizedName === normalizedName);
-  if (match) return match as T;
+  if (match) return match;
   const timestamp = Date.now();
   const record = {
     id: crypto.randomUUID(),
@@ -1362,31 +1484,30 @@ async function createNamedRecord<T extends CollectionRecord | TagRecord>(
     normalizedName,
     createdAt: timestamp,
     updatedAt: timestamp,
-  } as T;
-  await database.put(storeName, record);
-  notifyPersistentChange({ kind: 'library' });
+  } satisfies CollectionRecord;
+  await database.put(COLLECTION_STORE, record);
+  await dispatchPersistentChange({ kind: 'library' }, lease);
   return record;
 }
 
 async function renameNamedRecord(
-  storeName: typeof COLLECTION_STORE | typeof TAG_STORE,
   id: string,
   name: string,
-  field: 'collectionIds' | 'tagIds',
+  lease: WorkspaceRestoreLease,
 ): Promise<boolean> {
   const normalizedName = normalizeLibraryEntityName(name);
   const database = await getDatabase();
   if (!database || !normalizedName) return false;
-  const records = await database.getAll(storeName);
+  const records = await database.getAll(COLLECTION_STORE);
   if (
     records.some(
       (record) => record.id !== id && record.normalizedName === normalizedName,
     )
   )
     return false;
-  const existing = await database.get(storeName, id);
+  const existing = await database.get(COLLECTION_STORE, id);
   if (!existing) return false;
-  await database.put(storeName, {
+  await database.put(COLLECTION_STORE, {
     ...existing,
     name: name.trim(),
     normalizedName,
@@ -1395,47 +1516,44 @@ async function renameNamedRecord(
   const documentIds = (await database.getAll(DOCUMENT_STATE_STORE)).flatMap(
     (rawState) => {
       const state = sanitizeDocumentState(rawState, rawState.documentId);
-      return state?.[field].includes(id) ? [state.documentId] : [];
+      return state?.collectionIds.includes(id) ? [state.documentId] : [];
     },
   );
-  notifyPersistentChange({
-    kind: 'library',
-    documentIds,
-    categories: ['metadata'],
-  });
+  await dispatchPersistentChange(
+    { kind: 'library', documentIds, categories: ['metadata'] },
+    lease,
+  );
   return true;
 }
 
 async function deleteNamedRecord(
-  storeName: typeof COLLECTION_STORE | typeof TAG_STORE,
   id: string,
-  field: 'collectionIds' | 'tagIds',
+  lease: WorkspaceRestoreLease,
 ): Promise<boolean> {
   const database = await getDatabase();
   if (!database) return false;
   const transaction = database.transaction(
-    [storeName, DOCUMENT_STATE_STORE],
+    [COLLECTION_STORE, DOCUMENT_STATE_STORE],
     'readwrite',
   );
-  await transaction.objectStore(storeName).delete(id);
+  await transaction.objectStore(COLLECTION_STORE).delete(id);
   const states = await transaction.objectStore(DOCUMENT_STATE_STORE).getAll();
   const documentIds: string[] = [];
   for (const rawState of states) {
     const state = sanitizeDocumentState(rawState, rawState.documentId);
-    if (!state || !state[field].includes(id)) continue;
+    if (!state || !state.collectionIds.includes(id)) continue;
     documentIds.push(state.documentId);
     await transaction.objectStore(DOCUMENT_STATE_STORE).put({
       ...state,
-      [field]: state[field].filter((value) => value !== id),
+      collectionIds: state.collectionIds.filter((value) => value !== id),
       updatedAt: Date.now(),
     });
   }
   await transaction.done;
-  notifyPersistentChange({
-    kind: 'library',
-    documentIds,
-    categories: ['metadata'],
-  });
+  await dispatchPersistentChange(
+    { kind: 'library', documentIds, categories: ['metadata'] },
+    lease,
+  );
   return true;
 }
 
@@ -1448,67 +1566,400 @@ export async function saveDocumentState(
   nextNoteNumber: number,
   displayTitle: string,
   requestedDocumentType?: DocumentType,
+  links?: readonly DocumentLink[],
+  nextLinkNumber?: number,
+  workspaceLease?: WorkspaceRestoreLease,
 ): Promise<boolean> {
   if (!isValidDocumentId(identity.documentId)) {
     return false;
   }
 
   try {
-    const database = await getDatabase();
-    if (!database) {
-      return false;
-    }
+    return await withWorkspaceMutation(async (lease) => {
+      const database = await getDatabase();
+      if (!database) {
+        return false;
+      }
 
-    const sanitizedAnnotations = sanitizeAnnotations(annotations);
-    const sanitizedNoteAnchors = sanitizeNoteAnchors(noteAnchors);
-    const sanitizedNotes = sanitizeNotes(
-      notes,
-      sanitizedAnnotations,
-      sanitizedNoteAnchors,
-    );
-    const existingState = sanitizeDocumentState(
-      await database.get(DOCUMENT_STATE_STORE, identity.documentId),
-      identity.documentId,
-    );
-    const documentType = requestedDocumentType ?? existingState?.documentType ?? 'pdf';
-    if (existingState && existingState.documentType !== documentType) return false;
-    const sanitizedGlossaryEntries = sanitizePersistedGlossaryEntries(
-      glossaryEntries,
-      identity.documentId,
-      documentType,
-    );
+      const sanitizedAnnotations = sanitizeAnnotations(annotations);
+      if (sanitizedAnnotations.length !== annotations.length) {
+        return false;
+      }
+      const sanitizedNoteAnchors = sanitizeNoteAnchors(noteAnchors);
+      const sanitizedNotes = sanitizeNotes(
+        notes,
+        sanitizedAnnotations,
+        sanitizedNoteAnchors,
+      );
+      const existingState = sanitizeDocumentState(
+        await database.get(DOCUMENT_STATE_STORE, identity.documentId),
+        identity.documentId,
+      );
+      const documentType =
+        requestedDocumentType ?? existingState?.documentType ?? 'pdf';
+      if (existingState && existingState.documentType !== documentType) return false;
+      const requestedLinks = links ?? existingState?.links ?? [];
+      const sanitizedLinks = sanitizeDocumentLinks(requestedLinks, identity.documentId);
+      if (
+        sanitizedLinks.length !== requestedLinks.length ||
+        (documentType !== 'pdf' && sanitizedLinks.length > 0)
+      ) {
+        return false;
+      }
+      const requestedHighWater = nextLinkNumber ?? existingState?.nextLinkNumber ?? 1;
+      if (!isValidNextDocumentLinkNumber(requestedHighWater, sanitizedLinks)) {
+        return false;
+      }
+      const repairedLinks = repairDocumentLinkNumberCollisions(
+        sanitizedLinks,
+        requestedHighWater,
+      );
+      const sanitizedGlossaryEntries = sanitizePersistedGlossaryEntries(
+        glossaryEntries,
+        identity.documentId,
+        documentType,
+      );
 
-    const nextState: PersistedDocumentState = {
-      schemaVersion: PERSISTENCE_SCHEMA_VERSION,
-      documentType,
-      documentId: identity.documentId,
-      documentName: identity.documentName,
-      originalFileName: identity.documentName,
-      displayTitle: normalizeDisplayTitle(displayTitle, identity.documentName),
-      annotations: sanitizedAnnotations,
-      officeAnnotations: existingState?.officeAnnotations ?? [],
-      noteAnchors: sanitizedNoteAnchors,
-      notes: sanitizedNotes,
-      glossaryEntries: sanitizedGlossaryEntries,
-      nextNoteNumber: normalizeNextNoteNumber(nextNoteNumber, sanitizedNotes),
-      updatedAt: Date.now(),
-      ...(existingState
-        ? getDocumentLibraryMetadata(existingState)
-        : createEmptyLibraryMetadata()),
-      ...(existingState?.documentReadingPosition
-        ? { documentReadingPosition: existingState.documentReadingPosition }
-        : {}),
-    };
-    await database.put(DOCUMENT_STATE_STORE, nextState);
-    notifyPersistentChange({
-      kind: 'document',
-      documentId: identity.documentId,
-      categories: documentChangeCategories(existingState, nextState, undefined),
-    });
-    return true;
+      const nextState: PersistedDocumentState = {
+        schemaVersion: PERSISTENCE_SCHEMA_VERSION,
+        documentType,
+        documentId: identity.documentId,
+        documentName: identity.documentName,
+        originalFileName: identity.documentName,
+        displayTitle: normalizeDisplayTitle(displayTitle, identity.documentName),
+        annotations: sanitizedAnnotations,
+        links: repairedLinks.links,
+        officeAnnotations: existingState?.officeAnnotations ?? [],
+        noteAnchors: sanitizedNoteAnchors,
+        notes: sanitizedNotes,
+        glossaryEntries: sanitizedGlossaryEntries,
+        nextNoteNumber: normalizeNextNoteNumber(nextNoteNumber, sanitizedNotes),
+        nextLinkNumber: repairedLinks.nextLinkNumber,
+        updatedAt: Date.now(),
+        ...(existingState
+          ? getDocumentLibraryMetadata(existingState)
+          : createEmptyLibraryMetadata()),
+        ...(existingState?.documentReadingPosition
+          ? { documentReadingPosition: existingState.documentReadingPosition }
+          : {}),
+      };
+      await database.put(DOCUMENT_STATE_STORE, nextState);
+      await dispatchPersistentChange(
+        {
+          kind: 'document',
+          documentId: identity.documentId,
+          categories: documentChangeCategories(existingState, nextState, undefined),
+        },
+        lease,
+      );
+      return true;
+    }, workspaceLease);
   } catch (error) {
     reportPersistenceError('write', error);
     return false;
+  }
+}
+
+/**
+ * Common admission boundary for every normal local mutation. The supplied
+ * capability may be reused by a larger composite operation; otherwise shared
+ * ownership is acquired for the complete callback lifetime.
+ */
+export async function withWorkspaceMutation<T>(
+  task: (lease: WorkspaceRestoreLease) => Promise<T> | T,
+  existingLease?: WorkspaceRestoreLease,
+): Promise<T> {
+  return withSharedWorkspaceRestoreLease(async (lease) => {
+    await assertWorkspaceMutationAllowed(lease);
+    return task(lease);
+  }, existingLease);
+}
+
+export async function assertWorkspaceMutationAllowed(
+  lease: WorkspaceRestoreLease,
+): Promise<void> {
+  assertWorkspaceRestoreLease(lease, { allowExclusive: true });
+  const operation = await loadDurableRestoreOperation(lease.workspaceId);
+  // The durable read awaits IndexedDB. Revalidate the opaque capability after
+  // that boundary before admitting the caller's first mutation.
+  assertWorkspaceRestoreLease(lease, { allowExclusive: true });
+  if (
+    operation &&
+    !(
+      operation.phase === 'publication-hold' &&
+      operation.publicationHold &&
+      operation.enginePlan &&
+      operation.commitEvidence
+    )
+  ) {
+    throw new WorkspaceRestoreBarrierError(undefined, operation);
+  }
+}
+
+/**
+ * Remote operations remain fenced while restored local data is under review.
+ * Only the explicit resume flow may admit one read-only remote revalidation for
+ * the exact durable hold generation supplied by the UI.
+ */
+export async function assertWorkspaceCloudOperationAllowed(
+  lease: WorkspaceRestoreLease,
+  publicationReview?: { operationId: string; expectedGeneration: number },
+): Promise<DurableRestoreOperation | null> {
+  assertWorkspaceRestoreLease(lease, { allowExclusive: true });
+  const operation = await loadDurableRestoreOperation(lease.workspaceId);
+  assertWorkspaceRestoreLease(lease, { allowExclusive: true });
+  if (!operation) return null;
+  if (
+    publicationReview &&
+    operation.phase === 'publication-hold' &&
+    operation.publicationHold &&
+    operation.enginePlan !== undefined &&
+    operation.commitEvidence !== undefined &&
+    operation.operationId === publicationReview.operationId &&
+    operation.generation === publicationReview.expectedGeneration
+  ) {
+    return operation;
+  }
+  throw new WorkspaceRestoreBarrierError(undefined, operation);
+}
+
+export async function loadDurableRestoreOperation(
+  expectedWorkspaceId?: string,
+): Promise<DurableRestoreOperation | null> {
+  const workspaceId = currentWorkspaceRestoreIdentity();
+  if (expectedWorkspaceId && workspaceId !== expectedWorkspaceId) {
+    throw new WorkspaceRestoreBarrierError(
+      'The workspace changed while restore safety was being verified.',
+    );
+  }
+  const database = await getDatabase();
+  if (!database) {
+    throw new WorkspaceRestoreBarrierError(
+      'The durable restore state could not be verified.',
+    );
+  }
+  const value = await database.get(RESTORE_OPERATION_STORE, workspaceId);
+  if (expectedWorkspaceId && currentWorkspaceRestoreIdentity() !== workspaceId) {
+    throw new WorkspaceRestoreBarrierError(
+      'The workspace changed while restore safety was being verified.',
+    );
+  }
+  if (value === undefined) return null;
+  if (!isDurableRestoreOperation(value) || value.workspaceId !== workspaceId) {
+    throw new WorkspaceRestoreBarrierError(
+      'The durable restore state is invalid and normal writes are blocked.',
+    );
+  }
+  return value;
+}
+
+/** Opens both the upgraded schema and durable restore state before app mount. */
+export async function prepareAnnotationPersistenceStartup(): Promise<void> {
+  if (!browserSupportsWorkspaceRestoreLocks()) {
+    // Keep physical migration and lock-policy failures separately diagnosable.
+    throw new WorkspaceLocksUnavailableError();
+  }
+  const operation = await loadDurableRestoreOperation();
+  if (operation) throw new RestoreStartupBlockedError(operation);
+}
+
+/** Opens the upgraded annotation database without interpreting a journal. */
+export async function prepareAnnotationPersistenceRecoveryStartup(): Promise<void> {
+  if (!browserSupportsWorkspaceRestoreLocks()) {
+    throw new WorkspaceLocksUnavailableError();
+  }
+  await loadDurableRestoreOperation();
+}
+
+/** Creates the authoritative Phase C/D restore journal under exclusive ownership. */
+export async function createDurableRestoreOperation(
+  operation: DurableRestoreOperation,
+  lease: WorkspaceRestoreLease,
+): Promise<void> {
+  assertWorkspaceRestoreLease(lease, { requireExclusive: true });
+  const workspaceId = currentWorkspaceRestoreIdentity();
+  if (
+    !isDurableRestoreOperation(operation) ||
+    operation.workspaceId !== workspaceId ||
+    operation.generation !== 1 ||
+    operation.phase !== 'preparing' ||
+    operation.recoveryRequired ||
+    operation.publicationHold ||
+    operation.remoteRevalidationRequired ||
+    operation.publicationAccountId !== undefined
+  ) {
+    throw new WorkspaceRestoreBarrierError('The restore operation is invalid.');
+  }
+  const database = await getDatabase();
+  if (!database) throw new WorkspaceRestoreBarrierError();
+  const transaction = database.transaction(RESTORE_OPERATION_STORE, 'readwrite');
+  const store = transaction.objectStore(RESTORE_OPERATION_STORE);
+  if ((await store.get(workspaceId)) !== undefined) {
+    await transaction.done;
+    throw new WorkspaceRestoreBarrierError(
+      'Another restore operation already owns this workspace.',
+    );
+  }
+  await store.put(structuredClone(operation));
+  await transaction.done;
+}
+
+export async function transitionDurableRestoreOperation(
+  input: {
+    operationId: string;
+    expectedGeneration: number;
+    expectedPhase: RestoreLifecyclePhase;
+    nextPhase: RestoreLifecyclePhase;
+    publicationHold?: {
+      remoteRevalidationRequired: boolean;
+      accountId?: string;
+    };
+    commitEvidence?: RestoreCommitEvidenceV1;
+  },
+  lease: WorkspaceRestoreLease,
+): Promise<DurableRestoreOperation> {
+  assertWorkspaceRestoreLease(lease, { requireExclusive: true });
+  if (!canTransitionRestorePhase(input.expectedPhase, input.nextPhase)) {
+    throw new WorkspaceRestoreBarrierError('The restore phase transition is invalid.');
+  }
+  if (
+    (input.nextPhase === 'publication-hold') !==
+    (input.publicationHold !== undefined)
+  ) {
+    throw new WorkspaceRestoreBarrierError(
+      'Publication-hold fencing evidence is incomplete.',
+    );
+  }
+  const database = await getDatabase();
+  if (!database) throw new WorkspaceRestoreBarrierError();
+  const workspaceId = currentWorkspaceRestoreIdentity();
+  const transaction = database.transaction(RESTORE_OPERATION_STORE, 'readwrite');
+  const store = transaction.objectStore(RESTORE_OPERATION_STORE);
+  const current = await store.get(workspaceId);
+  if (
+    !isDurableRestoreOperation(current) ||
+    current.operationId !== input.operationId ||
+    current.generation !== input.expectedGeneration ||
+    current.phase !== input.expectedPhase
+  ) {
+    await transaction.done;
+    throw new WorkspaceRestoreBarrierError(
+      'A stale restore actor cannot change the durable barrier.',
+    );
+  }
+  const requiresCommitEvidence =
+    current.enginePlan !== undefined && input.nextPhase === 'committed';
+  if (
+    requiresCommitEvidence !== (input.commitEvidence !== undefined) ||
+    (input.commitEvidence !== undefined &&
+      (input.commitEvidence.version !== 1 ||
+        input.commitEvidence.operationId !== current.operationId ||
+        input.commitEvidence.planFingerprint !== current.enginePlan?.planFingerprint ||
+        input.commitEvidence.targetFingerprint !==
+          current.enginePlan?.targetFingerprint))
+  ) {
+    await transaction.done;
+    throw new WorkspaceRestoreBarrierError(
+      'The restore commit evidence is incomplete or does not match the frozen plan.',
+    );
+  }
+  const next: DurableRestoreOperation = {
+    ...current,
+    phase: input.nextPhase,
+    generation: current.generation + 1,
+    recoveryRequired: input.nextPhase === 'recovery-required',
+    publicationHold: input.nextPhase === 'publication-hold',
+    remoteRevalidationRequired:
+      input.publicationHold?.remoteRevalidationRequired ?? false,
+    ...(input.publicationHold?.accountId
+      ? { publicationAccountId: input.publicationHold.accountId }
+      : {}),
+    ...(input.commitEvidence ? { commitEvidence: input.commitEvidence } : {}),
+  };
+  if (!isDurableRestoreOperation(next)) {
+    await transaction.done;
+    throw new WorkspaceRestoreBarrierError(
+      'The next durable restore state is invalid.',
+    );
+  }
+  await store.put(next);
+  await transaction.done;
+  return next;
+}
+
+export async function clearDurablePublicationHold(
+  input: {
+    operationId: string;
+    expectedGeneration: number;
+    publicationResumeAuthorized: true;
+    remoteReconciled: boolean;
+    verifiedAccountId?: string;
+  },
+  lease: WorkspaceRestoreLease,
+): Promise<void> {
+  assertWorkspaceRestoreLease(lease, { requireExclusive: true });
+  if (!input.publicationResumeAuthorized) {
+    throw new WorkspaceRestoreBarrierError(
+      'Publication resume requires explicit authorization.',
+    );
+  }
+  const database = await getDatabase();
+  if (!database) throw new WorkspaceRestoreBarrierError();
+  const workspaceId = currentWorkspaceRestoreIdentity();
+  const transaction = database.transaction(RESTORE_OPERATION_STORE, 'readwrite');
+  const store = transaction.objectStore(RESTORE_OPERATION_STORE);
+  const current = await store.get(workspaceId);
+  if (
+    !isDurableRestoreOperation(current) ||
+    current.operationId !== input.operationId ||
+    current.generation !== input.expectedGeneration ||
+    current.phase !== 'publication-hold' ||
+    !current.publicationHold
+  ) {
+    await transaction.done;
+    throw new WorkspaceRestoreBarrierError(
+      'A stale restore actor cannot clear the publication hold.',
+    );
+  }
+  if (current.remoteRevalidationRequired && !input.remoteReconciled) {
+    await transaction.done;
+    throw new WorkspaceRestoreBarrierError(
+      'Remote reconciliation is required before publication can resume.',
+    );
+  }
+  if (
+    current.publicationAccountId !== undefined &&
+    input.verifiedAccountId !== current.publicationAccountId
+  ) {
+    await transaction.done;
+    throw new WorkspaceRestoreBarrierError(
+      'The verified Google account does not own this publication hold.',
+    );
+  }
+  await store.delete(workspaceId);
+  await transaction.done;
+}
+
+export function upgradeAnnotationDatabaseSchema(
+  database: IDBPDatabase<AnnotationDatabase>,
+): void {
+  if (!database.objectStoreNames.contains(DOCUMENT_STATE_STORE)) {
+    database.createObjectStore(DOCUMENT_STATE_STORE, { keyPath: 'documentId' });
+  }
+  if (!database.objectStoreNames.contains(PDF_FILE_STORE)) {
+    database.createObjectStore(PDF_FILE_STORE, { keyPath: 'documentId' });
+  }
+  if (!database.objectStoreNames.contains(COLLECTION_STORE)) {
+    database.createObjectStore(COLLECTION_STORE, { keyPath: 'id' });
+  }
+  if (!database.objectStoreNames.contains(RESTORE_OPERATION_STORE)) {
+    database.createObjectStore(RESTORE_OPERATION_STORE, { keyPath: 'workspaceId' });
+  }
+  if (!database.objectStoreNames.contains(RESTORE_SNAPSHOT_STORE)) {
+    database.createObjectStore(RESTORE_SNAPSHOT_STORE, { keyPath: 'id' });
+  }
+  if (!database.objectStoreNames.contains(RESTORE_ACTION_STORE)) {
+    database.createObjectStore(RESTORE_ACTION_STORE, { keyPath: 'id' });
   }
 }
 
@@ -1527,22 +1978,17 @@ async function getDatabase(): Promise<IDBPDatabase<AnnotationDatabase> | null> {
 
   if (!databasePromise) {
     openedDatabaseName = databaseName;
-    databasePromise = openDB<AnnotationDatabase>(databaseName, DATABASE_VERSION, {
-      upgrade(database) {
-        if (!database.objectStoreNames.contains(DOCUMENT_STATE_STORE)) {
-          database.createObjectStore(DOCUMENT_STATE_STORE, { keyPath: 'documentId' });
-        }
-        if (!database.objectStoreNames.contains(PDF_FILE_STORE)) {
-          database.createObjectStore(PDF_FILE_STORE, { keyPath: 'documentId' });
-        }
-        if (!database.objectStoreNames.contains(COLLECTION_STORE)) {
-          database.createObjectStore(COLLECTION_STORE, { keyPath: 'id' });
-        }
-        if (!database.objectStoreNames.contains(TAG_STORE)) {
-          database.createObjectStore(TAG_STORE, { keyPath: 'id' });
-        }
+    databasePromise = openDatabaseWithLifecycleSafety<AnnotationDatabase>(
+      databaseName,
+      ANNOTATION_DATABASE_VERSION,
+      {
+        upgrade: upgradeAnnotationDatabaseSchema,
+        onConnectionClosed() {
+          databasePromise = null;
+          openedDatabaseName = null;
+        },
       },
-    }).catch((error) => {
+    ).catch((error) => {
       databasePromise = null;
       openedDatabaseName = null;
       throw error;
@@ -1571,14 +2017,15 @@ function createEmptyDocumentState(
     originalFileName: identity.documentName,
     displayTitle: identity.documentName,
     annotations: [],
+    links: [],
     officeAnnotations: [],
     noteAnchors: [],
     notes: [],
     glossaryEntries: [],
     nextNoteNumber: 1,
+    nextLinkNumber: 1,
     updatedAt: Date.now(),
     collectionIds: [],
-    tagIds: [],
     isPinned: false,
   };
 }
@@ -1597,8 +2044,8 @@ function documentChangeCategories(
       previous.originalFileName,
       previous.displayTitle,
       previous.nextNoteNumber,
+      previous.nextLinkNumber,
       previous.collectionIds,
-      previous.tagIds,
       previous.isPinned,
       previous.pinnedAt,
       previous.lastReadAt,
@@ -1609,8 +2056,8 @@ function documentChangeCategories(
         next.originalFileName,
         next.displayTitle,
         next.nextNoteNumber,
+        next.nextLinkNumber,
         next.collectionIds,
-        next.tagIds,
         next.isPinned,
         next.pinnedAt,
         next.lastReadAt,
@@ -1625,9 +2072,16 @@ function documentChangeCategories(
     !previous ||
     JSON.stringify([
       previous.annotations,
+      previous.links,
       previous.officeAnnotations,
       previous.noteAnchors,
-    ]) !== JSON.stringify([next.annotations, next.officeAnnotations, next.noteAnchors])
+    ]) !==
+      JSON.stringify([
+        next.annotations,
+        next.links,
+        next.officeAnnotations,
+        next.noteAnchors,
+      ])
   ) {
     categories.push('annotations');
   }
@@ -1664,6 +2118,7 @@ function sanitizeDocumentState(
   if (
     !isRecord(value) ||
     (value.schemaVersion !== PERSISTENCE_SCHEMA_VERSION &&
+      value.schemaVersion !== FORMAT_GENERIC_PERSISTENCE_SCHEMA_VERSION &&
       value.schemaVersion !== PDF_DOCUMENT_SCHEMA_VERSION &&
       value.schemaVersion !== NOTE_ANCHOR_PREVIOUS_SCHEMA_VERSION &&
       value.schemaVersion !== HIGHLIGHT_NOTE_SCHEMA_VERSION &&
@@ -1671,6 +2126,14 @@ function sanitizeDocumentState(
       value.schemaVersion !== PREVIOUS_PERSISTENCE_SCHEMA_VERSION &&
       value.schemaVersion !== PREVIOUS_SCHEMA_VERSION &&
       value.schemaVersion !== LEGACY_SCHEMA_VERSION)
+  ) {
+    return null;
+  }
+
+  if (
+    (value.schemaVersion === PERSISTENCE_SCHEMA_VERSION &&
+      !Array.isArray(value.links)) ||
+    (value.schemaVersion !== PERSISTENCE_SCHEMA_VERSION && value.links !== undefined)
   ) {
     return null;
   }
@@ -1684,7 +2147,8 @@ function sanitizeDocumentState(
   }
 
   const documentType =
-    value.schemaVersion === PERSISTENCE_SCHEMA_VERSION
+    value.schemaVersion === PERSISTENCE_SCHEMA_VERSION ||
+    value.schemaVersion === FORMAT_GENERIC_PERSISTENCE_SCHEMA_VERSION
       ? isDocumentType(value.documentType)
         ? value.documentType
         : null
@@ -1694,6 +2158,27 @@ function sanitizeDocumentState(
   if (!documentType) return null;
 
   const annotations = sanitizeAnnotations(value.annotations ?? value.highlights);
+  const rawLinks =
+    value.schemaVersion === PERSISTENCE_SCHEMA_VERSION ? value.links : [];
+  if (value.schemaVersion === PERSISTENCE_SCHEMA_VERSION && !Array.isArray(rawLinks)) {
+    return null;
+  }
+  const links = sanitizeDocumentLinks(rawLinks, expectedDocumentId);
+  if (
+    links.length !== (Array.isArray(rawLinks) ? rawLinks.length : 0) ||
+    (documentType !== 'pdf' && links.length > 0)
+  ) {
+    return null;
+  }
+  const requestedHighWater =
+    value.schemaVersion === PERSISTENCE_SCHEMA_VERSION ? value.nextLinkNumber : 1;
+  if (!isValidNextDocumentLinkNumber(requestedHighWater, links)) return null;
+  let repairedLinks: ReturnType<typeof repairDocumentLinkNumberCollisions>;
+  try {
+    repairedLinks = repairDocumentLinkNumberCollisions(links, requestedHighWater);
+  } catch {
+    return null;
+  }
   const officeAnnotations = sanitizeOfficeDocumentAnnotations(
     value.officeAnnotations,
   ).filter(
@@ -1725,11 +2210,13 @@ function sanitizeDocumentState(
     originalFileName,
     displayTitle: normalizeDisplayTitle(value.displayTitle, originalFileName),
     annotations,
+    links: repairedLinks.links,
     officeAnnotations,
     noteAnchors,
     notes,
     glossaryEntries,
     nextNoteNumber: normalizeNextNoteNumber(value.nextNoteNumber, notes),
+    nextLinkNumber: repairedLinks.nextLinkNumber,
     updatedAt: isTimestamp(value.updatedAt) ? value.updatedAt : 0,
     ...(documentReadingPosition ? { documentReadingPosition } : {}),
     ...sanitizeDocumentLibraryMetadata(value),
@@ -1740,7 +2227,6 @@ function sanitizeDocumentLibraryMetadata(
   value: Record<string, unknown>,
 ): DocumentLibraryMetadata {
   const collectionIds = sanitizeIdList(value.collectionIds);
-  const tagIds = sanitizeIdList(value.tagIds);
   const isPinned = value.isPinned === true;
   const pinnedAt = isPinned && isTimestamp(value.pinnedAt) ? value.pinnedAt : undefined;
   const lastReadAt = isTimestamp(value.lastReadAt) ? value.lastReadAt : undefined;
@@ -1748,7 +2234,6 @@ function sanitizeDocumentLibraryMetadata(
 
   return {
     collectionIds,
-    tagIds,
     isPinned,
     ...(pinnedAt ? { pinnedAt } : {}),
     ...(lastReadAt ? { lastReadAt } : {}),
@@ -1761,7 +2246,6 @@ function getDocumentLibraryMetadata(
 ): DocumentLibraryMetadata {
   return {
     collectionIds: state.collectionIds,
-    tagIds: state.tagIds,
     isPinned: state.isPinned,
     ...(state.pinnedAt ? { pinnedAt: state.pinnedAt } : {}),
     ...(state.lastReadAt ? { lastReadAt: state.lastReadAt } : {}),
@@ -1770,7 +2254,7 @@ function getDocumentLibraryMetadata(
 }
 
 function createEmptyLibraryMetadata(): DocumentLibraryMetadata {
-  return { collectionIds: [], tagIds: [], isPinned: false };
+  return { collectionIds: [], isPinned: false };
 }
 
 function sanitizeIdList(value: unknown): string[] {
@@ -1903,13 +2387,13 @@ function sanitizeAnnotations(value: unknown): PdfAnnotation[] {
       return [];
     }
 
-    if (type === 'highlight' && !isHighlightColor(candidate.color)) {
-      return [];
-    }
-    const underlineColor = candidate.color === 'purple' ? 'blue' : candidate.color;
-    if (type === 'underline' && !isUnderlineColor(underlineColor)) {
-      return [];
-    }
+    const normalizedColor =
+      type === 'highlight'
+        ? normalizeHighlightColor(candidate.color)
+        : normalizeUnderlineColor(
+            candidate.color === 'purple' ? 'blue' : candidate.color,
+          );
+    if (!normalizedColor) return [];
 
     seenIds.add(candidate.id);
 
@@ -1920,8 +2404,7 @@ function sanitizeAnnotations(value: unknown): PdfAnnotation[] {
         pageNumber: candidate.pageNumber,
         text: candidate.text,
         rects,
-        color: (type === 'underline' ? underlineColor : candidate.color) as
-          HighlightColor | UnderlineColor,
+        color: normalizedColor as HighlightColor | UnderlineColor,
         createdAt: candidate.createdAt,
         updatedAt: candidate.updatedAt,
       } as PdfAnnotation,
@@ -2116,14 +2599,6 @@ function sanitizeRectangles(value: unknown): PdfAnnotation['rects'] {
   });
 }
 
-function isHighlightColor(value: unknown): value is HighlightColor {
-  return typeof value === 'string' && Object.hasOwn(highlightColors, value);
-}
-
-function isUnderlineColor(value: unknown): value is UnderlineColor {
-  return typeof value === 'string' && Object.hasOwn(underlineColors, value);
-}
-
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null;
 }
@@ -2143,8 +2618,9 @@ function normalizeLibraryEntityName(value: string): string | null {
   return trimmed.toLocaleLowerCase();
 }
 
-function isValidNamedRecord(value: CollectionRecord | TagRecord): boolean {
+function isValidNamedRecord(value: unknown): value is CollectionRecord {
   return (
+    isRecord(value) &&
     isNonEmptyString(value.id) &&
     value.id.length <= 128 &&
     isNonEmptyString(value.name) &&

@@ -14,12 +14,7 @@ import {
 } from 'lexical';
 
 export type PrintBlockKind =
-  | 'title'
-  | 'annotation'
-  | 'note'
-  | 'glossary'
-  | 'custom'
-  | 'ai-result';
+  'title' | 'annotation' | 'note' | 'glossary' | 'custom' | 'ai-result';
 
 export type SerializedPrintBlockNode = Spread<
   {

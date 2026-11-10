@@ -628,22 +628,40 @@ test('coordinator inventory cannot discover or create a root when none is select
   const drive = createMemoryHousekeepingDrive();
   drive.resetMutations();
   const coordinator = new PaperGoogleDriveSyncCoordinator({ notify() {} });
+  let accountRevalidations = 0;
   Object.assign(coordinator, {
     drive,
     initializationPromise: Promise.resolve(),
+    revalidateOperationWorkspaceAccount: async (
+      accountId: string,
+      operationType: string,
+    ) => {
+      accountRevalidations += 1;
+      assert.equal(accountId, 'account-a');
+      assert.equal(operationType, 'housekeeping');
+    },
+    // This test isolates the post-admission root-selection guard. Restore-barrier
+    // admission and its fail-closed behavior are covered by the operation-lifecycle tests.
+    assertWorkspaceMutationAdmission: async () => {},
     profile: {
       id: 'paper-device',
       deviceId: 'device-no-root',
       deviceLabel: 'No root device',
       deviceMode: 'personal',
+      deviceModeChoiceConfirmed: true,
       autoSync: true,
+      accountId: 'account-a',
+      workspaceAccountId: 'account-a',
     },
+    identity: { hasDeviceSession: true, accountId: 'account-a' },
   });
+  coordinator.getSnapshot().deviceModeChoiceConfirmed = true;
 
   await assert.rejects(
     () => coordinator.checkLegacyDriveData(),
     /Select an existing verified 39Note Drive folder/u,
   );
+  assert.equal(accountRevalidations, 2);
   assert.deepEqual(drive.mutations, []);
   assert.deepEqual(drive.trashAttempts, []);
 });

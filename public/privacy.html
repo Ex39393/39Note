@@ -1,0 +1,234 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta
+      name="description"
+      content="Privacy Policy for the 39Note local-first study workspace."
+    />
+    <link rel="icon" type="image/png" href="39note-icon.png" />
+    <link rel="stylesheet" href="legal.css" />
+    <title>Privacy Policy · 39Note</title>
+  </head>
+  <body>
+    <a class="skip-link" href="#main-content">Skip to policy</a>
+    <header class="site-header">
+      <a class="brand" href="./">39Note</a>
+      <nav class="site-nav" aria-label="Legal pages">
+        <a aria-current="page" href="privacy.html">Privacy</a>
+        <a href="terms.html">Terms</a>
+        <a href="https://github.com/Ex39393/39Note">Project</a>
+      </nav>
+    </header>
+
+    <main id="main-content">
+      <p class="eyebrow">39Note policy</p>
+      <h1>Privacy Policy</h1>
+      <p class="updated">Last updated: November 10, 2026</p>
+      <p class="lede">
+        39Note is a local-first PDF reading and study workspace. Most application data
+        stays in the browser profile on the device you use. Network features are
+        optional or occur only when you invoke a feature that needs an external service.
+      </p>
+
+      <div class="notice">
+        <strong>In short:</strong> 39Note has no advertising account, does not sell
+        personal information, and version 1.0.0 contains no third-party advertising or
+        analytics SDK. Optional Google Drive sync, online dictionary lookups, and a
+        user-configured AI provider each have the limited data flows described below.
+      </div>
+
+      <h2>1. Scope</h2>
+      <p>
+        This policy describes the 39Note web application, its optional Google Drive sync
+        feature, and the small 39Note authentication service used to connect Google
+        Drive. It does not replace the privacy policies of Google, Cloudflare,
+        Wikimedia, NCBI, an AI provider you choose, your browser, or your device.
+      </p>
+
+      <h2>2. Website hosting</h2>
+      <p>
+        The production web application is served by GitHub Pages. When you load the
+        site, GitHub can process ordinary web-request and usage metadata such as your IP
+        address, device and browser information, requested page, referring page, and the
+        date and time of the request. 39Note does not add its own analytics or
+        advertising tracker to this hosting traffic. GitHub processes this information
+        under the
+        <a
+          href="https://docs.github.com/en/site-policy/privacy-policies/github-general-privacy-statement"
+          >GitHub General Privacy Statement</a
+        >.
+      </p>
+
+      <h2>3. Data kept on your device</h2>
+      <p>
+        39Note uses browser storage, including IndexedDB, local storage, and session
+        storage, to provide the application. Depending on the features you use, this can
+        include:
+      </p>
+      <ul>
+        <li>
+          imported PDFs and locally converted PDF copies, document fingerprints and
+          identifiers, annotations, Notes, links, collections, reading position, and
+          organization metadata;
+        </li>
+        <li>
+          print drafts, local backups and restore metadata, application preferences, and
+          temporary diagnostic or recovery state;
+        </li>
+        <li>
+          AI conversations, prompt profiles, provider settings, and—only if you choose
+          to remember it—the API key for your selected AI provider; and
+        </li>
+        <li>
+          a personal-device session token for optional Google Drive sync, or a
+          session-only token when you select temporary/public-device mode.
+        </li>
+      </ul>
+      <p>
+        Google access tokens are held in browser memory only. Raw OCR recognition output
+        is session-only; records you explicitly create from recognized text follow the
+        normal persistence rules for annotations, Notes, links, and backups.
+      </p>
+
+      <h2>4. Optional Google Drive sync</h2>
+      <p>
+        Google Drive sync is off until you connect a Google account. 39Note requests
+        only the <code>drive.file</code> permission. This lets the application work with
+        files it creates or that you explicitly open with it; it does not grant general
+        access to every file in your Drive.
+      </p>
+      <p>
+        When enabled, original PDFs and allowlisted editable study records move directly
+        between your browser and a visible <strong>39Note</strong> folder in Google
+        Drive over HTTPS. Those records may include annotations, Notes, organization and
+        reading state, print drafts, AI conversations, and safe AI settings. AI API
+        keys, passwords, Google client secrets, custom authentication headers, and
+        Google refresh tokens are excluded from Drive sync payloads.
+      </p>
+
+      <h3>Authentication service metadata</h3>
+      <p>
+        A Cloudflare Worker and D1 database act only as an OAuth and device-session
+        broker. The broker does not receive PDFs, annotations, Notes, AI conversations,
+        or Google Drive file or folder identifiers. It processes and stores limited
+        account and authorization metadata:
+      </p>
+      <ul>
+        <li>
+          Google's opaque Drive permission identifier, granted scope, timestamps, and
+          revocation status;
+        </li>
+        <li>
+          an encrypted Google refresh token, together with its random initialization
+          vector and encryption-key version (the encryption key is stored separately);
+        </li>
+        <li>
+          random device/session identifiers and only a SHA-256 hash of each issued
+          device-session token; and
+        </li>
+        <li>one-time, expiring OAuth state and authorization-grant metadata.</li>
+      </ul>
+      <p>
+        Revoked authorization and session rows may remain as fail-closed status and
+        audit metadata. Disconnecting a device does not delete your browser library or
+        your Drive files. “Disconnect all devices” revokes 39Note sessions and submits
+        Google token revocation, but it is separate from deleting Drive content.
+      </p>
+
+      <h3>Google API data</h3>
+      <p>
+        39Note's use and transfer of information received from Google APIs complies with
+        the Google API Services User Data Policy, including its Limited Use
+        requirements. Google user data is used only to provide and secure the Drive sync
+        functionality you request. It is not used for advertising, sold, or transferred
+        for unrelated purposes.
+      </p>
+
+      <h2>5. Other optional network features</h2>
+      <h3>Dictionary lookups</h3>
+      <p>
+        39Note ships an offline WordNet dictionary. When an online definition lookup is
+        used, the selected or normalized term may be sent directly from your browser to
+        English Wiktionary (Wikimedia) and NCBI MeSH. Their services can receive
+        ordinary request metadata such as your IP address and browser headers.
+      </p>
+
+      <h3>User-configured AI</h3>
+      <p>
+        39Note does not provide an AI account and does not operate an AI relay. If you
+        configure and use an AI provider, your question, conversation context, and
+        selected or retrieved document excerpts are sent directly from your browser to
+        the endpoint you selected. The provider receives the API credential and request
+        metadata needed to answer. Its own terms and privacy policy apply.
+      </p>
+      <p>
+        AI credentials and custom authentication headers stay in the browser profile and
+        are not synced. If you choose “Remember API key,” the key remains in browser
+        local storage until you clear it; otherwise it is kept only in the browser
+        session.
+      </p>
+
+      <h2>6. Retention and your controls</h2>
+      <ul>
+        <li>
+          Local data remains in the relevant browser profile until you remove it in
+          39Note or clear that site's browser data. A downloaded backup remains wherever
+          you save it.
+        </li>
+        <li>
+          Synced content remains in Google Drive until you use an explicit 39Note
+          Drive-removal action or manage it in Google Drive. Local quarantine or
+          “ignore” actions do not claim to delete cloud records.
+        </li>
+        <li>
+          You can disconnect the current device, disconnect all devices, revoke 39Note
+          from your Google Account, clear AI credentials, and stop using optional
+          network features.
+        </li>
+      </ul>
+      <p>
+        Browser storage and Google Drive are separate. Removing one copy does not
+        necessarily remove the other. Review the wording of a removal action before
+        confirming it, and keep an independent backup of important work.
+      </p>
+
+      <h2>7. Security</h2>
+      <p>
+        39Note uses HTTPS for network traffic, OAuth state and one-time exchange values,
+        scoped Google authorization, hashed device-session tokens, and AES-256-GCM
+        encryption for stored Google refresh tokens. No system can guarantee absolute
+        security. Browser extensions, device users, the browser profile, and third-party
+        services you connect can access data within their own permissions.
+      </p>
+
+      <h2>8. Children's privacy</h2>
+      <p>
+        39Note is a general study tool and is not directed to children under the age at
+        which parental consent is required in their location. Do not connect a child's
+        account or submit a child's personal information without any consent required by
+        applicable law and the connected service.
+      </p>
+
+      <h2>9. Changes to this policy</h2>
+      <p>
+        Material changes will be reflected on this page by updating the date above. A
+        new release may also describe changed data flows in its release notes.
+      </p>
+
+      <h2>10. Contact</h2>
+      <p>
+        For a privacy question or request, use the
+        <a href="https://github.com/Ex39393/39Note/issues">39Note issue tracker</a>. Do
+        not include document content, credentials, account identifiers, or other
+        sensitive information in a public issue.
+      </p>
+    </main>
+
+    <footer class="site-footer">
+      <p>Copyright © 2026 Ex39393. All rights reserved.</p>
+      <p><a href="terms.html">Terms of Service</a></p>
+    </footer>
+  </body>
+</html>
