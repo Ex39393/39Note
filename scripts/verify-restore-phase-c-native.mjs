@@ -58,6 +58,7 @@ class CdpClient {
 
 const profile = await mkdtemp(join(tmpdir(), '39note-phase-c-native-'));
 const devToolsPortFile = join(profile, 'DevToolsActivePort');
+const browserStartupTimeoutMs = process.env.CI === 'true' ? 60_000 : 15_000;
 const port = await reserveLoopbackPort();
 const server = await createServer({
   appType: 'spa',
@@ -107,9 +108,16 @@ try {
     browserStderr = `${browserStderr}${chunk}`.slice(-16_384);
   });
   const debugPort = Number(
-    (await waitForFile(devToolsPortFile, 15_000)).split(/\r?\n/u)[0],
+    (await waitForFile(devToolsPortFile, browserStartupTimeoutMs, browser)).split(
+      /\r?\n/u,
+    )[0],
   );
-  const target = await waitForPageTarget(debugPort, 'about:blank', 15_000);
+  const target = await waitForPageTarget(
+    debugPort,
+    'about:blank',
+    browserStartupTimeoutMs,
+    browser,
+  );
   cdp = await CdpClient.connect(target.webSocketDebuggerUrl);
   await Promise.all([cdp.send('Page.enable'), cdp.send('Runtime.enable')]);
   await cdp.send('Page.addScriptToEvaluateOnNewDocument', {
@@ -218,21 +226,24 @@ function chromeExecutable() {
   return executable;
 }
 
-async function waitForFile(path, timeoutMs) {
+async function waitForFile(path, timeoutMs, browserProcess) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
+    assertBrowserStillRunning(browserProcess, 'debugging startup');
     try {
       return await readFile(path, 'utf8');
     } catch {
       await delay(50);
     }
   }
+  assertBrowserStillRunning(browserProcess, 'debugging startup');
   throw new Error('Timed out waiting for Chromium debugging startup.');
 }
 
-async function waitForPageTarget(debugPort, expectedUrl, timeoutMs) {
+async function waitForPageTarget(debugPort, expectedUrl, timeoutMs, browserProcess) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
+    assertBrowserStillRunning(browserProcess, 'page-target startup');
     try {
       const response = await fetch(`http://127.0.0.1:${debugPort}/json/list`);
       const targets = await response.json();
@@ -246,7 +257,15 @@ async function waitForPageTarget(debugPort, expectedUrl, timeoutMs) {
     }
     await delay(50);
   }
+  assertBrowserStillRunning(browserProcess, 'page-target startup');
   throw new Error('Timed out waiting for the isolated browser page.');
+}
+
+function assertBrowserStillRunning(child, phase) {
+  if (!child || (child.exitCode === null && child.signalCode === null)) return;
+  throw new Error(
+    `Chromium exited during ${phase} (exit code ${child.exitCode ?? 'none'}, signal ${child.signalCode ?? 'none'}).`,
+  );
 }
 
 async function waitForRuntimeValue(client, expression, predicate, timeoutMs) {

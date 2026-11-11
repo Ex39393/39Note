@@ -31,6 +31,33 @@ test('both restore verifiers honor the matrix browser before local fallbacks', (
   }
 });
 
+test('all native verifiers tolerate CI browser cold starts and diagnose early exits', () => {
+  for (const path of [
+    '../scripts/verify-targeted-purge-home-native.mjs',
+    '../scripts/verify-restore-phase-b-native.mjs',
+    '../scripts/verify-restore-phase-c-native.mjs',
+  ]) {
+    const verifier = source(path);
+    assert.match(
+      verifier,
+      /const browserStartupTimeoutMs = process\.env\.CI === 'true' \? 60_000 : 15_000/u,
+      `${path} must allow a bounded hosted-runner cold start`,
+    );
+    assert.match(
+      verifier,
+      /waitForFile\(devToolsPortFile, browserStartupTimeoutMs, browser\)/u,
+      `${path} must observe the browser while waiting for its debugging port`,
+    );
+    assert.match(
+      verifier,
+      /waitForPageTarget\([\s\S]*?browserStartupTimeoutMs,[\s\S]*?browser,[\s\S]*?\)/u,
+      `${path} must retain the same bounded startup contract for its page target`,
+    );
+    assert.match(verifier, /function assertBrowserStillRunning\(child, phase\)/u);
+    assert.match(verifier, /child\.exitCode[\s\S]*child\.signalCode/u);
+  }
+});
+
 test('the UI verifier covers compact controls, stale state, and explicit local OCR', () => {
   const verifier = source('../scripts/verify-targeted-purge-home-native.mjs');
 
