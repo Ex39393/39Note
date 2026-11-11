@@ -590,5 +590,8 @@ function fitWidthScale(containerWidth: number): number {
 }
 
 function source(relativePath: string): string {
-  return readFileSync(new URL(relativePath, import.meta.url), 'utf8');
+  return readFileSync(new URL(relativePath, import.meta.url), 'utf8').replace(
+    /\r\n?/gu,
+    '\n',
+  );
 }

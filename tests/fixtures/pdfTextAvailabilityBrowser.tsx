@@ -300,6 +300,13 @@ async function runChecks(): Promise<void> {
   assert(retryRecognition, 'cancelled OCR returns to the explicit recognition action');
   retryRecognition.click();
   await waitForCondition(() => imagePage.dataset.pdfOcrStatus === 'ready', 90_000);
+  await waitForCondition(
+    () =>
+      imagePage.querySelector<HTMLElement>('.textLayer')?.dataset.pdfOcrTextLayer ===
+        'true' && latestOcrResult !== null,
+    5_000,
+    'OCR reached ready state before its rendered text layer became available.',
+  );
   const ocrWords = imagePage.querySelectorAll<HTMLElement>('.ocr-text-word');
   assert(ocrWords.length >= 10, 'recognized words render into the existing text layer');
   const firstText = ocrWords[0].firstChild;
@@ -448,10 +455,11 @@ function assert(condition: unknown, message: string): asserts condition {
 async function waitForCondition(
   condition: () => boolean,
   timeoutMs: number,
+  timeoutMessage = 'PDF text check timed out.',
 ): Promise<void> {
   const deadline = performance.now() + timeoutMs;
   while (!condition()) {
-    if (performance.now() > deadline) throw new Error('PDF text check timed out.');
+    if (performance.now() > deadline) throw new Error(timeoutMessage);
     await new Promise((resolve) => window.setTimeout(resolve, 20));
   }
 }

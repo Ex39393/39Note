@@ -75,6 +75,28 @@ test('the UI verifier covers compact controls, stale state, and explicit local O
   assert.match(verifier, /width: 390,[\s\S]*height: 844/u);
 });
 
+test('the PDF OCR fixture waits for its rendered text layer after ready state', () => {
+  const fixture = source('./fixtures/pdfTextAvailabilityBrowser.tsx');
+  const readyStateWait = fixture.indexOf("imagePage.dataset.pdfOcrStatus === 'ready'");
+  const renderedLayerWait = fixture.indexOf('dataset.pdfOcrTextLayer');
+  const wordCountAssertion = fixture.indexOf('ocrWords.length >= 10');
+
+  assert.ok(readyStateWait >= 0, 'the fixture must wait for the typed OCR ready state');
+  assert.ok(
+    renderedLayerWait > readyStateWait,
+    'the fixture must then wait for the passive text-layer render',
+  );
+  assert.ok(
+    wordCountAssertion > renderedLayerWait,
+    'the strict recognized-word assertion must run after DOM readiness',
+  );
+  assert.match(fixture, /latestOcrResult !== null/u);
+  assert.match(
+    fixture,
+    /OCR reached ready state before its rendered text layer became available\./u,
+  );
+});
+
 test('CI relies on the complete matrix without duplicate default-browser restore runs', () => {
   for (const path of [
     '../.github/workflows/validate-pull-request.yml',
