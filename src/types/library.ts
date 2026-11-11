@@ -16,17 +16,8 @@ export interface CollectionRecord {
   updatedAt: number;
 }
 
-export interface TagRecord {
-  id: string;
-  name: string;
-  normalizedName: string;
-  createdAt: number;
-  updatedAt: number;
-}
-
 export interface DocumentLibraryMetadata {
   collectionIds: string[];
-  tagIds: string[];
   isPinned: boolean;
   pinnedAt?: number;
   lastReadAt?: number;

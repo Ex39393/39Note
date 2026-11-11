@@ -1,4 +1,4 @@
-import { openDB, type DBSchema, type IDBPDatabase } from 'idb';
+import type { DBSchema, IDBPDatabase } from 'idb';
 import {
   SYNC_DATABASE_NAME,
   SYNC_DATABASE_VERSION,
@@ -9,6 +9,7 @@ import type {
   PaperDriveFileEvidence,
   PaperDirtyReason,
   PaperSyncState,
+  TargetedPaperPurgeCheckpoint,
 } from './paperTypes.ts';
 import type { LayoutMigrationFailure } from './layoutMigration.ts';
 import { isValidDocumentId } from '../utils/documentId.ts';
@@ -16,6 +17,8 @@ import {
   isTemporaryWorkspaceActive,
   scopedDatabaseName,
 } from '../services/temporaryWorkspace.ts';
+import { openDatabaseWithLifecycleSafety } from '../services/indexedDbLifecycle.ts';
+import type { WorkspaceRestoreLease } from '../services/workspaceRestoreLock.ts';
 
 const DEVICE_STORE = 'device-state';
 const PAPER_DEVICE_STORE = 'paper-device';
@@ -36,17 +39,45 @@ export interface PaperDriveChangeCursor {
   lastFullAuditAt: number;
 }
 
+/**
+ * A local-only, user-confirmed exception for one otherwise blocking cloud paper.
+ * The account and root are carried on every record so a checkpoint can never
+ * suppress a paper after an identity or Drive-root change.
+ */
+export interface PaperCloudIssueQuarantineEntry {
+  version: 1;
+  documentId: string;
+  accountId: string;
+  rootFolderId: string;
+  reason: 'presence-control-resolution-failed';
+  confirmedAt: number;
+  /**
+   * A review reverses the active exception without erasing the identity proof
+   * that the user previously confirmed. Reviewed entries never suppress sync.
+   */
+  reviewedAt?: number;
+  /** Local-only managed-folder correlation captured at confirmation time. */
+  paperFolderId?: string;
+}
+
 export interface PaperSyncDeviceProfile {
   id: 'paper-device';
   deviceId: string;
   deviceLabel: string;
   deviceMode: SyncDeviceMode;
+  /** Absent on legacy profiles that only inherited the old Personal default. */
+  deviceModeChoiceConfirmed?: true;
   autoSync: boolean;
   /** Persisted only for personal mode. */
   googleDeviceSessionToken?: string;
+  /** Current authenticated session identity, originally verified by the broker. */
   accountId?: string;
+  /** Immutable local Personal-workspace association; never paper sync content. */
+  workspaceAccountId?: string;
   rootFolderId?: string;
   driveChangeCursor?: PaperDriveChangeCursor;
+  /** Local-only; never serialized into a Drive paper or protocol record. */
+  cloudIssueQuarantines?: PaperCloudIssueQuarantineEntry[];
   lastDiscoveryAt?: number;
   lastSuccessfulAt?: number;
 }
@@ -59,7 +90,6 @@ export interface TemporarySessionProvenance {
   createdAt: number;
   documentIds: string[];
   collectionIds: string[];
-  tagIds: string[];
   finishPhase: 'active' | 'uploading' | 'revoking' | 'cleaning' | 'cleanup-incomplete';
 }
 
@@ -145,56 +175,87 @@ export class LocalSyncPersistenceError extends Error {
   }
 }
 
-export async function loadSyncDeviceState(): Promise<SyncDeviceState> {
+export class WorkspaceAccountBindingConflictError extends Error {
+  constructor() {
+    super(
+      'This local 39Note library is associated with a different Google account. Sync has been paused to prevent your study data from being uploaded to the wrong account.',
+    );
+    this.name = 'WorkspaceAccountBindingConflictError';
+  }
+}
+
+export async function loadSyncDeviceState(
+  workspaceLease?: WorkspaceRestoreLease,
+): Promise<SyncDeviceState> {
   try {
     const database = await getDatabase();
     const value = await database.get(DEVICE_STORE, 'device');
     if (value?.id === 'device' && typeof value.deviceId === 'string') {
       return normalizeState(value);
     }
-    const created = createDefaultState();
-    await database.put(DEVICE_STORE, created);
-    return created;
+    return await withSyncWorkspaceMutation(async () => {
+      const current = await database.get(DEVICE_STORE, 'device');
+      if (current?.id === 'device' && typeof current.deviceId === 'string') {
+        return normalizeState(current);
+      }
+      const created = createDefaultState();
+      await database.put(DEVICE_STORE, created);
+      return created;
+    }, workspaceLease);
   } catch (error) {
     if (error instanceof LocalSyncPersistenceError) throw error;
     throw new LocalSyncPersistenceError('read', error);
   }
 }
 
-export async function saveSyncDeviceState(state: SyncDeviceState): Promise<void> {
+export async function saveSyncDeviceState(
+  state: SyncDeviceState,
+  workspaceLease?: WorkspaceRestoreLease,
+): Promise<void> {
   try {
-    const database = await getDatabase();
-    await database.put(DEVICE_STORE, normalizeState(state));
+    await withSyncWorkspaceMutation(async () => {
+      const database = await getDatabase();
+      await database.put(DEVICE_STORE, normalizeState(state));
+    }, workspaceLease);
   } catch (error) {
     if (error instanceof LocalSyncPersistenceError) throw error;
     throw new LocalSyncPersistenceError('write', error);
   }
 }
 
-export async function loadPaperSyncDeviceProfile(): Promise<PaperSyncDeviceProfile> {
+export async function loadPaperSyncDeviceProfile(
+  workspaceLease?: WorkspaceRestoreLease,
+): Promise<PaperSyncDeviceProfile> {
   try {
     const database = await getDatabase();
     const existing = await database.get(PAPER_DEVICE_STORE, 'paper-device');
     if (existing) return normalizePaperDeviceProfile(existing);
-    const legacy = await database.get(DEVICE_STORE, 'device');
-    const created: PaperSyncDeviceProfile = {
-      id: 'paper-device',
-      deviceId: legacy?.deviceId ?? crypto.randomUUID(),
-      deviceLabel: 'This device',
-      deviceMode: isTemporaryWorkspaceActive() ? 'temporary' : 'personal',
-      autoSync: isTemporaryWorkspaceActive() ? false : (legacy?.autoSync ?? true),
-      ...(legacy?.googleDeviceSessionToken
-        ? { googleDeviceSessionToken: legacy.googleDeviceSessionToken }
-        : {}),
-      ...(legacy?.driveFiles.rootFolderId
-        ? { rootFolderId: legacy.driveFiles.rootFolderId }
-        : {}),
-      ...(legacy?.lastSuccessfulAt
-        ? { lastSuccessfulAt: legacy.lastSuccessfulAt }
-        : {}),
-    };
-    await database.put(PAPER_DEVICE_STORE, created);
-    return created;
+    return await withSyncWorkspaceMutation(async () => {
+      const current = await database.get(PAPER_DEVICE_STORE, 'paper-device');
+      if (current) return normalizePaperDeviceProfile(current);
+      const legacy = await database.get(DEVICE_STORE, 'device');
+      const created: PaperSyncDeviceProfile = {
+        id: 'paper-device',
+        deviceId: legacy?.deviceId ?? crypto.randomUUID(),
+        deviceLabel: 'This device',
+        deviceMode: isTemporaryWorkspaceActive() ? 'temporary' : 'personal',
+        ...(isTemporaryWorkspaceActive()
+          ? { deviceModeChoiceConfirmed: true as const }
+          : {}),
+        autoSync: isTemporaryWorkspaceActive() ? false : (legacy?.autoSync ?? true),
+        ...(legacy?.googleDeviceSessionToken
+          ? { googleDeviceSessionToken: legacy.googleDeviceSessionToken }
+          : {}),
+        ...(legacy?.driveFiles.rootFolderId
+          ? { rootFolderId: legacy.driveFiles.rootFolderId }
+          : {}),
+        ...(legacy?.lastSuccessfulAt
+          ? { lastSuccessfulAt: legacy.lastSuccessfulAt }
+          : {}),
+      };
+      await database.put(PAPER_DEVICE_STORE, created);
+      return created;
+    }, workspaceLease);
   } catch (error) {
     throw new LocalSyncPersistenceError('read', error);
   }
@@ -202,16 +263,110 @@ export async function loadPaperSyncDeviceProfile(): Promise<PaperSyncDeviceProfi
 
 export async function savePaperSyncDeviceProfile(
   profile: PaperSyncDeviceProfile,
+  options: { authentication?: 'preserve' | 'replace' } = {},
+  workspaceLease?: WorkspaceRestoreLease,
 ): Promise<void> {
   try {
-    const normalized = normalizePaperDeviceProfile(profile);
-    normalized.deviceMode = isTemporaryWorkspaceActive() ? 'temporary' : 'personal';
-    if (normalized.deviceMode === 'temporary') {
-      normalized.autoSync = false;
-      delete normalized.googleDeviceSessionToken;
-    }
-    await (await getDatabase()).put(PAPER_DEVICE_STORE, normalized);
+    await withSyncWorkspaceMutation(async () => {
+      const database = await getDatabase();
+      const transaction = database.transaction(PAPER_DEVICE_STORE, 'readwrite');
+      const existing = await transaction.store.get('paper-device');
+      const normalized = normalizePaperDeviceProfile(profile);
+      normalized.deviceMode = isTemporaryWorkspaceActive() ? 'temporary' : 'personal';
+      if (normalized.deviceMode === 'temporary') {
+        normalized.deviceModeChoiceConfirmed = true;
+        normalized.autoSync = false;
+        delete normalized.googleDeviceSessionToken;
+        delete normalized.workspaceAccountId;
+      } else {
+        const existingBinding = safeAccountId(existing?.workspaceAccountId);
+        if (existing?.workspaceAccountId !== undefined && !existingBinding) {
+          void transaction.done.catch(() => undefined);
+          transaction.abort();
+          throw new WorkspaceAccountBindingConflictError();
+        }
+        if (
+          existingBinding &&
+          normalized.workspaceAccountId &&
+          normalized.workspaceAccountId !== existingBinding
+        ) {
+          void transaction.done.catch(() => undefined);
+          transaction.abort();
+          throw new WorkspaceAccountBindingConflictError();
+        }
+        if (existingBinding) normalized.workspaceAccountId = existingBinding;
+        if (options.authentication !== 'replace') {
+          const existingAccountId = safeAccountId(existing?.accountId);
+          if (existingAccountId) normalized.accountId = existingAccountId;
+          else delete normalized.accountId;
+          if (isSessionToken(existing?.googleDeviceSessionToken)) {
+            normalized.googleDeviceSessionToken = existing.googleDeviceSessionToken;
+          } else {
+            delete normalized.googleDeviceSessionToken;
+          }
+        }
+      }
+      await transaction.store.put(normalized);
+      await transaction.done;
+    }, workspaceLease);
   } catch (error) {
+    if (error instanceof WorkspaceAccountBindingConflictError) throw error;
+    throw new LocalSyncPersistenceError('write', error);
+  }
+}
+
+export function hasExplicitOrEstablishedDeviceMode(
+  profile: PaperSyncDeviceProfile,
+): boolean {
+  if (profile.deviceModeChoiceConfirmed === true) return true;
+  if (profile.deviceMode === 'temporary') return true;
+  return Boolean(
+    profile.googleDeviceSessionToken ||
+    profile.accountId ||
+    profile.rootFolderId ||
+    profile.lastSuccessfulAt,
+  );
+}
+
+export async function bindPersonalWorkspaceAccount(
+  accountId: string,
+  workspaceLease?: WorkspaceRestoreLease,
+): Promise<void> {
+  const normalizedAccountId = safeAccountId(accountId);
+  if (!normalizedAccountId || isTemporaryWorkspaceActive()) {
+    throw new WorkspaceAccountBindingConflictError();
+  }
+  try {
+    await withSyncWorkspaceMutation(async () => {
+      const database = await getDatabase();
+      const transaction = database.transaction(PAPER_DEVICE_STORE, 'readwrite');
+      const existing = await transaction.store.get('paper-device');
+      if (!existing) {
+        void transaction.done.catch(() => undefined);
+        transaction.abort();
+        throw new LocalSyncPersistenceError('read');
+      }
+      const profile = normalizePaperDeviceProfile(existing);
+      if (
+        profile.workspaceAccountId &&
+        profile.workspaceAccountId !== normalizedAccountId
+      ) {
+        void transaction.done.catch(() => undefined);
+        transaction.abort();
+        throw new WorkspaceAccountBindingConflictError();
+      }
+      profile.workspaceAccountId = normalizedAccountId;
+      profile.deviceModeChoiceConfirmed = true;
+      await transaction.store.put(profile);
+      await transaction.done;
+    }, workspaceLease);
+  } catch (error) {
+    if (
+      error instanceof WorkspaceAccountBindingConflictError ||
+      error instanceof LocalSyncPersistenceError
+    ) {
+      throw error;
+    }
     throw new LocalSyncPersistenceError('write', error);
   }
 }
@@ -259,9 +414,19 @@ export async function loadPaperSyncState(
   }
 }
 
-export async function savePaperSyncState(state: PaperSyncState): Promise<void> {
+export async function savePaperSyncState(
+  state: PaperSyncState,
+  workspaceLease?: WorkspaceRestoreLease,
+): Promise<void> {
   try {
-    await (await getDatabase()).put(PAPER_STATE_STORE, normalizePaperSyncState(state));
+    await withSyncWorkspaceMutation(
+      async () =>
+        void (await getDatabase()).put(
+          PAPER_STATE_STORE,
+          normalizePaperSyncState(state),
+        ),
+      workspaceLease,
+    );
   } catch (error) {
     throw new LocalSyncPersistenceError('write', error);
   }
@@ -269,13 +434,16 @@ export async function savePaperSyncState(state: PaperSyncState): Promise<void> {
 
 export async function savePaperSyncStates(
   states: readonly PaperSyncState[],
+  workspaceLease?: WorkspaceRestoreLease,
 ): Promise<void> {
   try {
-    const database = await getDatabase();
-    const transaction = database.transaction(PAPER_STATE_STORE, 'readwrite');
-    for (const state of states)
-      await transaction.store.put(normalizePaperSyncState(state));
-    await transaction.done;
+    await withSyncWorkspaceMutation(async () => {
+      const database = await getDatabase();
+      const transaction = database.transaction(PAPER_STATE_STORE, 'readwrite');
+      for (const state of states)
+        await transaction.store.put(normalizePaperSyncState(state));
+      await transaction.done;
+    }, workspaceLease);
   } catch (error) {
     throw new LocalSyncPersistenceError('write', error);
   }
@@ -283,13 +451,16 @@ export async function savePaperSyncStates(
 
 export async function saveCloudPaperCatalog(
   papers: readonly PaperCloudSummary[],
+  workspaceLease?: WorkspaceRestoreLease,
 ): Promise<void> {
   try {
-    const database = await getDatabase();
-    const transaction = database.transaction(CLOUD_PAPER_STORE, 'readwrite');
-    await transaction.store.clear();
-    for (const paper of papers) await transaction.store.put(paper);
-    await transaction.done;
+    await withSyncWorkspaceMutation(async () => {
+      const database = await getDatabase();
+      const transaction = database.transaction(CLOUD_PAPER_STORE, 'readwrite');
+      await transaction.store.clear();
+      for (const paper of papers) await transaction.store.put(paper);
+      await transaction.done;
+    }, workspaceLease);
   } catch (error) {
     throw new LocalSyncPersistenceError('write', error);
   }
@@ -305,9 +476,17 @@ export async function loadCloudPaperCatalog(): Promise<PaperCloudSummary[]> {
 
 export async function loadTemporarySessionProvenance(): Promise<TemporarySessionProvenance | null> {
   try {
-    return (
-      (await (await getDatabase()).get(TEMPORARY_SESSION_STORE, 'temporary')) ?? null
-    );
+    const stored = await (
+      await getDatabase()
+    ).get(TEMPORARY_SESSION_STORE, 'temporary');
+    if (!stored) return null;
+    // Released v1 provenance may carry retired organizational Tag IDs.
+    const { tagIds: _legacyTagIds, ...current } =
+      stored as TemporarySessionProvenance & {
+        tagIds?: unknown;
+      };
+    void _legacyTagIds;
+    return normalizeTemporarySessionProvenance(current);
   } catch (error) {
     throw new LocalSyncPersistenceError('read', error);
   }
@@ -315,17 +494,75 @@ export async function loadTemporarySessionProvenance(): Promise<TemporarySession
 
 export async function saveTemporarySessionProvenance(
   provenance: TemporarySessionProvenance,
+  workspaceLease?: WorkspaceRestoreLease,
 ): Promise<void> {
   try {
-    await (await getDatabase()).put(TEMPORARY_SESSION_STORE, provenance);
+    await withSyncWorkspaceMutation(
+      async () =>
+        void (await getDatabase()).put(
+          TEMPORARY_SESSION_STORE,
+          normalizeTemporarySessionProvenance(provenance),
+        ),
+      workspaceLease,
+    );
   } catch (error) {
     throw new LocalSyncPersistenceError('write', error);
   }
 }
 
-export async function clearTemporarySessionProvenance(): Promise<void> {
+export function normalizeTemporarySessionProvenance(
+  value: unknown,
+): TemporarySessionProvenance {
+  if (!isRecord(value) || value.id !== 'temporary') {
+    throw new Error('Invalid temporary workspace provenance.');
+  }
+  const temporarySessionId = safeOpaqueToken(value.temporarySessionId, 64);
+  const accountId = safeAccountId(value.accountId);
+  const rootFolderId = safeOpaqueToken(value.rootFolderId, 256);
+  const phases = new Set<TemporarySessionProvenance['finishPhase']>([
+    'active',
+    'uploading',
+    'revoking',
+    'cleaning',
+    'cleanup-incomplete',
+  ]);
+  if (
+    !temporarySessionId ||
+    !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(
+      temporarySessionId,
+    ) ||
+    !accountId ||
+    (value.rootFolderId !== undefined && !rootFolderId) ||
+    !validTimestamp(value.createdAt) ||
+    !Array.isArray(value.documentIds) ||
+    !Array.isArray(value.collectionIds) ||
+    !value.documentIds.every((id) => safeOpaqueToken(id, 512) === id) ||
+    !value.collectionIds.every((id) => safeOpaqueToken(id, 512) === id) ||
+    !phases.has(value.finishPhase as TemporarySessionProvenance['finishPhase'])
+  ) {
+    throw new Error('Invalid temporary workspace provenance.');
+  }
+  return {
+    id: 'temporary',
+    temporarySessionId,
+    accountId,
+    ...(rootFolderId ? { rootFolderId } : {}),
+    createdAt: value.createdAt,
+    documentIds: [...new Set(value.documentIds as string[])],
+    collectionIds: [...new Set(value.collectionIds as string[])],
+    finishPhase: value.finishPhase as TemporarySessionProvenance['finishPhase'],
+  };
+}
+
+export async function clearTemporarySessionProvenance(
+  workspaceLease?: WorkspaceRestoreLease,
+): Promise<void> {
   try {
-    await (await getDatabase()).delete(TEMPORARY_SESSION_STORE, 'temporary');
+    await withSyncWorkspaceMutation(
+      async () =>
+        void (await getDatabase()).delete(TEMPORARY_SESSION_STORE, 'temporary'),
+      workspaceLease,
+    );
   } catch (error) {
     throw new LocalSyncPersistenceError('write', error);
   }
@@ -399,19 +636,30 @@ export function normalizeLayoutMigrationRecord(value: unknown): LayoutMigrationR
 
 export async function saveLayoutMigrationRecord(
   record: LayoutMigrationRecord,
+  workspaceLease?: WorkspaceRestoreLease,
 ): Promise<void> {
   try {
-    await (
-      await getDatabase()
-    ).put(LAYOUT_MIGRATION_STORE, normalizeLayoutMigrationRecord(record));
+    await withSyncWorkspaceMutation(
+      async () =>
+        void (await getDatabase()).put(
+          LAYOUT_MIGRATION_STORE,
+          normalizeLayoutMigrationRecord(record),
+        ),
+      workspaceLease,
+    );
   } catch (error) {
     throw new LocalSyncPersistenceError('write', error);
   }
 }
 
-export async function clearLayoutMigrationRecord(): Promise<void> {
+export async function clearLayoutMigrationRecord(
+  workspaceLease?: WorkspaceRestoreLease,
+): Promise<void> {
   try {
-    await (await getDatabase()).delete(LAYOUT_MIGRATION_STORE, 'layout');
+    await withSyncWorkspaceMutation(
+      async () => void (await getDatabase()).delete(LAYOUT_MIGRATION_STORE, 'layout'),
+      workspaceLease,
+    );
   } catch (error) {
     throw new LocalSyncPersistenceError('write', error);
   }
@@ -502,19 +750,30 @@ export function normalizePaperV3MigrationRecord(
 
 export async function savePaperV3MigrationRecord(
   record: PaperV3MigrationRecord,
+  workspaceLease?: WorkspaceRestoreLease,
 ): Promise<void> {
   try {
-    await (
-      await getDatabase()
-    ).put(LAYOUT_MIGRATION_STORE, normalizePaperV3MigrationRecord(record));
+    await withSyncWorkspaceMutation(
+      async () =>
+        void (await getDatabase()).put(
+          LAYOUT_MIGRATION_STORE,
+          normalizePaperV3MigrationRecord(record),
+        ),
+      workspaceLease,
+    );
   } catch (error) {
     throw new LocalSyncPersistenceError('write', error);
   }
 }
 
-export async function clearPaperV3MigrationRecord(): Promise<void> {
+export async function clearPaperV3MigrationRecord(
+  workspaceLease?: WorkspaceRestoreLease,
+): Promise<void> {
   try {
-    await (await getDatabase()).delete(LAYOUT_MIGRATION_STORE, 'paper-v3');
+    await withSyncWorkspaceMutation(
+      async () => void (await getDatabase()).delete(LAYOUT_MIGRATION_STORE, 'paper-v3'),
+      workspaceLease,
+    );
   } catch (error) {
     throw new LocalSyncPersistenceError('write', error);
   }
@@ -522,18 +781,21 @@ export async function clearPaperV3MigrationRecord(): Promise<void> {
 
 export async function deletePaperSyncRecords(
   documentIds: readonly string[],
+  workspaceLease?: WorkspaceRestoreLease,
 ): Promise<void> {
   try {
-    const database = await getDatabase();
-    const transaction = database.transaction(
-      [PAPER_STATE_STORE, CLOUD_PAPER_STORE],
-      'readwrite',
-    );
-    for (const documentId of new Set(documentIds)) {
-      await transaction.objectStore(PAPER_STATE_STORE).delete(documentId);
-      await transaction.objectStore(CLOUD_PAPER_STORE).delete(documentId);
-    }
-    await transaction.done;
+    await withSyncWorkspaceMutation(async () => {
+      const database = await getDatabase();
+      const transaction = database.transaction(
+        [PAPER_STATE_STORE, CLOUD_PAPER_STORE],
+        'readwrite',
+      );
+      for (const documentId of new Set(documentIds)) {
+        await transaction.objectStore(PAPER_STATE_STORE).delete(documentId);
+        await transaction.objectStore(CLOUD_PAPER_STORE).delete(documentId);
+      }
+      await transaction.done;
+    }, workspaceLease);
   } catch (error) {
     throw new LocalSyncPersistenceError('write', error);
   }
@@ -591,19 +853,34 @@ function normalizePaperDeviceProfile(
 ): PaperSyncDeviceProfile {
   const temporaryWorkspace = isTemporaryWorkspaceActive();
   const deviceMode: SyncDeviceMode = temporaryWorkspace ? 'temporary' : 'personal';
-  const accountId = safeText(value.accountId, 256);
-  const rootFolderId = safeText(value.rootFolderId, 256);
+  const accountId = safeAccountId(value.accountId);
+  const workspaceAccountId = safeAccountId(value.workspaceAccountId);
+  const rootFolderId = safeOpaqueToken(value.rootFolderId, 256);
+  if (
+    (value.accountId !== undefined && !accountId) ||
+    (value.workspaceAccountId !== undefined && !workspaceAccountId) ||
+    (value.rootFolderId !== undefined && !rootFolderId)
+  ) {
+    throw new Error('Invalid Google Drive workspace identity metadata.');
+  }
   const cursor = normalizeDriveChangeCursor(value.driveChangeCursor);
+  const cloudIssueQuarantines = temporaryWorkspace
+    ? []
+    : normalizePaperCloudIssueQuarantines(value.cloudIssueQuarantines);
   return {
     id: 'paper-device',
     deviceId: safeText(value.deviceId, 256) ?? crypto.randomUUID(),
     deviceLabel: safeText(value.deviceLabel, 80) ?? 'This device',
     deviceMode,
+    ...(value.deviceModeChoiceConfirmed === true || temporaryWorkspace
+      ? { deviceModeChoiceConfirmed: true as const }
+      : {}),
     autoSync: temporaryWorkspace ? false : value.autoSync !== false,
     ...(isSessionToken(value.googleDeviceSessionToken) && !temporaryWorkspace
       ? { googleDeviceSessionToken: value.googleDeviceSessionToken }
       : {}),
     ...(accountId ? { accountId } : {}),
+    ...(!temporaryWorkspace && workspaceAccountId ? { workspaceAccountId } : {}),
     ...(rootFolderId ? { rootFolderId } : {}),
     ...(cursor &&
     cursor.deviceMode === deviceMode &&
@@ -611,6 +888,7 @@ function normalizePaperDeviceProfile(
     cursor.rootFolderId === rootFolderId
       ? { driveChangeCursor: cursor }
       : {}),
+    ...(cloudIssueQuarantines.length > 0 ? { cloudIssueQuarantines } : {}),
     ...(validTimestamp(value.lastDiscoveryAt)
       ? { lastDiscoveryAt: value.lastDiscoveryAt }
       : {}),
@@ -620,12 +898,68 @@ function normalizePaperDeviceProfile(
   };
 }
 
+function normalizePaperCloudIssueQuarantines(
+  value: unknown,
+): PaperCloudIssueQuarantineEntry[] {
+  if (!Array.isArray(value)) return [];
+  const byScope = new Map<string, PaperCloudIssueQuarantineEntry>();
+  for (const candidate of value) {
+    if (!isRecord(candidate)) continue;
+    const accountId = safeAccountId(candidate.accountId);
+    const rootFolderId = safeOpaqueToken(candidate.rootFolderId, 256);
+    const paperFolderId = safeOpaqueToken(candidate.paperFolderId, 256);
+    const reviewedAt = validTimestamp(candidate.reviewedAt)
+      ? candidate.reviewedAt
+      : undefined;
+    if (
+      candidate.version !== 1 ||
+      !isValidDocumentId(candidate.documentId) ||
+      !accountId ||
+      !rootFolderId ||
+      (candidate.paperFolderId !== undefined && !paperFolderId) ||
+      candidate.reason !== 'presence-control-resolution-failed' ||
+      !validTimestamp(candidate.confirmedAt) ||
+      (candidate.reviewedAt !== undefined &&
+        (reviewedAt === undefined || reviewedAt < candidate.confirmedAt))
+    ) {
+      // A malformed local checkpoint must never suppress cloud validation.
+      continue;
+    }
+    const normalized: PaperCloudIssueQuarantineEntry = {
+      version: 1,
+      documentId: candidate.documentId,
+      accountId,
+      rootFolderId,
+      reason: 'presence-control-resolution-failed',
+      confirmedAt: candidate.confirmedAt,
+      ...(reviewedAt !== undefined ? { reviewedAt } : {}),
+      ...(paperFolderId ? { paperFolderId } : {}),
+    };
+    const key = `${accountId}\u0000${rootFolderId}\u0000${candidate.documentId}`;
+    const existing = byScope.get(key);
+    if (
+      !existing ||
+      (existing.reviewedAt !== undefined && normalized.reviewedAt === undefined) ||
+      (Boolean(existing.reviewedAt) === Boolean(normalized.reviewedAt) &&
+        normalized.confirmedAt < existing.confirmedAt)
+    ) {
+      byScope.set(key, normalized);
+    }
+  }
+  return [...byScope.values()].sort(
+    (first, second) =>
+      first.accountId.localeCompare(second.accountId) ||
+      first.rootFolderId.localeCompare(second.rootFolderId) ||
+      first.documentId.localeCompare(second.documentId),
+  );
+}
+
 function normalizeDriveChangeCursor(
   value: unknown,
 ): PaperDriveChangeCursor | undefined {
   if (!isRecord(value)) return undefined;
-  const accountId = safeText(value.accountId, 256);
-  const rootFolderId = safeText(value.rootFolderId, 256);
+  const accountId = safeAccountId(value.accountId);
+  const rootFolderId = safeOpaqueToken(value.rootFolderId, 256);
   const pageToken = safeOpaqueToken(value.pageToken, 4096);
   if (
     value.version !== 1 ||
@@ -698,6 +1032,7 @@ export function normalizePaperSyncState(value: PaperSyncState): PaperSyncState {
         ),
       ].sort()
     : [];
+  const targetedPurge = normalizeTargetedPaperPurgeCheckpoint(value.targetedPurge);
   if (sourcePdfEvidence) driveFiles.sourcePdfEvidence = sourcePdfEvidence;
   else delete driveFiles.sourcePdfEvidence;
   if (sourceArtifactEvidence) {
@@ -732,13 +1067,49 @@ export function normalizePaperSyncState(value: PaperSyncState): PaperSyncState {
     ...(cloudPresence === 'removed' && value.cloudCleanupPending === true
       ? { cloudCleanupPending: true }
       : {}),
+    ...(targetedPurge ? { targetedPurge } : {}),
   };
   if (dismissedRemoteHeadIds.length) {
     normalized.dismissedRemoteHeadIds = dismissedRemoteHeadIds;
   } else {
     delete normalized.dismissedRemoteHeadIds;
   }
+  if (!targetedPurge) delete normalized.targetedPurge;
   return normalized;
+}
+
+export function normalizeTargetedPaperPurgeCheckpoint(
+  value: unknown,
+): TargetedPaperPurgeCheckpoint | undefined {
+  if (!isRecord(value)) return undefined;
+  const operationId = safeOpaqueToken(value.operationId, 64);
+  const accountId = safeAccountId(value.accountId);
+  const rootFolderId = safeOpaqueToken(value.rootFolderId, 256);
+  const paperFolderId = safeOpaqueToken(value.paperFolderId, 256);
+  if (
+    value.version !== 1 ||
+    !operationId ||
+    !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(
+      operationId,
+    ) ||
+    (value.phase !== 'cloud-cleanup-pending' &&
+      value.phase !== 'local-cleanup-pending') ||
+    !validTimestamp(value.confirmedAt) ||
+    !accountId ||
+    !rootFolderId ||
+    !paperFolderId
+  ) {
+    return undefined;
+  }
+  return {
+    version: 1,
+    operationId,
+    phase: value.phase,
+    confirmedAt: value.confirmedAt,
+    accountId,
+    rootFolderId,
+    paperFolderId,
+  };
 }
 
 function normalizePaperDriveFileEvidence(
@@ -884,8 +1255,26 @@ function safeOpaqueToken(value: unknown, maximum: number): string | undefined {
     : undefined;
 }
 
+function safeAccountId(value: unknown): string | undefined {
+  const accountId = safeOpaqueToken(value, 256);
+  return accountId && accountId.trim() === accountId ? accountId : undefined;
+}
+
 function validTimestamp(value: unknown): value is number {
   return typeof value === 'number' && Number.isFinite(value) && value >= 0;
+}
+
+/**
+ * Keep the sync schema independently loadable while still sharing the one
+ * authoritative document-database restore barrier at mutation time.
+ */
+async function withSyncWorkspaceMutation<T>(
+  task: (lease: WorkspaceRestoreLease) => Promise<T> | T,
+  workspaceLease?: WorkspaceRestoreLease,
+): Promise<T> {
+  const { withWorkspaceMutation } =
+    await import('../services/annotationPersistence.ts');
+  return withWorkspaceMutation(task, workspaceLease);
 }
 
 function getDatabase(): Promise<IDBPDatabase<SyncDatabase>> {
@@ -898,28 +1287,36 @@ function getDatabase(): Promise<IDBPDatabase<SyncDatabase>> {
   }
   if (!databasePromise) {
     openedDatabaseName = databaseName;
-    const opening = openDB<SyncDatabase>(databaseName, SYNC_DATABASE_VERSION, {
-      upgrade(database) {
-        if (!database.objectStoreNames.contains(DEVICE_STORE)) {
-          database.createObjectStore(DEVICE_STORE, { keyPath: 'id' });
-        }
-        if (!database.objectStoreNames.contains(PAPER_DEVICE_STORE)) {
-          database.createObjectStore(PAPER_DEVICE_STORE, { keyPath: 'id' });
-        }
-        if (!database.objectStoreNames.contains(PAPER_STATE_STORE)) {
-          database.createObjectStore(PAPER_STATE_STORE, { keyPath: 'documentId' });
-        }
-        if (!database.objectStoreNames.contains(CLOUD_PAPER_STORE)) {
-          database.createObjectStore(CLOUD_PAPER_STORE, { keyPath: 'documentId' });
-        }
-        if (!database.objectStoreNames.contains(TEMPORARY_SESSION_STORE)) {
-          database.createObjectStore(TEMPORARY_SESSION_STORE, { keyPath: 'id' });
-        }
-        if (!database.objectStoreNames.contains(LAYOUT_MIGRATION_STORE)) {
-          database.createObjectStore(LAYOUT_MIGRATION_STORE, { keyPath: 'id' });
-        }
+    const opening = openDatabaseWithLifecycleSafety<SyncDatabase>(
+      databaseName,
+      SYNC_DATABASE_VERSION,
+      {
+        upgrade(database) {
+          if (!database.objectStoreNames.contains(DEVICE_STORE)) {
+            database.createObjectStore(DEVICE_STORE, { keyPath: 'id' });
+          }
+          if (!database.objectStoreNames.contains(PAPER_DEVICE_STORE)) {
+            database.createObjectStore(PAPER_DEVICE_STORE, { keyPath: 'id' });
+          }
+          if (!database.objectStoreNames.contains(PAPER_STATE_STORE)) {
+            database.createObjectStore(PAPER_STATE_STORE, { keyPath: 'documentId' });
+          }
+          if (!database.objectStoreNames.contains(CLOUD_PAPER_STORE)) {
+            database.createObjectStore(CLOUD_PAPER_STORE, { keyPath: 'documentId' });
+          }
+          if (!database.objectStoreNames.contains(TEMPORARY_SESSION_STORE)) {
+            database.createObjectStore(TEMPORARY_SESSION_STORE, { keyPath: 'id' });
+          }
+          if (!database.objectStoreNames.contains(LAYOUT_MIGRATION_STORE)) {
+            database.createObjectStore(LAYOUT_MIGRATION_STORE, { keyPath: 'id' });
+          }
+        },
+        onConnectionClosed() {
+          databasePromise = null;
+          openedDatabaseName = null;
+        },
       },
-    });
+    );
     databasePromise = opening.catch((error) => {
       databasePromise = null;
       openedDatabaseName = null;

@@ -46,7 +46,7 @@ function commonBase() {
 test('Paper package layout 3 uses an honestly typed source artifact', async () => {
   assert.equal(PAPER_PACKAGE_LAYOUT_VERSION, 3);
   assert.equal(SYNC_LAYOUT_VERSION, 3);
-  assert.equal(PAPER_SYNC_PROTOCOL_VERSION, 2);
+  assert.equal(PAPER_SYNC_PROTOCOL_VERSION, 3);
   assert.equal(PAPER_PRESENCE_PROTOCOL_VERSION, 1);
   const base: PaperManifestBase = {
     ...commonBase(),

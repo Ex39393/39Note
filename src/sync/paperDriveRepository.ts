@@ -1,4 +1,5 @@
 import { getDocumentMimeType, type StoredDocumentSource } from '../types/document.ts';
+import { isSyncCompatibleDocumentId, isValidDocumentId } from '../utils/documentId.ts';
 import type { StoredRenderedPrintPdf } from '../types/productivity.ts';
 import { assertValidPrintPdfBlob } from '../print/renderedPrintPdf.ts';
 import {
@@ -19,7 +20,12 @@ import {
   type DriveFileMetadata,
   type DriveRequestContext,
 } from './driveClient.ts';
-import { compareCanonicalStrings, sha256Hex, stableStringify } from './hash.ts';
+import {
+  compareCanonicalStrings,
+  isSha256,
+  sha256Hex,
+  stableStringify,
+} from './hash.ts';
 import {
   buildLegacyDriveInventory,
   driveMetadataEvidenceHash,
@@ -32,7 +38,10 @@ import {
   SyncBackendUnavailableError,
   SyncServiceRateLimitedError,
 } from './googleIdentity.ts';
-import { mergeSyncSnapshots } from './merge.ts';
+import {
+  mergeSyncSnapshots,
+  preserveLinkNumberHighWaterForKeepLocal,
+} from './merge.ts';
 import {
   assertPaperSnapshot,
   combinePaperPayloads,
@@ -49,6 +58,7 @@ import {
 import {
   LEGACY_PAPER_MANIFEST_STORAGE,
   LEGACY_PAPER_PACKAGE_LAYOUT_VERSION,
+  LEGACY_PAPER_SYNC_PROTOCOL_VERSION,
   PAPER_MANIFEST_STORAGE,
   PAPER_PACKAGE_LAYOUT_VERSION,
   PAPER_PAYLOAD_STORAGE,
@@ -65,6 +75,7 @@ import {
   type RenderedPrintPdfDescriptor,
   type PaperSyncState,
   type PaperTransferProgress,
+  type SupportedPaperSyncProtocolVersion,
 } from './paperTypes.ts';
 import {
   driveRoleForNewSource,
@@ -80,8 +91,11 @@ import {
   isLegacyPaperRootMetadata,
   isOwnedManagedPaperRootMetadata,
   isPaperV2RootMetadata,
+  isPaperV3Protocol2RootMetadata,
   isPaperV3RootMetadata,
+  isPaperV3RootMetadataForProtocol,
   paperRootLayoutVersion,
+  paperRootProtocolVersion,
 } from './paperRootValidation.ts';
 import {
   PAPER_PRESENCE_PROTOCOL_VERSION,
@@ -94,10 +108,16 @@ import {
   PaperPresenceDriveRepository,
   PaperV3ControlIntegrityError,
   type PaperV3MigrationCompletion,
+  type PaperProtocolMigrationCompletion,
+  type TargetedPurgePresenceAncestryDiagnostic,
+  type TargetedPurgePresenceBlockCode,
+  type TargetedPurgePresenceProof,
+  type VerifiedPaperV3Control,
 } from './paperPresenceDriveRepository.ts';
 import { assertNoSecretsInSyncPayload } from './secrets.ts';
 import {
   ConcurrencyGate,
+  PAPER_MANIFEST_READ_CONCURRENCY,
   PAPER_MEDIA_CONCURRENCY,
   PAPER_METADATA_CONCURRENCY,
   PAPER_TRANSFER_CONCURRENCY,
@@ -177,9 +197,11 @@ export interface PaperScopedDiscoveryResult {
   missingDocumentIds: string[];
 }
 
-interface PaperDiscoveryOptions {
+export interface PaperDiscoveryOptions {
   layoutValidated?: boolean;
   reuseVerifiedManifests?: boolean;
+  /** Exact local account/root-scoped exceptions for ordinary discovery only. */
+  ignoredDocumentIds?: readonly string[];
 }
 
 interface PaperPublicationOptions {
@@ -200,9 +222,11 @@ interface PaperPublicationOptions {
 
 export type PaperRepositoryErrorCode =
   | 'layout-upgrade-required'
+  | 'protocol-upgrade-required'
   | 'layout-migration-incomplete'
   | 'layout-migration-proof-invalid'
   | 'unsupported-layout'
+  | 'unsupported-protocol'
   | 'drive-root-missing'
   | 'drive-root-invalid'
   | 'ambiguous-paper-folder'
@@ -214,14 +238,28 @@ export type PaperRepositoryErrorCode =
   | 'paper-presence-invalid'
   | 'paper-removed-from-drive';
 
+interface PaperRepositoryErrorOptions extends ErrorOptions {
+  /** Redacted diagnostic phase; never contains a Drive identity. */
+  diagnosticPhase?: string;
+  /** Stable redacted classifier; never contains a Drive identity. */
+  diagnosticCauseCode?: string;
+}
+
 export class PaperRepositoryError extends Error {
+  readonly diagnosticPhase?: string;
+  readonly diagnosticCauseCode?: string;
+
   constructor(
     readonly code: PaperRepositoryErrorCode,
     message: string,
-    options?: ErrorOptions,
+    options?: PaperRepositoryErrorOptions,
   ) {
     super(message, options);
     this.name = 'PaperRepositoryError';
+    if (options?.diagnosticPhase) this.diagnosticPhase = options.diagnosticPhase;
+    if (options?.diagnosticCauseCode) {
+      this.diagnosticCauseCode = options.diagnosticCauseCode;
+    }
   }
 }
 
@@ -232,6 +270,16 @@ export class PaperLayoutUpgradeRequiredError extends PaperRepositoryError {
       'Drive layout upgrade required. Ordinary paper sync was not started.',
     );
     this.name = 'PaperLayoutUpgradeRequiredError';
+  }
+}
+
+export class PaperProtocolUpgradeRequiredError extends PaperRepositoryError {
+  constructor() {
+    super(
+      'protocol-upgrade-required',
+      'Drive sync protocol upgrade required. Ordinary paper sync was not started.',
+    );
+    this.name = 'PaperProtocolUpgradeRequiredError';
   }
 }
 
@@ -259,6 +307,16 @@ export class PaperUnsupportedLayoutError extends PaperRepositoryError {
       'This Drive library was created by a newer 39Note version. Ordinary sync is paused.',
     );
     this.name = 'PaperUnsupportedLayoutError';
+  }
+}
+
+export class PaperUnsupportedProtocolError extends PaperRepositoryError {
+  constructor(readonly protocolVersion?: number) {
+    super(
+      'unsupported-protocol',
+      'This 39Note version is too old to access this Drive library. Open the latest 39Note version. Do not attempt another Drive upgrade. Ordinary sync is paused.',
+    );
+    this.name = 'PaperUnsupportedProtocolError';
   }
 }
 
@@ -307,10 +365,78 @@ export interface PaperV3MigrationSeed {
   packageHeadIds: string[];
 }
 
+export interface PaperProtocolMigrationResult {
+  completion: PaperProtocolMigrationCompletion;
+  alreadyActive: boolean;
+}
+
 export interface PaperCloudRemovalResult {
   cloud: PaperCloudSummary;
   cleanupPending: boolean;
   cleanupError?: string;
+}
+
+export type TargetedPaperPurgeBlockCode =
+  | TargetedPurgePresenceBlockCode
+  | 'invalid-document-identity'
+  | 'paper-folder-missing'
+  | 'paper-folder-identity-ambiguous'
+  | 'paper-folder-contents-ambiguous';
+
+export interface TargetedPaperPurgeBlocker {
+  code: TargetedPaperPurgeBlockCode;
+  message: string;
+}
+
+export type TargetedPaperPurgeFolderState = 'active' | 'trashed' | 'missing';
+
+/**
+ * Opaque confirmation proof. Exact Drive identities stay inside the repository
+ * boundary and must not be displayed by callers.
+ */
+export interface TargetedPaperPurgeProof {
+  readonly recordId: 'targeted-paper-purge';
+  readonly documentId: string;
+  readonly rootFolderId: string;
+  readonly controlFolderId: string;
+  readonly paperFolderId: string;
+  readonly folderState: TargetedPaperPurgeFolderState;
+  readonly paperTreeFileIds: readonly string[];
+  readonly folderEvidenceFingerprint: string;
+  readonly evidenceFingerprint: string;
+  readonly presence: TargetedPurgePresenceProof;
+}
+
+export interface TargetedPaperPurgeInspection {
+  eligible: boolean;
+  documentId: string;
+  displayName?: string;
+  paperFolderCount: number;
+  paperFileCount: number;
+  validPresenceCount: number;
+  corruptPresenceCount: number;
+  preservedPresenceCount: number;
+  presenceHeadCount: number;
+  presenceState?: PaperPresenceState;
+  folderState?: TargetedPaperPurgeFolderState;
+  proof?: TargetedPaperPurgeProof;
+  blocker?: TargetedPaperPurgeBlocker;
+  ancestryDiagnostic?: TargetedPurgePresenceAncestryDiagnostic;
+}
+
+export interface TargetedPaperPurgeResult extends PaperCloudRemovalResult {
+  corruptPresenceFilesTrashed: number;
+  folderState: TargetedPaperPurgeFolderState;
+}
+
+interface TargetedPaperFolderInspection {
+  state: TargetedPaperPurgeFolderState;
+  folder?: DriveFileMetadata;
+  tree: DriveFileMetadata[];
+  paperFolderCount: number;
+  paperFileCount: number;
+  fingerprint: string;
+  blocker?: TargetedPaperPurgeBlocker;
 }
 
 export interface PaperDownloadOperationCache {
@@ -481,26 +607,55 @@ export interface PaperFolderNameNormalizationResult {
 
 export class PaperDriveRepository {
   private readonly now: () => number;
+  private readonly supportedPaperSyncProtocolVersion: SupportedPaperSyncProtocolVersion;
   private readonly presence: PaperPresenceDriveRepository;
-  /** Bounds media GETs across concurrent paper operations sharing this repository. */
+  /** Bounds tiny immutable manifest GETs across concurrent paper histories. */
+  private readonly manifestReadGate = new ConcurrencyGate(
+    PAPER_MANIFEST_READ_CONCURRENCY,
+  );
+  /** Bounds payload and source-document GETs across concurrent paper operations. */
   private readonly mediaGate = new ConcurrencyGate(PAPER_MEDIA_CONCURRENCY);
   /** Root-scoped, non-authoritative cache; every reuse requires fresh Drive metadata. */
   private readonly verifiedManifestCache = new Map<
     string,
     VerifiedManifestCacheEntry
   >();
+  private verifiedProtocolContext:
+    | {
+        protocolVersion: SupportedPaperSyncProtocolVersion;
+        migrationCompletion?: PaperProtocolMigrationCompletion;
+      }
+    | undefined;
 
   constructor(
     private readonly drive: DriveClient,
     readonly rootFolderId: string,
-    options: { now?: () => number } = {},
+    options: {
+      now?: () => number;
+      supportedPaperSyncProtocolVersion?: SupportedPaperSyncProtocolVersion;
+    } = {},
   ) {
     if (!isSafeDriveId(rootFolderId)) throw new Error('Invalid Drive root identity.');
     this.now = options.now ?? Date.now;
+    this.supportedPaperSyncProtocolVersion =
+      options.supportedPaperSyncProtocolVersion ?? PAPER_SYNC_PROTOCOL_VERSION;
     this.presence = new PaperPresenceDriveRepository(drive, rootFolderId, this.now);
   }
 
+  private retainVerifiedProtocolContext(
+    protocolVersion: SupportedPaperSyncProtocolVersion,
+    verified: VerifiedPaperV3Control,
+  ): void {
+    this.verifiedProtocolContext = {
+      protocolVersion,
+      ...(verified.protocolMigrationCompletion
+        ? { migrationCompletion: verified.protocolMigrationCompletion }
+        : {}),
+    };
+  }
+
   async detectLayout(signal: AbortSignal): Promise<PaperLayoutInspection> {
+    this.verifiedProtocolContext = undefined;
     const root = await this.drive.getMetadata(this.rootFolderId, signal, {
       phase: 'layout-validation',
       resource: 'root',
@@ -524,6 +679,7 @@ export class PaperDriveRepository {
         !legacy.includes(file) && !paper.includes(file) && !control.includes(file),
     );
     const detectedLayoutVersion = paperRootLayoutVersion(root);
+    const detectedPaperSyncProtocolVersion = paperRootProtocolVersion(root);
     let state: PaperLayoutInspection['state'];
     if (
       detectedLayoutVersion !== undefined &&
@@ -531,21 +687,66 @@ export class PaperDriveRepository {
         detectedLayoutVersion > SYNC_LAYOUT_VERSION)
     ) {
       state = 'unsupported-layout';
-    } else if (isPaperV3RootMetadata(root)) {
+    } else if (
+      detectedPaperSyncProtocolVersion !== undefined &&
+      Number.isSafeInteger(detectedPaperSyncProtocolVersion) &&
+      detectedPaperSyncProtocolVersion > this.supportedPaperSyncProtocolVersion
+    ) {
+      state = 'unsupported-protocol';
+    } else if (
+      isPaperV3RootMetadataForProtocol(root, this.supportedPaperSyncProtocolVersion)
+    ) {
       try {
-        await this.presence.verifyActivatedControl(
+        const verifiedControl = await this.presence.verifyActivatedControl(
           root.appProperties!.controlFolderId,
           root.appProperties!.migrationCompletionId,
           signal,
+          root.appProperties!.protocolMigrationCompletionId,
+          this.supportedPaperSyncProtocolVersion,
+        );
+        this.retainVerifiedProtocolContext(
+          this.supportedPaperSyncProtocolVersion,
+          verifiedControl,
         );
         state = 'paper-v3';
       } catch (error) {
+        signal.throwIfAborted();
+        if (isDriveOperationFailure(error)) throw error;
+        state = 'migration-incomplete';
+      }
+    } else if (
+      this.supportedPaperSyncProtocolVersion === PAPER_SYNC_PROTOCOL_VERSION &&
+      isPaperV3Protocol2RootMetadata(root)
+    ) {
+      try {
+        const verifiedControl = await this.presence.verifyActivatedControl(
+          root.appProperties!.controlFolderId,
+          root.appProperties!.migrationCompletionId,
+          signal,
+          undefined,
+          LEGACY_PAPER_SYNC_PROTOCOL_VERSION,
+        );
+        this.retainVerifiedProtocolContext(
+          LEGACY_PAPER_SYNC_PROTOCOL_VERSION,
+          verifiedControl,
+        );
+        state = 'protocol-upgrade-required';
+      } catch (error) {
+        signal.throwIfAborted();
         if (isDriveOperationFailure(error)) throw error;
         state = 'migration-incomplete';
       }
     } else if (detectedLayoutVersion === SYNC_LAYOUT_VERSION) {
       state = 'migration-incomplete';
     } else if (isPaperV2RootMetadata(root)) {
+      if (
+        detectedPaperSyncProtocolVersion === LEGACY_PAPER_SYNC_PROTOCOL_VERSION ||
+        detectedPaperSyncProtocolVersion === PAPER_SYNC_PROTOCOL_VERSION
+      ) {
+        this.verifiedProtocolContext = {
+          protocolVersion: detectedPaperSyncProtocolVersion,
+        };
+      }
       state = control.length > 0 ? 'migration-incomplete' : 'paper-v2-upgrade-required';
     } else if (isLegacyPaperRootMetadata(root)) {
       state =
@@ -571,6 +772,10 @@ export class PaperDriveRepository {
       ...(detectedLayoutVersion !== undefined &&
       Number.isSafeInteger(detectedLayoutVersion)
         ? { detectedLayoutVersion }
+        : {}),
+      ...(detectedPaperSyncProtocolVersion !== undefined &&
+      Number.isSafeInteger(detectedPaperSyncProtocolVersion)
+        ? { detectedPaperSyncProtocolVersion }
         : {}),
     };
   }
@@ -620,6 +825,7 @@ export class PaperDriveRepository {
               true,
             );
           } catch (error) {
+            signal.throwIfAborted();
             if (isDriveOperationFailure(error)) throw error;
             return undefined;
           }
@@ -847,6 +1053,7 @@ export class PaperDriveRepository {
           }
         }
       } catch (error) {
+        signal.throwIfAborted();
         if (isDriveOperationFailure(error)) throw error;
         currentDataVerified = false;
       }
@@ -970,8 +1177,12 @@ export class PaperDriveRepository {
     if (inspection.state === 'paper-v3') return;
     if (
       inspection.state === 'legacy-upgrade-required' ||
-      inspection.state === 'paper-v2-upgrade-required'
+      inspection.state === 'paper-v2-upgrade-required' ||
+      inspection.state === 'protocol-upgrade-required'
     ) {
+      if (inspection.state === 'protocol-upgrade-required') {
+        throw new PaperProtocolUpgradeRequiredError();
+      }
       throw new PaperLayoutUpgradeRequiredError();
     }
     if (inspection.state === 'migration-incomplete') {
@@ -979,6 +1190,11 @@ export class PaperDriveRepository {
     }
     if (inspection.state === 'unsupported-layout') {
       throw new PaperUnsupportedLayoutError(inspection.detectedLayoutVersion);
+    }
+    if (inspection.state === 'unsupported-protocol') {
+      throw new PaperUnsupportedProtocolError(
+        inspection.detectedPaperSyncProtocolVersion,
+      );
     }
     const control = await this.presence.createOrVerifyControlFolder(signal);
     const completion = await this.presence.ensureMigrationCompletion(
@@ -1112,6 +1328,18 @@ export class PaperDriveRepository {
         'The selected Drive root is not an exact Paper-v2 layout.',
       );
     }
+    const sourceProtocolVersion = paperRootProtocolVersion(root);
+    if (
+      sourceProtocolVersion !== LEGACY_PAPER_SYNC_PROTOCOL_VERSION &&
+      sourceProtocolVersion !== PAPER_SYNC_PROTOCOL_VERSION
+    ) {
+      throw new PaperLayoutMigrationProofError(
+        'The Paper-v2 root has an unsupported paper sync protocol.',
+      );
+    }
+    this.verifiedProtocolContext = {
+      protocolVersion: sourceProtocolVersion,
+    };
     return this.discoverPhysicalPapers(states, signal, {});
   }
 
@@ -1150,6 +1378,7 @@ export class PaperDriveRepository {
           );
           return await this.summaryForResolved(resolved, state);
         } catch (error) {
+          signal.throwIfAborted();
           if (isDriveOperationFailure(error)) throw error;
           return failedPaperSummary(matches[0], documentId, state, error);
         }
@@ -1168,7 +1397,10 @@ export class PaperDriveRepository {
     options: PaperDiscoveryOptions = {},
   ): Promise<PaperScopedDiscoveryResult> {
     if (!options.layoutValidated) await this.ensureUsableLayout(signal);
-    const requested = [...new Set(documentIds)].sort(compareCanonicalStrings);
+    const ignoredDocumentIds = validatedIgnoredDocumentIds(options.ignoredDocumentIds);
+    const requested = [...new Set(documentIds)]
+      .filter((documentId) => !ignoredDocumentIds.has(documentId))
+      .sort(compareCanonicalStrings);
     const papers = await this.discoverPresenceAware(states, signal, requested, {
       ...options,
       // Scoped invalidation always performs fresh Drive metadata reads, so a
@@ -1188,6 +1420,7 @@ export class PaperDriveRepository {
     requestedDocumentIds: readonly string[] | undefined,
     options: PaperDiscoveryOptions,
   ): Promise<PaperCloudSummary[]> {
+    const ignoredDocumentIds = validatedIgnoredDocumentIds(options.ignoredDocumentIds);
     const root = await this.requireActiveV3Root(signal, !options.layoutValidated);
     const controlFolderId = root.appProperties!.controlFolderId;
     let presenceByDocument: Map<string, ResolvedPaperPresence>;
@@ -1201,6 +1434,7 @@ export class PaperDriveRepository {
               documentId,
               await this.presence.resolveDocument(controlFolderId, documentId, signal, {
                 controlValidated: true,
+                ignoredDocumentIds: options.ignoredDocumentIds,
               }),
             ] as const,
         );
@@ -1213,25 +1447,35 @@ export class PaperDriveRepository {
       } else {
         presenceByDocument = await this.presence.resolveAll(controlFolderId, signal, {
           controlValidated: true,
+          ignoredDocumentIds: options.ignoredDocumentIds,
         });
       }
     } catch (error) {
+      signal.throwIfAborted();
       if (isDriveOperationFailure(error)) throw error;
       throw new PaperRepositoryError(
         'paper-presence-invalid',
         'The Drive paper-presence control data needs verification.',
-        { cause: error },
+        {
+          cause: error,
+          diagnosticPhase: 'paper-presence-resolution',
+          diagnosticCauseCode: 'presence-control-resolution-failed',
+        },
       );
     }
-    const folders = requestedDocumentIds
-      ? (
-          await mapWithConcurrency(
-            requestedDocumentIds,
-            PAPER_METADATA_CONCURRENCY,
-            (documentId) => this.listPaperFolders(signal, documentId),
-          )
-        ).flat()
-      : await this.listPaperFolders(signal);
+    const folders = (
+      requestedDocumentIds
+        ? (
+            await mapWithConcurrency(
+              requestedDocumentIds,
+              PAPER_METADATA_CONCURRENCY,
+              (documentId) => this.listPaperFolders(signal, documentId),
+            )
+          ).flat()
+        : await this.listPaperFolders(signal)
+    ).filter(
+      (folder) => !ignoredDocumentIds.has(folder.appProperties?.documentId ?? ''),
+    );
     const grouped = groupByDocumentId(folders);
     const stateByDocument = new Map(
       (states ?? []).map((state) => [state.documentId, state]),
@@ -1241,6 +1485,7 @@ export class PaperDriveRepository {
         ...new Set([...presenceByDocument.keys(), ...grouped.keys()]),
       ]
     )
+      .filter((documentId) => !ignoredDocumentIds.has(documentId))
       .slice()
       .sort(compareCanonicalStrings);
 
@@ -1261,6 +1506,10 @@ export class PaperDriveRepository {
             new PaperRepositoryError(
               'paper-presence-invalid',
               'A v3 paper folder has no authoritative presence state.',
+              {
+                diagnosticPhase: 'paper-presence-resolution',
+                diagnosticCauseCode: 'authoritative-presence-missing',
+              },
             ),
           );
         }
@@ -1287,6 +1536,16 @@ export class PaperDriveRepository {
             new PaperRepositoryError(
               matches.length > 1 ? 'ambiguous-paper-folder' : 'paper-presence-invalid',
               'The present paper does not have one exact recognized folder.',
+              {
+                diagnosticPhase: 'paper-presence-folder-resolution',
+                diagnosticCauseCode: !presence.paperFolderId
+                  ? 'presence-folder-id-missing'
+                  : matches.length === 0
+                    ? 'presence-folder-missing'
+                    : matches.length > 1
+                      ? 'multiple-managed-paper-folders'
+                      : 'presence-folder-id-mismatch',
+              },
             ),
           );
         }
@@ -1309,6 +1568,7 @@ export class PaperDriveRepository {
             ].filter((id, index, values) => values.indexOf(id) === index),
           };
         } catch (error) {
+          signal.throwIfAborted();
           if (isDriveOperationFailure(error)) throw error;
           return failedPaperSummary(matches[0], documentId, state, error);
         }
@@ -1335,6 +1595,7 @@ export class PaperDriveRepository {
       resource: 'root',
     });
     const detected = paperRootLayoutVersion(root);
+    const detectedProtocol = paperRootProtocolVersion(root);
     if (
       root.id === this.rootFolderId &&
       isOwnedManagedPaperRootMetadata(root) &&
@@ -1344,7 +1605,17 @@ export class PaperDriveRepository {
     ) {
       throw new PaperUnsupportedLayoutError(detected);
     }
-    if (root.id !== this.rootFolderId || !isPaperV3RootMetadata(root)) {
+    if (
+      detectedProtocol !== undefined &&
+      Number.isSafeInteger(detectedProtocol) &&
+      detectedProtocol > this.supportedPaperSyncProtocolVersion
+    ) {
+      throw new PaperUnsupportedProtocolError(detectedProtocol);
+    }
+    if (
+      root.id !== this.rootFolderId ||
+      !isPaperV3RootMetadataForProtocol(root, this.supportedPaperSyncProtocolVersion)
+    ) {
       throw new PaperRepositoryError(
         'drive-root-invalid',
         'The selected Google Drive folder is not an active 39Note sync root.',
@@ -1352,12 +1623,19 @@ export class PaperDriveRepository {
     }
     if (verifyControl) {
       try {
-        await this.presence.verifyActivatedControl(
+        const verifiedControl = await this.presence.verifyActivatedControl(
           root.appProperties!.controlFolderId,
           root.appProperties!.migrationCompletionId,
           signal,
+          root.appProperties!.protocolMigrationCompletionId,
+          this.supportedPaperSyncProtocolVersion,
+        );
+        this.retainVerifiedProtocolContext(
+          this.supportedPaperSyncProtocolVersion,
+          verifiedControl,
         );
       } catch (error) {
+        signal.throwIfAborted();
         if (isDriveOperationFailure(error)) throw error;
         throw new PaperRepositoryError(
           'paper-presence-invalid',
@@ -1800,6 +2078,7 @@ export class PaperDriveRepository {
           selectedPresence.documentId,
         )
         .catch((error: unknown) => {
+          signal.throwIfAborted();
           if (isDriveOperationFailure(error)) throw error;
           throw new PaperRemoteChangedError(
             selectedPresence.documentId,
@@ -2423,6 +2702,227 @@ export class PaperDriveRepository {
     return withPresence(result, authorizedPresence);
   }
 
+  /**
+   * Builds a read-only, exact-document confirmation proof for the exceptional
+   * recovery path where corrupt presence content prevents ordinary removal.
+   * No Drive mutation occurs here.
+   */
+  async inspectTargetedPaperPurge(
+    documentId: string,
+    signal: AbortSignal,
+  ): Promise<TargetedPaperPurgeInspection> {
+    if (!isValidDocumentId(documentId)) {
+      return targetedPaperPurgeBlocked(
+        documentId,
+        'invalid-document-identity',
+        'The selected paper identity is invalid.',
+      );
+    }
+    const root = await this.requireActiveV3Root(signal, true, {
+      phase: 'targeted-purge-root-validation',
+      dependencyPhase: 'root-layout-guard',
+      documentId,
+    });
+    const controlFolderId = root.appProperties!.controlFolderId;
+    const presence = await this.presence.inspectTargetedPurgePresence(
+      controlFolderId,
+      documentId,
+      signal,
+      { controlValidated: true },
+    );
+    const base = {
+      documentId,
+      validPresenceCount: presence.validPresenceCount,
+      corruptPresenceCount: presence.corruptPresenceCount,
+      preservedPresenceCount: presence.preservedPresenceCount,
+      presenceHeadCount: presence.presenceHeadCount,
+      ...(presence.presenceState ? { presenceState: presence.presenceState } : {}),
+      ...(presence.displayName ? { displayName: presence.displayName } : {}),
+      ...(presence.ancestryDiagnostic
+        ? { ancestryDiagnostic: presence.ancestryDiagnostic }
+        : {}),
+    };
+    if (!presence.eligible || !presence.proof || !presence.paperFolderId) {
+      return {
+        eligible: false,
+        ...base,
+        paperFolderCount: 0,
+        paperFileCount: 0,
+        blocker: presence.blocker ?? {
+          code: 'presence-validation-failed',
+          message: 'The paper presence state cannot be proven safe for targeted purge.',
+        },
+      };
+    }
+    const folder = await this.inspectTargetedPaperFolder(
+      documentId,
+      presence.paperFolderId,
+      presence.presenceState!,
+      signal,
+    );
+    if (folder.blocker) {
+      return {
+        eligible: false,
+        ...base,
+        paperFolderCount: folder.paperFolderCount,
+        paperFileCount: folder.paperFileCount,
+        folderState: folder.state,
+        blocker: folder.blocker,
+      };
+    }
+    const evidenceFingerprint = await sha256Hex(
+      stableStringify({
+        recordId: 'targeted-paper-purge',
+        documentId,
+        rootFolderId: this.rootFolderId,
+        controlFolderId,
+        paperFolderId: presence.paperFolderId,
+        folderState: folder.state,
+        folderEvidenceFingerprint: folder.fingerprint,
+        presenceEvidenceFingerprint: presence.proof.evidenceFingerprint,
+      }),
+    );
+    const proof: TargetedPaperPurgeProof = {
+      recordId: 'targeted-paper-purge',
+      documentId,
+      rootFolderId: this.rootFolderId,
+      controlFolderId,
+      paperFolderId: presence.paperFolderId,
+      folderState: folder.state,
+      paperTreeFileIds: folder.tree.map(({ id }) => id).sort(compareCanonicalStrings),
+      folderEvidenceFingerprint: folder.fingerprint,
+      evidenceFingerprint,
+      presence: presence.proof,
+    };
+    return {
+      eligible: true,
+      ...base,
+      paperFolderCount: folder.paperFolderCount,
+      paperFileCount: folder.paperFileCount,
+      folderState: folder.state,
+      proof,
+    };
+  }
+
+  /**
+   * Executes only a just-confirmed frozen proof. A normal removed tombstone is
+   * authoritative before any corrupt presence artifact or paper folder is
+   * moved to Trash. Partial cleanup is intentionally retryable.
+   */
+  async executeTargetedPaperPurge(
+    proof: TargetedPaperPurgeProof,
+    writer: PaperPresenceWriter,
+    signal: AbortSignal,
+  ): Promise<TargetedPaperPurgeResult> {
+    assertTargetedPaperPurgeProof(proof, this.rootFolderId);
+    const current = await this.inspectTargetedPaperPurge(proof.documentId, signal);
+    if (
+      !current.eligible ||
+      !current.proof ||
+      !sameTargetedPaperPurgeProof(current.proof, proof)
+    ) {
+      throw new PaperRepositoryError(
+        'paper-presence-invalid',
+        'The targeted purge scope changed after confirmation. Nothing was removed.',
+      );
+    }
+    const presenceResult = await this.presence.executeTargetedPurgePresence(
+      proof.presence,
+      writer,
+      signal,
+      () =>
+        this.assertControlRootGuard(proof.controlFolderId, proof.documentId, signal),
+    );
+    const folderBeforeCleanup = await this.inspectTargetedPaperFolder(
+      proof.documentId,
+      proof.paperFolderId,
+      'removed',
+      signal,
+    );
+    const pendingFolder =
+      folderBeforeCleanup.state === 'active' && folderBeforeCleanup.folder
+        ? [folderBeforeCleanup.folder]
+        : [];
+    const pendingSummary = async (cleanupPending: boolean) => ({
+      ...(await removedPaperSummary(
+        presenceResult.presence,
+        undefined,
+        cleanupPending ? pendingFolder : [],
+        false,
+      )),
+      displayName: proof.presence.displayName,
+      cleanupPending,
+    });
+    if (presenceResult.cleanupPending) {
+      return {
+        cloud: await pendingSummary(true),
+        cleanupPending: true,
+        cleanupError: presenceResult.cleanupError,
+        corruptPresenceFilesTrashed: presenceResult.corruptPresenceFilesTrashed,
+        folderState: folderBeforeCleanup.state,
+      };
+    }
+    if (
+      folderBeforeCleanup.blocker ||
+      folderBeforeCleanup.fingerprint !== proof.folderEvidenceFingerprint ||
+      !sameStringSet(
+        folderBeforeCleanup.tree.map(({ id }) => id),
+        proof.paperTreeFileIds,
+      )
+    ) {
+      return {
+        cloud: await pendingSummary(true),
+        cleanupPending: true,
+        cleanupError:
+          folderBeforeCleanup.blocker?.message ??
+          'The exact paper folder changed before cleanup. It was preserved.',
+        corruptPresenceFilesTrashed: presenceResult.corruptPresenceFilesTrashed,
+        folderState: folderBeforeCleanup.state,
+      };
+    }
+    if (folderBeforeCleanup.state !== 'active' || !folderBeforeCleanup.folder) {
+      return {
+        cloud: await pendingSummary(false),
+        cleanupPending: false,
+        corruptPresenceFilesTrashed: presenceResult.corruptPresenceFilesTrashed,
+        folderState: folderBeforeCleanup.state,
+      };
+    }
+    try {
+      const trashed = await this.drive.trashManagedPaperFolder(
+        folderBeforeCleanup.folder.id,
+        signal,
+        {
+          phase: 'targeted-purge-folder-cleanup',
+          resource: 'paper-folder',
+          documentId: proof.documentId,
+        },
+      );
+      if (trashed.id !== proof.paperFolderId || trashed.trashed !== true) {
+        throw new Error(
+          'Google Drive did not confirm that the exact paper folder was moved to Trash.',
+        );
+      }
+      return {
+        cloud: await pendingSummary(false),
+        cleanupPending: false,
+        corruptPresenceFilesTrashed: presenceResult.corruptPresenceFilesTrashed,
+        folderState: 'trashed',
+      };
+    } catch (error) {
+      return {
+        cloud: await pendingSummary(true),
+        cleanupPending: true,
+        cleanupError:
+          error instanceof Error
+            ? error.message
+            : 'The exact paper folder cleanup did not finish.',
+        corruptPresenceFilesTrashed: presenceResult.corruptPresenceFilesTrashed,
+        folderState: 'active',
+      };
+    }
+  }
+
   async removePaperFromDrive(
     summary: PaperCloudSummary,
     writer: PaperPresenceWriter,
@@ -2591,7 +3091,16 @@ export class PaperDriveRepository {
         `Paper ${failed.documentId} could not be verified for the v3 migration.`,
       );
     }
-    const control = await this.presence.createOrVerifyControlFolder(signal);
+    const sourceProtocolVersion = this.verifiedProtocolContext?.protocolVersion;
+    if (!sourceProtocolVersion) {
+      throw new PaperLayoutMigrationProofError(
+        'The Paper-v2 protocol boundary was not verified.',
+      );
+    }
+    const control = await this.presence.createOrVerifyControlFolder(
+      signal,
+      sourceProtocolVersion,
+    );
     return { controlFolderId: control.id, papers };
   }
 
@@ -2651,9 +3160,26 @@ export class PaperDriveRepository {
       phase: 'v3-migration-activation',
       resource: 'root',
     });
-    if (!isPaperV2RootMetadata(root) && !isPaperV3RootMetadata(root)) {
+    if (
+      !isPaperV2RootMetadata(root) &&
+      !isPaperV3Protocol2RootMetadata(root) &&
+      !isPaperV3RootMetadata(root)
+    ) {
       throw new PaperLayoutMigrationProofError(
         'The root changed before the v3 migration could activate.',
+      );
+    }
+    const activationProtocolVersion = isPaperV2RootMetadata(root)
+      ? paperRootProtocolVersion(root)
+      : isPaperV3Protocol2RootMetadata(root)
+        ? LEGACY_PAPER_SYNC_PROTOCOL_VERSION
+        : PAPER_SYNC_PROTOCOL_VERSION;
+    if (
+      activationProtocolVersion !== LEGACY_PAPER_SYNC_PROTOCOL_VERSION &&
+      activationProtocolVersion !== PAPER_SYNC_PROTOCOL_VERSION
+    ) {
+      throw new PaperLayoutMigrationProofError(
+        'The root has an unsupported paper sync protocol.',
       );
     }
     if (isPaperV2RootMetadata(root)) {
@@ -2698,10 +3224,371 @@ export class PaperDriveRepository {
       presenceGenerations,
       writer.deviceId,
       signal,
+      2,
+      activationProtocolVersion,
     );
-    await this.activateV3RootMetadata(controlFolderId, completion.id, signal, false);
+    await this.activateV3RootMetadata(
+      controlFolderId,
+      completion.id,
+      signal,
+      false,
+      activationProtocolVersion,
+    );
+    if (activationProtocolVersion === LEGACY_PAPER_SYNC_PROTOCOL_VERSION) {
+      await this.upgradePaperSyncProtocol(writer, signal);
+    }
     await this.assertActiveRoot(signal);
     return completion;
+  }
+
+  /**
+   * Verifies an active root-layout-3 protocol-2 realm and activates protocol 3.
+   * Immutable protocol-2 objects are read in place; the root marker is the final
+   * write and therefore the authoritative released-client publication guard.
+   */
+  async upgradePaperSyncProtocol(
+    writer: PaperPresenceWriter,
+    signal: AbortSignal,
+  ): Promise<PaperProtocolMigrationResult> {
+    const initialRoot = await this.drive.getMetadata(this.rootFolderId, signal, {
+      phase: 'protocol-migration-root-validation',
+      resource: 'root',
+    });
+    const detectedProtocol = paperRootProtocolVersion(initialRoot);
+    if (
+      detectedProtocol !== undefined &&
+      Number.isSafeInteger(detectedProtocol) &&
+      detectedProtocol > this.supportedPaperSyncProtocolVersion
+    ) {
+      throw new PaperUnsupportedProtocolError(detectedProtocol);
+    }
+    if (isPaperV3RootMetadata(initialRoot)) {
+      const completionId = initialRoot.appProperties!.protocolMigrationCompletionId;
+      if (!completionId) {
+        throw new PaperV3ControlIntegrityError(
+          'This protocol-3 root has no protocol-2 migration evidence.',
+        );
+      }
+      const verifiedControl = await this.presence.verifyActivatedControl(
+        initialRoot.appProperties!.controlFolderId,
+        initialRoot.appProperties!.migrationCompletionId,
+        signal,
+        completionId,
+      );
+      this.retainVerifiedProtocolContext(PAPER_SYNC_PROTOCOL_VERSION, verifiedControl);
+      return {
+        completion: await this.presence.verifyProtocolMigrationCompletion(
+          initialRoot.appProperties!.controlFolderId,
+          completionId,
+          signal,
+        ),
+        alreadyActive: true,
+      };
+    }
+    if (!isPaperV3Protocol2RootMetadata(initialRoot)) {
+      throw new PaperProtocolUpgradeRequiredError();
+    }
+
+    const controlFolderId = initialRoot.appProperties!.controlFolderId;
+    const layoutMigrationCompletionId =
+      initialRoot.appProperties!.migrationCompletionId;
+    const verifiedProtocol2Control = await this.presence.verifyActivatedControl(
+      controlFolderId,
+      layoutMigrationCompletionId,
+      signal,
+      undefined,
+      LEGACY_PAPER_SYNC_PROTOCOL_VERSION,
+    );
+    this.retainVerifiedProtocolContext(
+      LEGACY_PAPER_SYNC_PROTOCOL_VERSION,
+      verifiedProtocol2Control,
+    );
+    const papers = await this.verifyProtocol2Realm(
+      controlFolderId,
+      layoutMigrationCompletionId,
+      signal,
+    );
+    const completion = await this.presence.ensureProtocolMigrationCompletion(
+      controlFolderId,
+      layoutMigrationCompletionId,
+      papers,
+      writer.deviceId,
+      signal,
+    );
+    await this.presence.verifyProtocolMigrationCompletion(
+      controlFolderId,
+      completion.id,
+      signal,
+    );
+
+    // Commit guard: recompute the complete current realm immediately before
+    // the one authoritative root mutation.
+    const guardedRoot = await this.drive.getMetadata(this.rootFolderId, signal, {
+      phase: 'protocol-migration-commit-guard',
+      resource: 'root',
+    });
+    if (
+      !isPaperV3Protocol2RootMetadata(guardedRoot) ||
+      guardedRoot.appProperties!.controlFolderId !== controlFolderId ||
+      guardedRoot.appProperties!.migrationCompletionId !== layoutMigrationCompletionId
+    ) {
+      throw new PaperRemoteChangedError('protocol-migration');
+    }
+    const guardedPapers = await this.verifyProtocol2Realm(
+      controlFolderId,
+      layoutMigrationCompletionId,
+      signal,
+    );
+    if (stableStringify(guardedPapers) !== stableStringify(completion.papers)) {
+      throw new PaperRemoteChangedError('protocol-migration');
+    }
+    await this.presence.verifyProtocolMigrationCompletion(
+      controlFolderId,
+      completion.id,
+      signal,
+    );
+
+    const updated = await this.drive.updateMetadata(
+      guardedRoot.id,
+      {
+        appProperties: {
+          ...guardedRoot.appProperties!,
+          paperProtocolVersion: String(PAPER_SYNC_PROTOCOL_VERSION),
+          protocolMigrationCompletionId: completion.id,
+        },
+      },
+      signal,
+      { phase: 'protocol-migration-root-activation', resource: 'root' },
+    );
+    if (updated.id !== guardedRoot.id) {
+      throw new PaperV3ControlIntegrityError(
+        'Google Drive changed the protocol migration root identity.',
+      );
+    }
+    const verifiedRoot = await this.drive.getMetadata(guardedRoot.id, signal, {
+      phase: 'protocol-migration-root-verification',
+      resource: 'root',
+    });
+    if (
+      !isPaperV3RootMetadata(verifiedRoot) ||
+      verifiedRoot.appProperties!.controlFolderId !== controlFolderId ||
+      verifiedRoot.appProperties!.migrationCompletionId !==
+        layoutMigrationCompletionId ||
+      verifiedRoot.appProperties!.protocolMigrationCompletionId !== completion.id
+    ) {
+      throw new PaperV3ControlIntegrityError(
+        'Google Drive did not retain the exact protocol-3 root activation.',
+      );
+    }
+    const verifiedControl = await this.presence.verifyActivatedControl(
+      controlFolderId,
+      layoutMigrationCompletionId,
+      signal,
+      completion.id,
+    );
+    this.retainVerifiedProtocolContext(PAPER_SYNC_PROTOCOL_VERSION, verifiedControl);
+    return { completion, alreadyActive: false };
+  }
+
+  private async verifyProtocol2Realm(
+    controlFolderId: string,
+    layoutMigrationCompletionId: string,
+    signal: AbortSignal,
+  ): Promise<PaperProtocolMigrationCompletion['papers']> {
+    const verifiedProtocol2Control = await this.presence.verifyActivatedControl(
+      controlFolderId,
+      layoutMigrationCompletionId,
+      signal,
+      undefined,
+      LEGACY_PAPER_SYNC_PROTOCOL_VERSION,
+    );
+    this.retainVerifiedProtocolContext(
+      LEGACY_PAPER_SYNC_PROTOCOL_VERSION,
+      verifiedProtocol2Control,
+    );
+    const [presenceByDocument, activeFolders] = await Promise.all([
+      this.presence.resolveAll(controlFolderId, signal, {
+        controlValidated: true,
+      }),
+      this.listPaperFolders(signal),
+    ]);
+    const selectedFolderIds = new Set(
+      [...presenceByDocument.values()].flatMap(({ paperFolderId }) =>
+        paperFolderId ? [paperFolderId] : [],
+      ),
+    );
+    if (
+      [...presenceByDocument.values()].some(({ paperFolderId }) => !paperFolderId) ||
+      selectedFolderIds.size !== presenceByDocument.size ||
+      activeFolders.some((folder) => !selectedFolderIds.has(folder.id))
+    ) {
+      throw new PaperLayoutMigrationProofError(
+        'The protocol-2 paper realm contains an ambiguous current folder.',
+      );
+    }
+
+    const verified = await mapWithConcurrency(
+      [...presenceByDocument.entries()].sort(([first], [second]) =>
+        compareCanonicalStrings(first, second),
+      ),
+      PAPER_METADATA_CONCURRENCY,
+      async ([documentId, presence]) => {
+        signal.throwIfAborted();
+        if (!presence.paperFolderId) {
+          throw new PaperLayoutMigrationProofError(
+            `Paper ${documentId} has ambiguous protocol-2 presence.`,
+          );
+        }
+        const folder = await this.drive.getMetadata(presence.paperFolderId, signal);
+        if (
+          !isOwnedPaperFolderIdentity(folder, this.rootFolderId, documentId) ||
+          folder.parents?.length !== 1 ||
+          folder.parents[0] !== this.rootFolderId ||
+          folder.appProperties?.paperProtocolVersion !==
+            String(LEGACY_PAPER_SYNC_PROTOCOL_VERSION) ||
+          (presence.state === 'present' && folder.trashed)
+        ) {
+          throw new PaperLayoutMigrationProofError(
+            `Paper ${documentId} has invalid protocol-2 folder evidence.`,
+          );
+        }
+        // Removed presence may intentionally point at the exact folder in Trash.
+        // Treat it as readable only for immutable verification; never untrash it.
+        const allowInheritedTrash =
+          presence.state === 'removed' && folder.trashed === true;
+        const resolved = await this.resolvePaperFolder(
+          folder,
+          signal,
+          true,
+          undefined,
+          false,
+          allowInheritedTrash,
+        );
+        if (
+          resolved.heads.length === 0 ||
+          resolved.dataFolder.appProperties?.paperProtocolVersion !==
+            String(LEGACY_PAPER_SYNC_PROTOCOL_VERSION) ||
+          resolved.generations.some(
+            ({ file, manifest }) =>
+              manifest.paperSyncProtocolVersion !==
+                LEGACY_PAPER_SYNC_PROTOCOL_VERSION ||
+              file.appProperties?.paperProtocolVersion !==
+                String(LEGACY_PAPER_SYNC_PROTOCOL_VERSION),
+          )
+        ) {
+          throw new PaperLayoutMigrationProofError(
+            `Paper ${documentId} is not a complete protocol-2 package.`,
+          );
+        }
+        foldLoadedHeads(resolved.heads);
+        await mapWithConcurrency(
+          resolved.heads,
+          PAPER_METADATA_CONCURRENCY,
+          async ({ manifest }) => {
+            await Promise.all([
+              this.verifyProtocol2PayloadMetadata(
+                manifest.state,
+                'paper-state',
+                manifest.dataFolderId,
+                documentId,
+                signal,
+                allowInheritedTrash,
+              ),
+              this.verifyProtocol2PayloadMetadata(
+                manifest.productivity,
+                'paper-productivity',
+                manifest.dataFolderId,
+                documentId,
+                signal,
+                allowInheritedTrash,
+              ),
+              this.verifyProtocol2PayloadMetadata(
+                manifest.conflictJournal,
+                'paper-conflicts',
+                manifest.dataFolderId,
+                documentId,
+                signal,
+                allowInheritedTrash,
+              ),
+            ]);
+            const artifacts = [
+              sourceArtifactFromManifest(manifest),
+              manifest.renderedPrintPdf,
+            ].filter((artifact): artifact is NonNullable<typeof artifact> =>
+              Boolean(artifact),
+            );
+            await mapWithConcurrency(
+              artifacts,
+              PAPER_MEDIA_CONCURRENCY,
+              async (artifact) => {
+                const metadata = await this.drive.getMetadata(artifact.fileId, signal);
+                if (
+                  !isReadablePackageMetadata(metadata, allowInheritedTrash) ||
+                  metadata.parents?.length !== 1 ||
+                  metadata.parents[0] !== folder.id ||
+                  metadata.appProperties?.documentId !== documentId ||
+                  metadata.appProperties?.sha256 !== artifact.sha256 ||
+                  metadata.appProperties?.paperProtocolVersion !==
+                    String(LEGACY_PAPER_SYNC_PROTOCOL_VERSION)
+                ) {
+                  throw new PaperManifestIntegrityError(
+                    'A protocol-2 source artifact failed metadata verification.',
+                    documentId,
+                  );
+                }
+                const blob = await this.drive.downloadBlob(artifact.fileId, signal);
+                if (
+                  blob.size !== artifact.size ||
+                  (await sha256Hex(blob)) !== artifact.sha256
+                ) {
+                  throw new PaperManifestIntegrityError(
+                    'A protocol-2 source artifact failed immutable verification.',
+                    documentId,
+                  );
+                }
+              },
+            );
+          },
+        );
+        return [
+          documentId,
+          {
+            presenceHeadIds: [...presence.headIds].sort(compareCanonicalStrings),
+            paperFolderId: folder.id,
+            state: presence.state,
+            packageHeadIds: resolved.heads
+              .map(({ manifest }) => manifest.generation.id)
+              .sort(compareCanonicalStrings),
+          },
+        ] as const;
+      },
+    );
+    return Object.fromEntries(verified);
+  }
+
+  private async verifyProtocol2PayloadMetadata(
+    reference: CloudPayloadReference,
+    role: 'paper-state' | 'paper-productivity' | 'paper-conflicts',
+    dataFolderId: string,
+    documentId: string,
+    signal: AbortSignal,
+    allowInheritedTrash = false,
+  ): Promise<void> {
+    const metadata = await this.drive.getMetadata(reference.fileId, signal);
+    if (
+      !isReadablePackageMetadata(metadata, allowInheritedTrash) ||
+      metadata.parents?.length !== 1 ||
+      metadata.parents[0] !== dataFolderId ||
+      !isPaperRole(metadata, role, documentId) ||
+      metadata.appProperties?.paperProtocolVersion !==
+        String(LEGACY_PAPER_SYNC_PROTOCOL_VERSION) ||
+      metadata.appProperties?.sha256 !== reference.sha256
+    ) {
+      throw new PaperManifestIntegrityError(
+        'A protocol-2 payload failed metadata verification.',
+        documentId,
+      );
+    }
   }
 
   async openLayoutMigration(
@@ -2768,6 +3655,11 @@ export class PaperDriveRepository {
     local: LocalPaperPackage,
     state: PaperSyncState,
   ): Promise<void> {
+    if (!isSyncCompatibleDocumentId(local.documentId)) {
+      throw new Error(
+        'This paper has a local document identity that cannot be published by the current sync format.',
+      );
+    }
     if (state.documentId !== local.documentId) {
       throw new Error('Paper sync state belongs to another paper.');
     }
@@ -2879,7 +3771,13 @@ export class PaperDriveRepository {
       if (options.reconciliation === 'keep-local') {
         // The user explicitly selected the current local editable state. Remote
         // journals remain preserved as immutable ancestry evidence, while the
-        // editable snapshot itself is not merged back over that decision.
+        // editable snapshot itself is not merged back over that decision. Link
+        // display-number allocation history is monotonic metadata rather than
+        // an editable remote winner, so retain its verified maximum.
+        mergedSnapshot = preserveLinkNumberHighWaterForKeepLocal(
+          local.snapshot,
+          remoteFolded.snapshot,
+        );
         conflicts = mergeConflicts(conflicts, remoteFolded.conflicts);
       } else {
         try {
@@ -3388,8 +4286,12 @@ export class PaperDriveRepository {
     if (layout.state === 'paper-v3') return;
     if (
       layout.state === 'legacy-upgrade-required' ||
-      layout.state === 'paper-v2-upgrade-required'
+      layout.state === 'paper-v2-upgrade-required' ||
+      layout.state === 'protocol-upgrade-required'
     ) {
+      if (layout.state === 'protocol-upgrade-required') {
+        throw new PaperProtocolUpgradeRequiredError();
+      }
       throw new PaperLayoutUpgradeRequiredError();
     }
     if (layout.state === 'migration-incomplete') {
@@ -3397,6 +4299,9 @@ export class PaperDriveRepository {
     }
     if (layout.state === 'unsupported-layout') {
       throw new PaperUnsupportedLayoutError(layout.detectedLayoutVersion);
+    }
+    if (layout.state === 'unsupported-protocol') {
+      throw new PaperUnsupportedProtocolError(layout.detectedPaperSyncProtocolVersion);
     }
     await this.initializeEmptyLayout(signal);
   }
@@ -3406,6 +4311,7 @@ export class PaperDriveRepository {
     migrationCompletionId: string,
     signal: AbortSignal,
     requireUnversionedRoot = false,
+    activationProtocolVersion: SupportedPaperSyncProtocolVersion = PAPER_SYNC_PROTOCOL_VERSION,
   ): Promise<void> {
     const root = await this.drive.getMetadata(this.rootFolderId, signal, {
       phase: 'v3-layout-activation',
@@ -3418,7 +4324,15 @@ export class PaperDriveRepository {
       );
     }
     const version = paperRootLayoutVersion(root);
-    if (isPaperV3RootMetadata(root)) {
+    const protocolVersion = paperRootProtocolVersion(root);
+    if (
+      protocolVersion !== undefined &&
+      Number.isSafeInteger(protocolVersion) &&
+      protocolVersion > this.supportedPaperSyncProtocolVersion
+    ) {
+      throw new PaperUnsupportedProtocolError(protocolVersion);
+    }
+    if (isPaperV3RootMetadataForProtocol(root, activationProtocolVersion)) {
       if (
         root.appProperties!.controlFolderId !== controlFolderId ||
         root.appProperties!.migrationCompletionId !== migrationCompletionId
@@ -3427,11 +4341,14 @@ export class PaperDriveRepository {
           'The active v3 root is bound to different migration evidence.',
         );
       }
-      await this.presence.verifyActivatedControl(
+      const verifiedControl = await this.presence.verifyActivatedControl(
         controlFolderId,
         migrationCompletionId,
         signal,
+        root.appProperties!.protocolMigrationCompletionId,
+        activationProtocolVersion,
       );
+      this.retainVerifiedProtocolContext(activationProtocolVersion, verifiedControl);
       return;
     }
     if (
@@ -3444,11 +4361,14 @@ export class PaperDriveRepository {
         Number.isSafeInteger(version) ? version : undefined,
       );
     }
-    await this.presence.verifyActivatedControl(
+    const verifiedControl = await this.presence.verifyActivatedControl(
       controlFolderId,
       migrationCompletionId,
       signal,
+      undefined,
+      activationProtocolVersion,
     );
+    this.retainVerifiedProtocolContext(activationProtocolVersion, verifiedControl);
     const updated = await this.drive.updateMetadata(
       root.id,
       {
@@ -3458,7 +4378,7 @@ export class PaperDriveRepository {
           role: 'root',
           syncSchema: '1',
           layoutVersion: String(SYNC_LAYOUT_VERSION),
-          paperProtocolVersion: String(PAPER_SYNC_PROTOCOL_VERSION),
+          paperProtocolVersion: String(activationProtocolVersion),
           presenceProtocolVersion: String(PAPER_PRESENCE_PROTOCOL_VERSION),
           controlFolderId,
           migrationCompletionId,
@@ -3476,16 +4396,223 @@ export class PaperDriveRepository {
       phase: 'v3-layout-activation-verification',
       resource: 'root',
     });
-    if (!isPaperV3RootMetadata(verified)) {
+    if (!isPaperV3RootMetadataForProtocol(verified, activationProtocolVersion)) {
       throw new PaperV3ControlIntegrityError(
         'Google Drive did not retain the exact v3 root metadata.',
       );
     }
-    await this.presence.verifyActivatedControl(
+    const activatedControl = await this.presence.verifyActivatedControl(
       controlFolderId,
       migrationCompletionId,
       signal,
+      verified.appProperties!.protocolMigrationCompletionId,
+      activationProtocolVersion,
     );
+    this.retainVerifiedProtocolContext(activationProtocolVersion, activatedControl);
+  }
+
+  private async inspectTargetedPaperFolder(
+    documentId: string,
+    paperFolderId: string,
+    presenceState: PaperPresenceState,
+    signal: AbortSignal,
+  ): Promise<TargetedPaperFolderInspection> {
+    const claimedQuery = [
+      `'${escapeDriveQueryValue(this.rootFolderId)}' in parents`,
+      'trashed=false',
+      `mimeType='${FOLDER_MIME}'`,
+      `appProperties has { key='application' and value='39Note' }`,
+      `appProperties has { key='role' and value='paper-folder' }`,
+      `appProperties has { key='documentId' and value='${escapeDriveQueryValue(documentId)}' }`,
+    ].join(' and ');
+    const claimed = dedupeFiles(
+      await this.drive.listFiles(claimedQuery, signal, {
+        phase: 'targeted-purge-folder-inspection',
+        resource: 'paper-folder',
+        documentId,
+      }),
+    );
+    if (
+      claimed.some(
+        (candidate) => !isPaperFolder(candidate, this.rootFolderId, documentId),
+      )
+    ) {
+      return targetedPaperFolderBlocked(
+        'active',
+        'paper-folder-identity-ambiguous',
+        'A claimed paper folder does not have exact owned root/document metadata.',
+      );
+    }
+    let target: DriveFileMetadata | undefined;
+    try {
+      target = await this.drive.getMetadata(paperFolderId, signal, {
+        phase: 'targeted-purge-folder-inspection',
+        resource: 'paper-folder',
+        documentId,
+      });
+    } catch (error) {
+      if (!(error instanceof DriveRequestError && error.status === 404)) throw error;
+    }
+    if (!target) {
+      if (presenceState !== 'removed') {
+        return targetedPaperFolderBlocked(
+          'missing',
+          'paper-folder-missing',
+          'The active presence state points to a paper folder that cannot be verified.',
+        );
+      }
+      if (claimed.length > 0) {
+        return targetedPaperFolderBlocked(
+          'missing',
+          'paper-folder-identity-ambiguous',
+          'Another active folder claims the removed paper identity.',
+          claimed.length,
+        );
+      }
+      return {
+        state: 'missing',
+        tree: [],
+        paperFolderCount: 0,
+        paperFileCount: 0,
+        fingerprint: await sha256Hex(
+          stableStringify({
+            state: 'missing',
+            documentId,
+            paperFolderId,
+            activeClaimedFolderIds: [],
+          }),
+        ),
+      };
+    }
+    const exactOwnedIdentity =
+      isOwnedPaperFolderIdentity(target, this.rootFolderId, documentId) &&
+      target.parents?.length === 1 &&
+      target.parents[0] === this.rootFolderId &&
+      target.appProperties?.role !== PAPER_V3_CONTROL_ROLE;
+    if (!exactOwnedIdentity) {
+      return targetedPaperFolderBlocked(
+        target.trashed ? 'trashed' : 'active',
+        'paper-folder-identity-ambiguous',
+        'The presence-selected Drive target is not the exact app-owned paper folder.',
+      );
+    }
+    if (target.trashed === true) {
+      if (
+        presenceState !== 'removed' ||
+        target.explicitlyTrashed !== true ||
+        claimed.length > 0
+      ) {
+        return targetedPaperFolderBlocked(
+          'trashed',
+          'paper-folder-identity-ambiguous',
+          'The removed paper folder state or active-folder set is ambiguous.',
+          1,
+        );
+      }
+      return {
+        state: 'trashed',
+        folder: target,
+        tree: [target],
+        paperFolderCount: 1,
+        paperFileCount: 0,
+        fingerprint: await sha256Hex(
+          stableStringify({
+            state: 'trashed',
+            evidence: await driveMetadataEvidenceHash(target),
+          }),
+        ),
+      };
+    }
+    if (
+      claimed.length !== 1 ||
+      claimed[0].id !== target.id ||
+      !isPaperFolder(target, this.rootFolderId, documentId)
+    ) {
+      return targetedPaperFolderBlocked(
+        'active',
+        'paper-folder-identity-ambiguous',
+        'The active paper folder identity is duplicated or changed.',
+        claimed.length,
+      );
+    }
+
+    const tree: DriveFileMetadata[] = [target];
+    const visited = new Set([target.id]);
+    const queued = [target.id];
+    let dataFolderCount = 0;
+    while (queued.length > 0) {
+      signal.throwIfAborted();
+      const parentId = queued.shift()!;
+      const children = dedupeFiles(
+        await this.drive.listFiles(
+          `'${escapeDriveQueryValue(parentId)}' in parents and trashed=false`,
+          signal,
+          {
+            phase: 'targeted-purge-folder-inspection',
+            resource: 'file-list',
+            documentId,
+          },
+        ),
+      );
+      for (const child of children) {
+        const role = child.appProperties?.role;
+        const isDataFolder =
+          child.mimeType === FOLDER_MIME &&
+          role === 'paper-data' &&
+          parentId === target.id;
+        const valid =
+          !visited.has(child.id) &&
+          child.trashed !== true &&
+          child.ownedByMe === true &&
+          child.parents?.length === 1 &&
+          child.parents[0] === parentId &&
+          typeof role === 'string' &&
+          PAPER_ROLES.has(role) &&
+          role !== PAPER_V3_CONTROL_ROLE &&
+          role !== 'paper-folder' &&
+          isPaperRole(child, role, documentId) &&
+          (child.mimeType !== FOLDER_MIME || isDataFolder);
+        if (!valid) {
+          return targetedPaperFolderBlocked(
+            'active',
+            'paper-folder-contents-ambiguous',
+            'The paper folder contains an item whose exclusive ownership or document ancestry cannot be proven.',
+            tree.filter(({ mimeType }) => mimeType === FOLDER_MIME).length,
+            tree.filter(({ mimeType }) => mimeType !== FOLDER_MIME).length,
+          );
+        }
+        visited.add(child.id);
+        tree.push(child);
+        if (isDataFolder) {
+          dataFolderCount += 1;
+          if (dataFolderCount > 1) {
+            return targetedPaperFolderBlocked(
+              'active',
+              'paper-folder-contents-ambiguous',
+              'The paper folder contains multiple managed data folders.',
+              dataFolderCount + 1,
+            );
+          }
+          queued.push(child.id);
+        }
+      }
+    }
+    const evidence = await Promise.all(
+      tree.map((file) => driveMetadataEvidenceHash(file)),
+    );
+    return {
+      state: 'active',
+      folder: target,
+      tree,
+      paperFolderCount: tree.filter(({ mimeType }) => mimeType === FOLDER_MIME).length,
+      paperFileCount: tree.filter(({ mimeType }) => mimeType !== FOLDER_MIME).length,
+      fingerprint: await sha256Hex(
+        stableStringify({
+          state: 'active',
+          evidence: evidence.sort(compareCanonicalStrings),
+        }),
+      ),
+    };
   }
 
   private async listPaperFolders(
@@ -3546,13 +4673,29 @@ export class PaperDriveRepository {
     loadPayloads: boolean,
     knownDataFolder?: DriveFileMetadata,
     reuseVerifiedManifests = false,
+    allowInheritedTrash = false,
   ): Promise<ResolvedPaper> {
     const documentId = folder.appProperties?.documentId;
-    if (!documentId || !isPaperFolder(folder, this.rootFolderId)) {
+    const validFolder = documentId
+      ? allowInheritedTrash
+        ? isOwnedPaperFolderIdentity(folder, this.rootFolderId, documentId) &&
+          folder.parents?.length === 1 &&
+          folder.parents[0] === this.rootFolderId &&
+          folder.trashed === true &&
+          folder.explicitlyTrashed === true
+        : isPaperFolder(folder, this.rootFolderId, documentId)
+      : false;
+    if (!documentId || !validFolder) {
       throw new PaperManifestIntegrityError('A managed paper folder is invalid.');
     }
     const dataFolder =
-      knownDataFolder ?? (await this.findSingleDataFolder(folder, documentId, signal));
+      knownDataFolder ??
+      (await this.findSingleDataFolder(
+        folder,
+        documentId,
+        signal,
+        allowInheritedTrash,
+      ));
     const generations = await this.loadManifestGenerations(
       documentId,
       folder,
@@ -3560,6 +4703,7 @@ export class PaperDriveRepository {
       signal,
       loadPayloads,
       reuseVerifiedManifests,
+      allowInheritedTrash,
     );
     const heads = derivePaperHeads(generations, documentId);
     return { folder, dataFolder, generations, heads };
@@ -3569,10 +4713,11 @@ export class PaperDriveRepository {
     paperFolder: Pick<DriveFileMetadata, 'id'>,
     documentId: string,
     signal: AbortSignal,
+    allowInheritedTrash = false,
   ): Promise<DriveFileMetadata> {
     const query = [
       `'${escapeDriveQueryValue(paperFolder.id)}' in parents`,
-      'trashed=false',
+      ...(allowInheritedTrash ? [] : ['trashed=false']),
       `mimeType='${FOLDER_MIME}'`,
       `appProperties has { key='role' and value='paper-data' }`,
       `appProperties has { key='documentId' and value='${escapeDriveQueryValue(documentId)}' }`,
@@ -3583,7 +4728,9 @@ export class PaperDriveRepository {
         resource: 'data-folder',
         documentId,
       }),
-    ).filter((file) => isPaperDataFolder(file, paperFolder.id, documentId));
+    ).filter((file) =>
+      isPaperDataFolder(file, paperFolder.id, documentId, allowInheritedTrash),
+    );
     if (matches.length !== 1) {
       throw new AmbiguousManagedPaperError(
         documentId,
@@ -3600,10 +4747,11 @@ export class PaperDriveRepository {
     signal: AbortSignal,
     loadPayloads: boolean,
     reuseVerifiedManifests: boolean,
+    allowInheritedTrash = false,
   ): Promise<LoadedPaperGeneration[]> {
     const query = [
       `'${escapeDriveQueryValue(dataFolder.id)}' in parents`,
-      'trashed=false',
+      ...(allowInheritedTrash ? [] : ['trashed=false']),
       `appProperties has { key='role' and value='paper-manifest-generation' }`,
       `appProperties has { key='documentId' and value='${escapeDriveQueryValue(documentId)}' }`,
     ].join(' and ');
@@ -3616,7 +4764,7 @@ export class PaperDriveRepository {
     );
     const generations = await mapWithConcurrency(
       files,
-      PAPER_METADATA_CONCURRENCY,
+      PAPER_MANIFEST_READ_CONCURRENCY,
       async (file) =>
         this.loadManifestFile(
           file,
@@ -3625,11 +4773,114 @@ export class PaperDriveRepository {
           dataFolder,
           signal,
           reuseVerifiedManifests,
+          allowInheritedTrash,
         ),
     );
+    this.assertProtocolGenerationBoundary(documentId, folder.id, generations);
     if (!loadPayloads) return generations;
 
     return this.loadCurrentHeadPayloads(generations, documentId, signal);
+  }
+
+  private assertProtocolGenerationBoundary(
+    documentId: string,
+    paperFolderId: string,
+    generations: readonly LoadedPaperGeneration[],
+  ): void {
+    const context = this.verifiedProtocolContext;
+    const legacyGenerations = generations.filter(
+      ({ manifest }) =>
+        manifest.paperSyncProtocolVersion === LEGACY_PAPER_SYNC_PROTOCOL_VERSION,
+    );
+    if (!context) {
+      if (legacyGenerations.length > 0) {
+        throw new PaperManifestIntegrityError(
+          'Protocol-2 paper history was found without a verified root boundary.',
+          documentId,
+        );
+      }
+      return;
+    }
+    if (context.protocolVersion === LEGACY_PAPER_SYNC_PROTOCOL_VERSION) {
+      if (legacyGenerations.length !== generations.length) {
+        throw new PaperManifestIntegrityError(
+          'A protocol-2 root contains a protocol-3 paper generation.',
+          documentId,
+        );
+      }
+      return;
+    }
+
+    const completion = context.migrationCompletion;
+    if (!completion) {
+      if (legacyGenerations.length > 0) {
+        throw new PaperManifestIntegrityError(
+          'A native protocol-3 root contains protocol-2 paper history.',
+          documentId,
+        );
+      }
+      return;
+    }
+    const evidence = completion.papers[documentId];
+    if (!evidence) {
+      if (legacyGenerations.length > 0) {
+        throw new PaperManifestIntegrityError(
+          'Protocol-2 paper history is outside the verified cutover set.',
+          documentId,
+        );
+      }
+      return;
+    }
+    if (evidence.paperFolderId !== paperFolderId) {
+      if (legacyGenerations.length > 0) {
+        throw new PaperManifestIntegrityError(
+          'Protocol-2 paper history moved outside its verified cutover folder.',
+          documentId,
+        );
+      }
+      return;
+    }
+
+    const generationById = new Map(
+      generations.map((generation) => [generation.manifest.generation.id, generation]),
+    );
+    if (
+      evidence.packageHeadIds.length === 0 ||
+      evidence.packageHeadIds.some((headId) => {
+        const generation = generationById.get(headId);
+        return (
+          !generation ||
+          generation.manifest.paperSyncProtocolVersion !==
+            LEGACY_PAPER_SYNC_PROTOCOL_VERSION
+        );
+      })
+    ) {
+      throw new PaperManifestIntegrityError(
+        'The protocol cutover package heads are missing or invalid.',
+        documentId,
+      );
+    }
+    for (const generation of generations) {
+      const generationId = generation.manifest.generation.id;
+      const insideLegacyHistory = evidence.packageHeadIds.some((headId) =>
+        generationDescendsFrom(headId, generationId, generations),
+      );
+      const descendsFromCutover = evidence.packageHeadIds.some((headId) =>
+        generationDescendsFrom(generationId, headId, generations),
+      );
+      if (
+        (generation.manifest.paperSyncProtocolVersion ===
+          LEGACY_PAPER_SYNC_PROTOCOL_VERSION &&
+          !insideLegacyHistory) ||
+        (generation.manifest.paperSyncProtocolVersion === PAPER_SYNC_PROTOCOL_VERSION &&
+          !descendsFromCutover)
+      ) {
+        throw new PaperManifestIntegrityError(
+          'A paper generation crosses the verified protocol cutover boundary.',
+          documentId,
+        );
+      }
+    }
   }
 
   private async loadCurrentHeadPayloads(
@@ -3663,6 +4914,7 @@ export class PaperDriveRepository {
             'document-state',
             documentId,
             signal,
+            loaded.manifest.paperSyncProtocolVersion,
           );
         payloads.set(stateKey, state);
         const productivity =
@@ -3672,6 +4924,7 @@ export class PaperDriveRepository {
             'productivity-data',
             documentId,
             signal,
+            loaded.manifest.paperSyncProtocolVersion,
           );
         payloads.set(productivityKey, productivity);
         const conflictPayload =
@@ -3680,6 +4933,7 @@ export class PaperDriveRepository {
             loaded.manifest.conflictJournal,
             documentId,
             signal,
+            loaded.manifest.paperSyncProtocolVersion,
           );
         conflicts.set(conflictKey, conflictPayload);
         const [resolvedState, resolvedProductivity, resolvedConflicts] =
@@ -3718,8 +4972,9 @@ export class PaperDriveRepository {
     dataFolder: DriveFileMetadata,
     signal: AbortSignal,
     reuseVerifiedManifest: boolean,
+    allowInheritedTrash = false,
   ): Promise<LoadedPaperGeneration> {
-    if (!isPaperManifestFile(file, dataFolder.id, documentId)) {
+    if (!isPaperManifestFile(file, dataFolder.id, documentId, allowInheritedTrash)) {
       throw new PaperManifestIntegrityError(
         'A managed paper manifest has invalid Drive metadata.',
         documentId,
@@ -3736,7 +4991,7 @@ export class PaperDriveRepository {
     ) {
       return { file, manifest: cached.manifest };
     }
-    const text = await this.mediaGate.run(() =>
+    const text = await this.manifestReadGate.run(() =>
       this.drive.downloadText(file.id, signal, {
         phase: 'manifest-head-resolution',
         resource: 'manifest',
@@ -3760,8 +5015,14 @@ export class PaperDriveRepository {
       manifest.paperFolderId !== folder.id ||
       manifest.dataFolderId !== dataFolder.id ||
       paperPackageLayoutVersion(file) !== manifest.syncLayoutVersion ||
+      file.appProperties?.paperProtocolVersion !==
+        String(manifest.paperSyncProtocolVersion) ||
       file.appProperties?.manifestStorage !== manifest.manifestStorage ||
-      file.name !== manifestGenerationName(manifest.generation.id) ||
+      file.name !==
+        manifestGenerationNameForProtocol(
+          manifest.generation.id,
+          manifest.paperSyncProtocolVersion,
+        ) ||
       file.appProperties?.generationId !== manifest.generation.id
     ) {
       throw new PaperManifestIntegrityError(
@@ -3782,6 +5043,7 @@ export class PaperDriveRepository {
     logicalType: 'document-state' | 'productivity-data',
     documentId: string,
     signal: AbortSignal,
+    sourceProtocolVersion: SupportedPaperSyncProtocolVersion = PAPER_SYNC_PROTOCOL_VERSION,
   ): Promise<CloudEntityPayload> {
     try {
       const blob = await this.mediaGate.run(() =>
@@ -3793,10 +5055,18 @@ export class PaperDriveRepository {
       );
       return await this.drive.measureOperationPhase(
         'json-payload-verification',
-        () => parsePaperPayloadBlob(blob, reference.sha256, logicalType, documentId),
+        () =>
+          parsePaperPayloadBlob(
+            blob,
+            reference.sha256,
+            logicalType,
+            documentId,
+            sourceProtocolVersion,
+          ),
         { documentId, bytesProcessed: blob.size },
       );
     } catch (error) {
+      signal.throwIfAborted();
       if (isDriveOperationFailure(error)) throw error;
       if (error instanceof CloudPayloadPartitionError) {
         throw new PaperPayloadPartitionError(documentId, error);
@@ -3813,6 +5083,7 @@ export class PaperDriveRepository {
     reference: CloudPayloadReference,
     documentId: string,
     signal: AbortSignal,
+    sourceProtocolVersion: SupportedPaperSyncProtocolVersion = PAPER_SYNC_PROTOCOL_VERSION,
   ) {
     try {
       const blob = await this.mediaGate.run(() =>
@@ -3824,10 +5095,17 @@ export class PaperDriveRepository {
       );
       return await this.drive.measureOperationPhase(
         'json-payload-verification',
-        () => parsePaperConflictPayloadBlob(blob, reference.sha256, documentId),
+        () =>
+          parsePaperConflictPayloadBlob(
+            blob,
+            reference.sha256,
+            documentId,
+            sourceProtocolVersion,
+          ),
         { documentId, bytesProcessed: blob.size },
       );
     } catch (error) {
+      signal.throwIfAborted();
       if (isDriveOperationFailure(error)) throw error;
       throw new PaperManifestIntegrityError(
         'A selected paper conflict journal failed integrity verification.',
@@ -4815,7 +6093,10 @@ export class PaperDriveRepository {
   ): Promise<DriveFileMetadata> {
     const text = stableStringify(manifest);
     const uploaded = await this.drive.uploadFile(
-      manifestGenerationName(manifest.generation.id),
+      manifestGenerationNameForProtocol(
+        manifest.generation.id,
+        manifest.paperSyncProtocolVersion,
+      ),
       new Blob([text], { type: 'application/json' }),
       {
         parents: [dataFolderId],
@@ -4824,6 +6105,7 @@ export class PaperDriveRepository {
             'paper-manifest-generation',
             manifest.documentId,
             manifest.syncLayoutVersion,
+            manifest.paperSyncProtocolVersion,
           ),
           manifestStorage: manifest.manifestStorage,
           generationId: manifest.generation.id,
@@ -4852,7 +6134,11 @@ export class PaperDriveRepository {
     if (
       verifiedText !== text ||
       !isPaperManifestFile(metadata, dataFolderId, manifest.documentId) ||
-      metadata.name !== manifestGenerationName(manifest.generation.id) ||
+      metadata.name !==
+        manifestGenerationNameForProtocol(
+          manifest.generation.id,
+          manifest.paperSyncProtocolVersion,
+        ) ||
       metadata.appProperties?.generationId !== manifest.generation.id
     ) {
       throw new PaperManifestIntegrityError(
@@ -4986,6 +6272,7 @@ export class PaperDriveRepository {
         migratedManifests,
       };
     } catch (error) {
+      signal.throwIfAborted();
       if (isDriveOperationFailure(error)) throw error;
       return null;
     }
@@ -5046,6 +6333,7 @@ export class PaperDriveRepository {
               authorized.add(file.id);
             }
           } catch (error) {
+            signal.throwIfAborted();
             if (isDriveOperationFailure(error)) throw error;
           }
         } else if (
@@ -5424,6 +6712,12 @@ function failedPaperSummary(
         repositoryError instanceof AmbiguousManagedPaperError
           ? 'More than one managed Drive folder claims this paper identity.'
           : 'Drive data for this paper needs verification.',
+      ...(repositoryError?.diagnosticPhase
+        ? { phase: repositoryError.diagnosticPhase }
+        : {}),
+      ...(repositoryError?.diagnosticCauseCode
+        ? { causeCode: repositoryError.diagnosticCauseCode }
+        : {}),
     },
   };
 }
@@ -5555,11 +6849,12 @@ function isPaperDataFolder(
   file: DriveFileMetadata,
   paperFolderId: string,
   documentId: string,
+  allowInheritedTrash = false,
 ): boolean {
   return (
     file.name === PAPER_DATA_NAME &&
     file.mimeType === FOLDER_MIME &&
-    !file.trashed &&
+    isReadablePackageMetadata(file, allowInheritedTrash) &&
     file.parents?.length === 1 &&
     file.parents[0] === paperFolderId &&
     isPaperRole(file, 'paper-data', documentId)
@@ -5570,6 +6865,7 @@ function isPaperManifestFile(
   file: DriveFileMetadata,
   dataFolderId: string,
   documentId: string,
+  allowInheritedTrash = false,
 ): boolean {
   const layoutVersion = paperPackageLayoutVersion(file);
   const expectedManifestStorage =
@@ -5580,7 +6876,7 @@ function isPaperManifestFile(
         : undefined;
   return (
     file.mimeType === 'application/json' &&
-    !file.trashed &&
+    isReadablePackageMetadata(file, allowInheritedTrash) &&
     file.parents?.length === 1 &&
     file.parents[0] === dataFolderId &&
     isPaperRole(file, 'paper-manifest-generation', documentId) &&
@@ -5588,6 +6884,14 @@ function isPaperManifestFile(
     file.appProperties?.manifestStorage === expectedManifestStorage &&
     typeof file.appProperties.generationId === 'string'
   );
+}
+
+function isReadablePackageMetadata(
+  file: DriveFileMetadata,
+  allowInheritedTrash: boolean,
+): boolean {
+  if (!file.trashed) return true;
+  return allowInheritedTrash && file.explicitlyTrashed === false;
 }
 
 function isPaperRole(
@@ -5600,7 +6904,10 @@ function isPaperRole(
     file.appProperties?.application === '39Note' &&
     (layoutVersion === LEGACY_PAPER_PACKAGE_LAYOUT_VERSION ||
       layoutVersion === PAPER_PACKAGE_LAYOUT_VERSION) &&
-    file.appProperties.paperProtocolVersion === String(PAPER_SYNC_PROTOCOL_VERSION) &&
+    (file.appProperties.paperProtocolVersion ===
+      String(LEGACY_PAPER_SYNC_PROTOCOL_VERSION) ||
+      file.appProperties.paperProtocolVersion ===
+        String(PAPER_SYNC_PROTOCOL_VERSION)) &&
     file.appProperties.role === role &&
     (!documentId || file.appProperties.documentId === documentId)
   );
@@ -5625,12 +6932,13 @@ function paperAppProperties(
   layoutVersion:
     | typeof LEGACY_PAPER_PACKAGE_LAYOUT_VERSION
     | typeof PAPER_PACKAGE_LAYOUT_VERSION = PAPER_PACKAGE_LAYOUT_VERSION,
+  protocolVersion: SupportedPaperSyncProtocolVersion = PAPER_SYNC_PROTOCOL_VERSION,
 ): Record<string, string> {
   return {
     application: '39Note',
     syncSchema: '1',
     layoutVersion: String(layoutVersion),
-    paperProtocolVersion: String(PAPER_SYNC_PROTOCOL_VERSION),
+    paperProtocolVersion: String(protocolVersion),
     role,
     documentId,
   };
@@ -5744,8 +7052,11 @@ function payloadGenerationName(baseName: string, sha256: string): string {
   return `${stem}-${sha256.slice(0, 16)}${extension}`;
 }
 
-function manifestGenerationName(generationId: string): string {
-  return `paper-manifest-v${PAPER_SYNC_PROTOCOL_VERSION}-${generationId}.json`;
+function manifestGenerationNameForProtocol(
+  generationId: string,
+  protocolVersion: SupportedPaperSyncProtocolVersion,
+): string {
+  return `paper-manifest-v${protocolVersion}-${generationId}.json`;
 }
 
 async function headSetId(headIds: readonly string[]): Promise<string> {
@@ -5923,6 +7234,106 @@ function sameStringSet(first: readonly string[], second: readonly string[]): boo
   return (
     stableStringify([...new Set(first)].sort(compareCanonicalStrings)) ===
     stableStringify([...new Set(second)].sort(compareCanonicalStrings))
+  );
+}
+
+function targetedPaperPurgeBlocked(
+  documentId: string,
+  code: TargetedPaperPurgeBlockCode,
+  message: string,
+): TargetedPaperPurgeInspection {
+  return {
+    eligible: false,
+    documentId,
+    paperFolderCount: 0,
+    paperFileCount: 0,
+    validPresenceCount: 0,
+    corruptPresenceCount: 0,
+    preservedPresenceCount: 0,
+    presenceHeadCount: 0,
+    blocker: { code, message },
+  };
+}
+
+function targetedPaperFolderBlocked(
+  state: TargetedPaperPurgeFolderState,
+  code: TargetedPaperPurgeBlockCode,
+  message: string,
+  paperFolderCount = 0,
+  paperFileCount = 0,
+): TargetedPaperFolderInspection {
+  return {
+    state,
+    tree: [],
+    paperFolderCount,
+    paperFileCount,
+    fingerprint: '',
+    blocker: { code, message },
+  };
+}
+
+function assertTargetedPaperPurgeProof(
+  proof: TargetedPaperPurgeProof,
+  expectedRootFolderId: string,
+): void {
+  const presence = proof?.presence;
+  if (
+    proof?.recordId !== 'targeted-paper-purge' ||
+    proof.rootFolderId !== expectedRootFolderId ||
+    !isValidDocumentId(proof.documentId) ||
+    !isSafeDriveId(proof.controlFolderId) ||
+    !isSafeDriveId(proof.paperFolderId) ||
+    !['active', 'trashed', 'missing'].includes(proof.folderState) ||
+    !isSha256(proof.folderEvidenceFingerprint) ||
+    !isSha256(proof.evidenceFingerprint) ||
+    !Array.isArray(proof.paperTreeFileIds) ||
+    proof.paperTreeFileIds.some(
+      (id, index) =>
+        !isSafeDriveId(id) || (index > 0 && proof.paperTreeFileIds[index - 1] >= id),
+    ) ||
+    !presence ||
+    presence.documentId !== proof.documentId ||
+    presence.controlFolderId !== proof.controlFolderId ||
+    presence.paperFolderId !== proof.paperFolderId ||
+    !isSha256(presence.evidenceFingerprint) ||
+    (presence.state !== 'present' && presence.state !== 'removed')
+  ) {
+    throw new PaperRepositoryError(
+      'paper-presence-invalid',
+      'The targeted purge confirmation proof is invalid.',
+    );
+  }
+}
+
+function sameTargetedPaperPurgeProof(
+  first: TargetedPaperPurgeProof,
+  second: TargetedPaperPurgeProof,
+): boolean {
+  return (
+    first.recordId === second.recordId &&
+    first.documentId === second.documentId &&
+    first.rootFolderId === second.rootFolderId &&
+    first.controlFolderId === second.controlFolderId &&
+    first.paperFolderId === second.paperFolderId &&
+    first.folderState === second.folderState &&
+    first.folderEvidenceFingerprint === second.folderEvidenceFingerprint &&
+    first.evidenceFingerprint === second.evidenceFingerprint &&
+    sameStringSet(first.paperTreeFileIds, second.paperTreeFileIds) &&
+    first.presence.documentId === second.presence.documentId &&
+    first.presence.controlFolderId === second.presence.controlFolderId &&
+    first.presence.paperFolderId === second.presence.paperFolderId &&
+    first.presence.displayName === second.presence.displayName &&
+    first.presence.state === second.presence.state &&
+    first.presence.evidenceFingerprint === second.presence.evidenceFingerprint &&
+    sameStringSet(first.presence.headIds, second.presence.headIds) &&
+    sameStringSet(
+      first.presence.validPresenceFileIds,
+      second.presence.validPresenceFileIds,
+    ) &&
+    sameStringSet(
+      first.presence.corruptPresenceFileIds,
+      second.presence.corruptPresenceFileIds,
+    )
   );
 }
 
@@ -6198,6 +7609,22 @@ function isSafeDriveIdArray(value: unknown): value is string[] {
 
 function isSafeMigrationDocumentId(value: string): boolean {
   return value.length > 0 && value.length <= 512 && !hasControlCharacters(value);
+}
+
+function validatedIgnoredDocumentIds(
+  values: readonly string[] | undefined,
+): ReadonlySet<string> {
+  const result = new Set<string>();
+  for (const value of values ?? []) {
+    if (!isValidDocumentId(value)) {
+      throw new PaperRepositoryError(
+        'paper-presence-invalid',
+        'A local ignored-paper identity is invalid.',
+      );
+    }
+    result.add(value);
+  }
+  return result;
 }
 
 function isPlainRecord(value: unknown): value is Record<string, unknown> {

@@ -362,7 +362,7 @@ test('left-click and right-click geometry resolve only the hit annotation withou
   assert.match(pdfPageSource, /onContextMenu=\{\(event\) => \{/);
   assert.match(
     pdfPageSource,
-    /if \(annotationHits\.length === 0\) return;[\s\S]*?event\.preventDefault\(\)/,
+    /annotationHits\.length === 0\s*&&\s*glossaryHits\.length === 0\s*&&\s*linkHits\.length === 0[\s\S]*?event\.preventDefault\(\)/,
   );
 });
 
@@ -449,7 +449,10 @@ test('mark-owned Notes align the shared large-editor handle with the Note label 
   );
   assert.equal(tagSource.match(/<NoteDragHandle/g)?.length, 1);
   assert.match(notesPanelSource, /<NoteDragHandle/);
-  assert.match(noteDragHandleSource, /aria-label="Drag to open large editor"/);
+  assert.match(
+    noteDragHandleSource,
+    /aria-label="Open large Note editor; drag on desktop"/,
+  );
   assert.match(
     styleSource,
     /\.annotation-tag-note-header\s*\{[^}]*display:\s*flex;[^}]*min-width:\s*0;[^}]*align-items:\s*center;[^}]*justify-content:\s*space-between;[^}]*gap:\s*8px;/s,
@@ -466,14 +469,23 @@ test('mark-owned Notes align the shared large-editor handle with the Note label 
 
 test('the shared handle preserves the accepted pointer, touch, and keyboard initiation semantics', () => {
   assert.match(noteDragHandleSource, /if \(event\.button !== 0\) return/);
+  assert.match(noteDragHandleSource, /event\.pointerType === 'touch'/);
   assert.match(noteDragHandleSource, /event\.preventDefault\(\)/);
   assert.match(noteDragHandleSource, /event\.stopPropagation\(\)/);
   assert.match(noteDragHandleSource, /onBeginNoteDrag\(note, event, onDropInTarget\)/);
+  assert.match(
+    noteDragHandleSource,
+    /lastPointerTypeRef\.current !== 'touch'[\s\S]*?onOpenLargeEditor\(note\)/,
+  );
   assert.match(noteDragHandleSource, /event\.key !== 'Enter'/);
   assert.match(noteDragHandleSource, /onOpenLargeEditor\(note\)/);
   assert.match(
     styleSource,
     /\.note-drag-handle\s*\{[^}]*cursor:\s*grab;[^}]*touch-action:\s*none;/s,
+  );
+  assert.match(
+    styleSource,
+    /@media \(hover: none\), \(pointer: coarse\)[\s\S]*?\.note-drag-handle\s*\{[^}]*min-width:\s*44px;[^}]*touch-action:\s*manipulation;/s,
   );
 });
 
@@ -531,7 +543,14 @@ test('cancelled drag clears presentation only and cannot create, clone, delete, 
     /addNote|deleteNote|setNotes|updateNote|onUpdate|updatedAt|annotationId\s*:/,
   );
   assert.match(noteDragHandleSource, /event\.stopPropagation\(\)/);
-  assert.doesNotMatch(noteDragHandleSource, /onClick=/);
+  assert.match(
+    noteDragHandleSource,
+    /onClick=\{\(event\) => \{[\s\S]*?lastPointerTypeRef\.current !== 'touch'[\s\S]*?onOpenLargeEditor\(note\)/,
+  );
+  assert.doesNotMatch(
+    noteDragHandleSource,
+    /addNote|deleteNote|setNotes|updateNote|onUpdate|clone|annotationId\s*:/,
+  );
 });
 
 test('small and large editors update the same persisted Note object and preserve mark ownership', () => {
@@ -572,18 +591,21 @@ test('transient annotation context never changes persistent Notes drawer visibil
 });
 
 test('contextual Add, edit, and Delete Note callbacks preserve Notes drawer state', () => {
-  const addSource = appLayoutSource.match(
-    /const addNoteToMarkedAnnotation = useCallback\([\s\S]*?\n\s*\}, \[\]\);/,
-  )?.[0];
-  const updateSource = appLayoutSource.match(
-    /const updateNote = useCallback\([\s\S]*?\n\s*\}, \[\]\);/,
-  )?.[0];
-  const deleteSource = appLayoutSource.match(
-    /const deleteNote = useCallback\([\s\S]*?\n\s*\}, \[\]\);/,
-  )?.[0];
-  assert.ok(addSource);
-  assert.ok(updateSource);
-  assert.ok(deleteSource);
+  const addSource = sourceSection(
+    appLayoutSource,
+    'const addNoteToMarkedAnnotation',
+    'const removeMarkedAnnotation',
+  );
+  const updateSource = sourceSection(
+    appLayoutSource,
+    'const updateNote',
+    'const addAiOutputToNote',
+  );
+  const deleteSource = sourceSection(
+    appLayoutSource,
+    'const deleteNote',
+    'const addGlossaryEntry',
+  );
   for (const callbackSource of [addSource, updateSource, deleteSource]) {
     assert.doesNotMatch(callbackSource, /setIsNotesDrawerOpen/);
   }
@@ -658,7 +680,10 @@ test('blank and ordinary unmarked PDF points preserve the native context menu', 
     ),
     [],
   );
-  assert.match(pdfPageSource, /if \(annotationHits\.length === 0\) return;/);
+  assert.match(
+    pdfPageSource,
+    /annotationHits\.length === 0\s*&&\s*glossaryHits\.length === 0\s*&&\s*linkHits\.length === 0/,
+  );
 });
 
 test('simple blank taps dismiss only the transient context after selection guards', () => {
@@ -729,9 +754,9 @@ test('reader wiring has one explicit Note creation path and preserves schema/pro
   assert.doesNotMatch(appLayoutSource, /addNoteFromSelection|addNoteFromMarkedSource/);
   assert.match(
     source('../src/services/annotationPersistence.ts'),
-    /PERSISTENCE_SCHEMA_VERSION = 8/,
+    /PERSISTENCE_SCHEMA_VERSION =\s*9/,
   );
-  assert.match(source('../src/sync/paperTypes.ts'), /PAPER_SYNC_PROTOCOL_VERSION = 2/);
+  assert.match(source('../src/sync/paperTypes.ts'), /PAPER_SYNC_PROTOCOL_VERSION = 3/);
 });
 
 function makeState(
@@ -822,4 +847,12 @@ function note(id: string, annotationId: string, content: string): Note {
 
 function source(relativePath: string): string {
   return readFileSync(new URL(relativePath, import.meta.url), 'utf8');
+}
+
+function sourceSection(sourceText: string, start: string, end: string): string {
+  const startIndex = sourceText.indexOf(start);
+  const endIndex = sourceText.indexOf(end, startIndex);
+  assert.notEqual(startIndex, -1);
+  assert.notEqual(endIndex, -1);
+  return sourceText.slice(startIndex, endIndex);
 }

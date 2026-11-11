@@ -1,4 +1,4 @@
-import type { PointerEvent as ReactPointerEvent } from 'react';
+import { useRef, type PointerEvent as ReactPointerEvent } from 'react';
 import type { Note } from '../types/note';
 
 export type NoteDragStartHandler = (
@@ -20,16 +20,30 @@ export function NoteDragHandle({
   onOpenLargeEditor,
   onDropInTarget,
 }: NoteDragHandleProps) {
+  const lastPointerTypeRef = useRef<string | null>(null);
+
   return (
     <button
-      aria-label="Drag to open large editor"
+      aria-label="Open large Note editor; drag on desktop"
       className="note-drag-handle"
+      title="Tap to open; drag to the centre on desktop"
       type="button"
       onPointerDown={(event) => {
         if (event.button !== 0) return;
+        lastPointerTypeRef.current = event.pointerType;
+        if (event.pointerType === 'touch') {
+          event.stopPropagation();
+          return;
+        }
         event.preventDefault();
         event.stopPropagation();
         onBeginNoteDrag(note, event, onDropInTarget);
+      }}
+      onClick={(event) => {
+        if (lastPointerTypeRef.current !== 'touch') return;
+        event.stopPropagation();
+        lastPointerTypeRef.current = null;
+        onOpenLargeEditor(note);
       }}
       onKeyDown={(event) => {
         if (event.key !== 'Enter' && event.key !== ' ') return;

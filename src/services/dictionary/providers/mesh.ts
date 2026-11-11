@@ -17,9 +17,7 @@ export async function lookupMesh(
   searchUrl.searchParams.set('retmode', 'json');
   searchUrl.searchParams.set('retmax', '3');
   searchUrl.searchParams.set('tool', '39Note');
-  const identifier = parseMeshSearchIdentifier(
-    await fetchNcbiJson(searchUrl, signal),
-  );
+  const identifier = parseMeshSearchIdentifier(await fetchNcbiJson(searchUrl, signal));
   if (!identifier) return [];
 
   const summaryUrl = new URL(

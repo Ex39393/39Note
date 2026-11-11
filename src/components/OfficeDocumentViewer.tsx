@@ -701,6 +701,7 @@ export const OfficeDocumentViewer = forwardRef<ViewerHandle, OfficeDocumentViewe
             ? navigateToSemanticAnchor(entry.anchor)
             : false;
         },
+        navigateToLinkEndpoint: () => false,
         goToPage: (pageNumber) => goToNavigation(pageNumber),
         openSearch: () => {
           setSearchOpen(true);

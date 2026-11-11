@@ -12,8 +12,11 @@ const THEME_PREFERENCE_KEY = '39note-reading-theme';
 
 function createThemeVariables(theme: ThemeDefinition): CSSProperties {
   const isDawn = theme.id === 'dawn';
+  const usesDarkSurfaces = ['dark', 'midnight', 'twilight', 'dawn', 'sea'].includes(
+    theme.id,
+  );
   const semantic = theme.semanticPalette;
-  const surfaceApp = theme.appBackground;
+  const surfaceApp = theme.shellBackground ?? theme.appBackground;
   const surfaceReader = semantic?.mainBackground ?? theme.appBackground;
   const surfaceBase = semantic?.sectionBackground ?? theme.surfaceBackground;
   const surfacePanel = semantic?.toolbarBackground ?? theme.panelBackground;
@@ -26,8 +29,21 @@ function createThemeVariables(theme: ThemeDefinition): CSSProperties {
   const interactiveSelected =
     semantic?.navigationFocusColor ??
     `color-mix(in srgb, ${theme.accentColor} 20%, ${theme.surfaceBackground})`;
+  const shadowColor = usesDarkSurfaces ? '#000000' : theme.textColor;
+  const noteTextColor = theme.noteTextColor ?? theme.noteColor;
+  const destructiveBase = semantic?.destructiveColor ?? theme.underlineColor;
+  const destructiveText =
+    !semantic && (theme.id === 'original' || theme.id === 'soft-gray')
+      ? `color-mix(in srgb, ${destructiveBase} 72%, #000000)`
+      : destructiveBase;
   return {
     '--theme-background': theme.appBackground,
+    '--theme-app-background': surfaceApp,
+    '--theme-shell-background': theme.shellBackground ?? theme.appBackground,
+    '--theme-navigation-background':
+      theme.navigationBackground ??
+      semantic?.toolbarBackground ??
+      theme.panelBackground,
     '--theme-main': semantic?.mainBackground ?? theme.appBackground,
     '--theme-surface': theme.surfaceBackground,
     '--theme-elevated': semantic?.cardBackground ?? theme.surfaceBackground,
@@ -49,9 +65,9 @@ function createThemeVariables(theme: ThemeDefinition): CSSProperties {
       semantic?.navigationFocusColor ??
       `color-mix(in srgb, ${theme.accentColor} 22%, ${theme.surfaceBackground})`,
     '--theme-text': theme.textColor,
-    '--theme-secondary-text': semantic?.secondaryTextColor ?? theme.textColor,
+    '--theme-secondary-text': semantic?.secondaryTextColor ?? theme.mutedTextColor,
     '--theme-muted-text': theme.mutedTextColor,
-    '--theme-faint-text': semantic?.faintTextColor ?? theme.textColor,
+    '--theme-faint-text': semantic?.faintTextColor ?? theme.mutedTextColor,
     '--theme-heading': theme.textColor,
     '--theme-toolbar': semantic?.toolbarBackground ?? theme.elevatedBackground,
     '--theme-toolbar-input': semantic
@@ -63,7 +79,14 @@ function createThemeVariables(theme: ThemeDefinition): CSSProperties {
     '--theme-strong-border': semantic?.strongerBorderColor ?? theme.borderColor,
     '--theme-divider': semantic?.dividerColor ?? theme.borderColor,
     '--theme-accent': theme.accentColor,
-    '--theme-accent-contrast': semantic?.chipSelectedText ?? theme.elevatedBackground,
+    '--theme-accent-text': theme.accentTextColor ?? theme.accentColor,
+    '--theme-accent-contrast':
+      semantic?.chipSelectedText ??
+      (theme.id === 'original'
+        ? '#000000'
+        : theme.id === 'soft-gray'
+          ? '#FFFFFF'
+          : theme.elevatedBackground),
     '--theme-accent-hover': semantic?.accentHover ?? theme.accentColor,
     '--theme-accent-active': semantic?.accentActive ?? theme.accentColor,
     '--theme-accent-soft':
@@ -84,7 +107,10 @@ function createThemeVariables(theme: ThemeDefinition): CSSProperties {
     '--theme-underline': theme.underlineColor,
     '--glossary-underline-color': theme.glossaryUnderlineColor,
     '--theme-note': theme.noteColor,
+    '--theme-note-text': noteTextColor,
     '--theme-bold': theme.textColor,
+    '--theme-paper': theme.pageBackground,
+    '--theme-paper-text': theme.pageTextColor ?? theme.textColor,
     '--theme-page-background': theme.pageBackground,
     '--theme-canvas-filter': theme.canvasFilter,
     '--surface-app': surfaceApp,
@@ -93,6 +119,7 @@ function createThemeVariables(theme: ThemeDefinition): CSSProperties {
     '--surface-panel': surfacePanel,
     '--surface-raised': surfaceRaised,
     '--surface-overlay': semantic?.drawerBackground ?? theme.panelBackground,
+    '--surface-backdrop': `color-mix(in srgb, #000000 ${usesDarkSurfaces ? '44%' : '28%'}, transparent)`,
     '--interactive-hover': interactiveHover,
     '--interactive-selected': interactiveSelected,
     '--interactive-pressed':
@@ -100,9 +127,9 @@ function createThemeVariables(theme: ThemeDefinition): CSSProperties {
       `color-mix(in srgb, ${theme.accentColor} 26%, ${theme.surfaceBackground})`,
     '--border-subtle': borderSubtle,
     '--border-strong': borderStrong,
-    '--shadow-soft': `0 5px 16px color-mix(in srgb, ${theme.textColor} 11%, transparent)`,
-    '--shadow-raised': `0 14px 34px color-mix(in srgb, ${theme.textColor} 16%, transparent)`,
-    '--shadow-overlay': `0 24px 70px color-mix(in srgb, ${theme.textColor} 23%, transparent)`,
+    '--shadow-soft': `0 5px 16px color-mix(in srgb, ${shadowColor} 16%, transparent)`,
+    '--shadow-raised': `0 14px 34px color-mix(in srgb, ${shadowColor} 24%, transparent)`,
+    '--shadow-overlay': `0 24px 70px color-mix(in srgb, ${shadowColor} 34%, transparent)`,
     '--shadow-interactive': `0 5px 15px color-mix(in srgb, ${theme.accentColor} 16%, transparent)`,
     '--motion-fast': '120ms',
     '--motion-control': '160ms',
@@ -132,8 +159,8 @@ function createThemeVariables(theme: ThemeDefinition): CSSProperties {
         : `color-mix(in srgb, ${theme.accentColor} 14%, ${theme.elevatedBackground})`),
     '--metadata-chip-remove-icon': isDawn ? '#f7e9ef' : theme.mutedTextColor,
     '--metadata-chip-remove-hover': isDawn ? '#ffffff' : theme.textColor,
-    '--pin-accent': theme.noteColor,
-    '--control-bg': semantic?.cardBackground ?? theme.surfaceBackground,
+    '--pin-accent': noteTextColor,
+    '--control-bg': theme.inputBackground,
     '--control-border': semantic?.strongerBorderColor ?? theme.borderColor,
     '--control-text': theme.textColor,
     '--control-hover-bg':
@@ -162,12 +189,13 @@ function createThemeVariables(theme: ThemeDefinition): CSSProperties {
       semantic?.secondaryAccentColor ??
       `color-mix(in srgb, ${theme.accentColor} 72%, transparent)`,
     '--panel-elevation': 'var(--shadow-raised)',
-    '--destructive-text': semantic?.destructiveColor ?? theme.underlineColor,
-    '--destructive-bg': `color-mix(in srgb, ${semantic?.destructiveColor ?? theme.underlineColor} 10%, ${theme.surfaceBackground})`,
+    '--destructive-text': destructiveText,
+    '--destructive-bg': `color-mix(in srgb, ${destructiveText} 10%, ${usesDarkSurfaces ? theme.appBackground : theme.surfaceBackground})`,
     '--sync-success': '#35b779',
     '--sync-warning': '#ffd447',
     '--sync-neutral': semantic?.secondaryTextColor ?? theme.mutedTextColor,
     '--sync-danger': semantic?.destructiveColor ?? theme.underlineColor,
+    '--status-success-text': usesDarkSurfaces ? '#7FE0AD' : '#116B43',
     '--scrollbar-track': theme.scrollbarTrack,
     '--scrollbar-thumb': theme.scrollbarThumb,
     '--scrollbar-thumb-hover': theme.scrollbarThumbHover,

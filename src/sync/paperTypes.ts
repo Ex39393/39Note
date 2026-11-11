@@ -21,7 +21,9 @@ export const SYNC_LAYOUT_VERSION = 3 as const;
 /** Existing immutable package-v2 bytes remain valid and are never rewritten. */
 export const LEGACY_PAPER_PACKAGE_LAYOUT_VERSION = 2 as const;
 export const PAPER_PACKAGE_LAYOUT_VERSION = 3 as const;
-export const PAPER_SYNC_PROTOCOL_VERSION = 2 as const;
+/** Immutable protocol-2 packages remain readable after the root-last cutover. */
+export const LEGACY_PAPER_SYNC_PROTOCOL_VERSION = 2 as const;
+export const PAPER_SYNC_PROTOCOL_VERSION = 3 as const;
 export const LEGACY_PAPER_MANIFEST_STORAGE = 'immutable-paper-manifest-v2' as const;
 export const PAPER_MANIFEST_STORAGE = 'immutable-paper-manifest-v3' as const;
 /** Entity partitioning is unchanged by the source-artifact layout migration. */
@@ -29,6 +31,8 @@ export const PAPER_PAYLOAD_STORAGE = 'immutable-paper-payload-v2' as const;
 
 export type SupportedPaperPackageLayoutVersion =
   typeof LEGACY_PAPER_PACKAGE_LAYOUT_VERSION | typeof PAPER_PACKAGE_LAYOUT_VERSION;
+export type SupportedPaperSyncProtocolVersion =
+  typeof LEGACY_PAPER_SYNC_PROTOCOL_VERSION | typeof PAPER_SYNC_PROTOCOL_VERSION;
 
 export type PaperDirtyReason =
   | 'metadata'
@@ -75,6 +79,23 @@ export interface PaperDriveFileCache {
   fileIds: Record<string, string>;
 }
 
+/**
+ * Durable, local-only capability recording that the user explicitly confirmed
+ * one exact Targeted Purge. It is written before the first Drive mutation and
+ * retained until every local record and sync/catalog row has been removed.
+ * A restart can therefore re-preview and safely retry an interrupted purge
+ * without making the paper eligible for ordinary upload.
+ */
+export interface TargetedPaperPurgeCheckpoint {
+  version: 1;
+  operationId: string;
+  phase: 'cloud-cleanup-pending' | 'local-cleanup-pending';
+  confirmedAt: number;
+  accountId: string;
+  rootFolderId: string;
+  paperFolderId: string;
+}
+
 export interface PaperSyncState {
   documentId: string;
   /** Presentation only. Identity remains documentId. */
@@ -103,6 +124,8 @@ export interface PaperSyncState {
   presenceHeadIds?: string[];
   /** Logical removal succeeded, but the exact old folder still needs Drive Trash. */
   cloudCleanupPending?: boolean;
+  /** Local-only durable checkpoint for an explicitly confirmed Targeted Purge. */
+  targetedPurge?: TargetedPaperPurgeCheckpoint;
   lastSuccessfulAt?: number;
   temporarySessionId?: string;
 }
@@ -135,7 +158,7 @@ export interface RenderedPrintPdfDescriptor {
 
 interface PaperCloudManifestCommon {
   app: '39Note';
-  paperSyncProtocolVersion: typeof PAPER_SYNC_PROTOCOL_VERSION;
+  paperSyncProtocolVersion: SupportedPaperSyncProtocolVersion;
   payloadStorage: typeof PAPER_PAYLOAD_STORAGE;
   documentId: string;
   paperFolderId: string;
@@ -201,7 +224,14 @@ export interface PaperCloudSummary {
   presenceState?: 'present' | 'removed';
   presenceHeadIds?: string[];
   cleanupPending?: boolean;
-  issue?: { code: string; message: string };
+  issue?: {
+    code: string;
+    message: string;
+    /** Redacted local diagnostic only; never part of a Drive package. */
+    phase?: string;
+    /** Stable redacted classifier with no Drive or document identities. */
+    causeCode?: string;
+  };
 }
 
 export interface PaperPackageSnapshot {
@@ -279,11 +309,13 @@ export interface PaperTransferProgress {
 
 export type PaperLayoutState =
   | 'paper-v3'
+  | 'protocol-upgrade-required'
   | 'paper-v2-upgrade-required'
   | 'empty'
   | 'legacy-upgrade-required'
   | 'migration-incomplete'
-  | 'unsupported-layout';
+  | 'unsupported-layout'
+  | 'unsupported-protocol';
 
 export interface PaperLayoutInspection {
   rootFolderId: string;
@@ -293,4 +325,5 @@ export interface PaperLayoutInspection {
   controlManagedFileIds: string[];
   unknownFileIds: string[];
   detectedLayoutVersion?: number;
+  detectedPaperSyncProtocolVersion?: number;
 }

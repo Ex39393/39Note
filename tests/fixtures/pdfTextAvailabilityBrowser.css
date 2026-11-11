@@ -1,0 +1,18 @@
+.pdf-text-availability-fixture {
+  display: grid;
+  min-height: 100dvh;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 24px;
+  padding: 24px;
+  overflow: auto;
+  background: var(--theme-document-surround);
+}
+
+.pdf-text-availability-fixture > section {
+  min-width: 0;
+}
+
+.pdf-text-availability-fixture h1 {
+  color: var(--theme-heading);
+  font-size: 1rem;
+}

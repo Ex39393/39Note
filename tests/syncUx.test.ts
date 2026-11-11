@@ -558,8 +558,9 @@ test('drawer backup and sounds stay local and outside arbitrary React renders', 
   const control = source('../src/sync/SyncControl.tsx');
   const coordinator = source('../src/sync/coordinator.ts');
   const backup = source('../src/services/libraryBackup.ts');
-  assert.match(control, /await flushLocalPersistence\(\)/);
   assert.match(control, /await downloadLibraryBackup\(/);
+  assert.doesNotMatch(control, /flushLocalPersistence/);
+  assert.match(backup, /await flushLocalPersistence\(\)/);
   assert.doesNotMatch(control, /fetch\(/);
   assert.match(backup, /URL\.createObjectURL\(blob\)/);
   assert.match(backup, /link\.download = filename/);
@@ -569,6 +570,24 @@ test('drawer backup and sounds stay local and outside arbitrary React renders', 
   assert.match(control, /aria-controls=\{PANEL_ID\}/);
   assert.match(control, /aria-labelledby=\{PANEL_TITLE_ID\}/);
   assert.match(control, /aria-live="polite"/);
+});
+
+test('all backup surfaces rely on the central flush and expose recoverable failures', () => {
+  const paperControl = source('../src/sync/PaperSyncControl.tsx');
+  const legacyControl = source('../src/sync/SyncControl.tsx');
+  const library = source('../src/components/LibraryPanel.tsx');
+  const settings = source('../src/components/HomeWorkspace.tsx');
+  const backup = source('../src/services/libraryBackup.ts');
+
+  assert.match(backup, /await flushBackupPersistence\(\)/u);
+  assert.match(backup, /await flushLocalPersistence\(\)/u);
+  assert.doesNotMatch(paperControl, /flushLocalPersistence/u);
+  assert.doesNotMatch(legacyControl, /flushLocalPersistence/u);
+  for (const surface of [paperControl, legacyControl, library, settings]) {
+    assert.match(surface, /getBackupCreationErrorMessage/u);
+  }
+  assert.match(paperControl, /backupError[\s\S]*role="alert"/u);
+  assert.match(paperControl, /disabled=\{backupBusy\}/u);
 });
 
 function memoryStorage(): SyncSoundStorage {

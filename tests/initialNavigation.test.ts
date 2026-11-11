@@ -33,7 +33,8 @@ function resolve(
     activeRequestId: openRequest.requestId,
     activeNavigationEpoch: openRequest.navigationEpoch,
     savedReadingPosition: null,
-    annotationLookupState: openRequest.target?.type === 'annotation' ? 'found' : 'not-required',
+    annotationLookupState:
+      openRequest.target?.type === 'annotation' ? 'found' : 'not-required',
     documentReadyState: 'hydrated',
     pageCount: 30,
     ...overrides,
@@ -49,31 +50,40 @@ const annotationTarget = {
 
 test('explicit target takes priority over a saved position', () => {
   const openRequest = request(annotationTarget);
-  assert.deepEqual(resolve(openRequest, {
-    savedReadingPosition: savedPage23,
-    annotationLookupState: 'found',
-  }), {
-    type: 'explicit-annotation-target',
-    requestId: openRequest.requestId,
-    annotationId: annotationTarget.annotationId,
-    noteId: annotationTarget.noteId,
-  });
+  assert.deepEqual(
+    resolve(openRequest, {
+      savedReadingPosition: savedPage23,
+      annotationLookupState: 'found',
+    }),
+    {
+      type: 'explicit-annotation-target',
+      requestId: openRequest.requestId,
+      annotationId: annotationTarget.annotationId,
+      noteId: annotationTarget.noteId,
+    },
+  );
 });
 
 test('unhydrated annotation target waits', () => {
   const openRequest = request(annotationTarget);
-  assert.equal(resolve(openRequest, {
-    savedReadingPosition: savedPage23,
-    annotationLookupState: 'pending',
-    documentReadyState: 'loading',
-  })?.type, 'wait-for-explicit-target');
+  assert.equal(
+    resolve(openRequest, {
+      savedReadingPosition: savedPage23,
+      annotationLookupState: 'pending',
+      documentReadyState: 'loading',
+    })?.type,
+    'wait-for-explicit-target',
+  );
 });
 
 test('valid annotation target resolves after hydration', () => {
   const openRequest = request(annotationTarget);
-  assert.equal(resolve(openRequest, {
-    annotationLookupState: 'found',
-  })?.type, 'explicit-annotation-target');
+  assert.equal(
+    resolve(openRequest, {
+      annotationLookupState: 'found',
+    })?.type,
+    'explicit-annotation-target',
+  );
 });
 
 test('invalid target falls back to the valid saved position', () => {
@@ -83,34 +93,46 @@ test('invalid target falls back to the valid saved position', () => {
     annotationLookupState: 'missing',
   });
   assert.equal(decision?.type, 'invalid-target-fallback');
-  assert.equal(decision?.type === 'invalid-target-fallback' ? decision.fallback : null, 'saved-position');
+  assert.equal(
+    decision?.type === 'invalid-target-fallback' ? decision.fallback : null,
+    'saved-position',
+  );
 });
 
 test('normal open restores a valid saved position', () => {
   const openRequest = request(null);
-  assert.equal(resolve(openRequest, {
-    savedReadingPosition: savedPage23,
-    annotationLookupState: 'not-required',
-  })?.type, 'saved-position');
+  assert.equal(
+    resolve(openRequest, {
+      savedReadingPosition: savedPage23,
+      annotationLookupState: 'not-required',
+    })?.type,
+    'saved-position',
+  );
 });
 
 test('normal open without a saved position uses page one', () => {
   const openRequest = request(null);
-  assert.equal(resolve(openRequest, {
-    annotationLookupState: 'not-required',
-  })?.type, 'page-one');
+  assert.equal(
+    resolve(openRequest, {
+      annotationLookupState: 'not-required',
+    })?.type,
+    'page-one',
+  );
 });
 
 test('stale request id produces no decision', () => {
   const openRequest = request(annotationTarget);
-  assert.equal(resolveInitialNavigation({
-    openRequest,
-    activeRequestId: 'request-newer',
-    activeNavigationEpoch: openRequest.navigationEpoch,
-    savedReadingPosition: savedPage23,
-    annotationLookupState: 'found',
-    documentReadyState: 'hydrated',
-  }), null);
+  assert.equal(
+    resolveInitialNavigation({
+      openRequest,
+      activeRequestId: 'request-newer',
+      activeNavigationEpoch: openRequest.navigationEpoch,
+      savedReadingPosition: savedPage23,
+      annotationLookupState: 'found',
+      documentReadyState: 'hydrated',
+    }),
+    null,
+  );
 });
 
 test('invalid target without a saved position falls back to page one', () => {
@@ -119,7 +141,10 @@ test('invalid target without a saved position falls back to page one', () => {
     annotationLookupState: 'missing',
   });
   assert.equal(decision?.type, 'invalid-target-fallback');
-  assert.equal(decision?.type === 'invalid-target-fallback' ? decision.fallback : null, 'page-one');
+  assert.equal(
+    decision?.type === 'invalid-target-fallback' ? decision.fallback : null,
+    'page-one',
+  );
 });
 
 test('consumed explicit request never produces saved-position', () => {
@@ -127,20 +152,26 @@ test('consumed explicit request never produces saved-position', () => {
     ...request(annotationTarget),
     target: null,
   };
-  assert.equal(resolve(openRequest, {
-    savedReadingPosition: savedPage23,
-    annotationLookupState: 'not-required',
-  }), null);
+  assert.equal(
+    resolve(openRequest, {
+      savedReadingPosition: savedPage23,
+      annotationLookupState: 'not-required',
+    }),
+    null,
+  );
 });
 
 test('stale navigation epoch produces no decision', () => {
   const openRequest = request(annotationTarget);
-  assert.equal(resolveInitialNavigation({
-    openRequest,
-    activeRequestId: openRequest.requestId,
-    activeNavigationEpoch: openRequest.navigationEpoch + 1,
-    savedReadingPosition: savedPage23,
-    annotationLookupState: 'found',
-    documentReadyState: 'hydrated',
-  }), null);
+  assert.equal(
+    resolveInitialNavigation({
+      openRequest,
+      activeRequestId: openRequest.requestId,
+      activeNavigationEpoch: openRequest.navigationEpoch + 1,
+      savedReadingPosition: savedPage23,
+      annotationLookupState: 'found',
+      documentReadyState: 'hydrated',
+    }),
+    null,
+  );
 });

@@ -1,0 +1,9 @@
+# Generated dictionary shards are intentionally compact runtime data.
+public/dictionary/
+
+# PDF.js support files and license text are copied third-party artifacts.
+public/pdfjs-wasm/
+public/licenses/
+
+# The root rights-reserved notice is intentionally extensionless for repository hosts.
+LICENSE

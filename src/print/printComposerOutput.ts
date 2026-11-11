@@ -93,6 +93,16 @@ export function sanitizeComposerHtml(html: string): string {
   return main.innerHTML;
 }
 
+export function createIdempotentPrintAction(action: () => void): () => boolean {
+  let hasPrinted = false;
+  return () => {
+    if (hasPrinted) return false;
+    hasPrinted = true;
+    action();
+    return true;
+  };
+}
+
 export function printComposerHtml(
   html: string,
   documentTitle: string,
@@ -102,9 +112,15 @@ export function printComposerHtml(
   const printWindow = window.open('', '_blank', 'width=980,height=780');
   if (!printWindow) return null;
   let completed = false;
+  let cleanupTimer: number | null = null;
+  let readinessTimer: number | null = null;
   const cleanup = () => {
     if (completed) return;
     completed = true;
+    if (cleanupTimer !== null) window.clearTimeout(cleanupTimer);
+    if (readinessTimer !== null) window.clearTimeout(readinessTimer);
+    window.removeEventListener('pagehide', cleanup);
+    if (!printWindow.closed) printWindow.close();
     onComplete();
   };
   const safeTitle = escapeHtml(documentTitle);
@@ -136,21 +152,23 @@ export function printComposerHtml(
   @media print { a { color: inherit; } }
 </style></head><body class="${getPrintTemplateClassName(presentation)}" data-print-template="${presentation.baseTemplateId}" data-print-content="${presentation.contentMode}"><main>${safeContent}</main></body></html>`);
   printWindow.document.close();
+  const runPrintOnce = createIdempotentPrintAction(() => {
+    printWindow.addEventListener('afterprint', cleanup, { once: true });
+    cleanupTimer = window.setTimeout(cleanup, 120_000);
+    printWindow.focus();
+    printWindow.print();
+  });
   const print = () => {
     if (printWindow.closed) {
       cleanup();
       return;
     }
-    printWindow.addEventListener('afterprint', cleanup, { once: true });
-    printWindow.focus();
-    printWindow.print();
+    runPrintOnce();
   };
+  window.addEventListener('pagehide', cleanup, { once: true });
   printWindow.addEventListener('load', print, { once: true });
-  window.setTimeout(print, 50);
-  return () => {
-    if (!printWindow.closed) printWindow.close();
-    cleanup();
-  };
+  readinessTimer = window.setTimeout(print, 50);
+  return cleanup;
 }
 
 function escapeHtml(value: string): string {

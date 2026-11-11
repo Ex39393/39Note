@@ -49,12 +49,15 @@ export function defaultDirtyPaperSelection(
 export function pendingSyncPaperIds(
   states: readonly Pick<
     PaperSyncState,
-    'documentId' | 'dirtyReasons' | 'cloudPresence'
+    'documentId' | 'dirtyReasons' | 'cloudPresence' | 'targetedPurge'
   >[],
 ): string[] {
   return states
     .filter(
-      (state) => state.dirtyReasons.length > 0 && state.cloudPresence !== 'removed',
+      (state) =>
+        state.dirtyReasons.length > 0 &&
+        state.cloudPresence !== 'removed' &&
+        state.targetedPurge === undefined,
     )
     .map((state) => state.documentId)
     .sort();

@@ -15,6 +15,7 @@ import { DrawerEdgeHandle } from './DrawerEdgeHandle';
 
 interface SidebarProps {
   isCollapsed: boolean;
+  isModal?: boolean;
   onToggle: () => void;
   width: number;
   onWidthChange: (width: number) => void;
@@ -46,6 +47,7 @@ function readSplitPreference(): number {
 
 export function Sidebar({
   isCollapsed,
+  isModal = false,
   onToggle,
   width,
   onWidthChange,
@@ -115,9 +117,12 @@ export function Sidebar({
 
   return (
     <aside
+      id="reader-mobile-tools-panel"
       className="sidebar reader-tools-sidebar"
-      aria-label="Reader Tools"
-      aria-hidden={isCollapsed}
+      aria-label="Navigation and annotations"
+      aria-modal={isModal && !isCollapsed ? true : undefined}
+      role={isModal && !isCollapsed ? 'dialog' : undefined}
+      tabIndex={-1}
       data-reader-occlusion-active={isCollapsed ? 'false' : 'true'}
       data-reader-occlusion-edge="left"
       style={
@@ -127,7 +132,19 @@ export function Sidebar({
         } as CSSProperties
       }
     >
-      <div className="sidebar-inner reader-tools-inner">
+      <div
+        className="sidebar-inner reader-tools-inner"
+        aria-hidden={isCollapsed ? true : undefined}
+        inert={isCollapsed ? true : undefined}
+      >
+        <button
+          aria-label="Close navigation and annotations"
+          className="sidebar-mobile-close"
+          type="button"
+          onClick={onToggle}
+        >
+          <span aria-hidden="true">×</span>
+        </button>
         <section
           className={`sidebar-section reader-tool-section navigation-tool ${isNavigationOpen ? 'is-open' : ''}`}
         >
@@ -196,13 +213,17 @@ export function Sidebar({
         </section>
       </div>
       <DrawerEdgeHandle
-        accessibleLabel={isCollapsed ? 'Open Reader Tools' : 'Collapse Reader Tools'}
+        accessibleLabel={
+          isCollapsed
+            ? 'Open navigation and annotations'
+            : 'Collapse navigation and annotations'
+        }
         isOpen={!isCollapsed}
         side="left"
         onToggle={onToggle}
       />
       <button
-        aria-label="Resize Reader Tools panel"
+        aria-label="Resize navigation and annotations panel"
         className="sidebar-resize-handle"
         tabIndex={-1}
         type="button"

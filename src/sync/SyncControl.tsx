@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { downloadLibraryBackup } from '../services/libraryBackup.ts';
-import { flushLocalPersistence } from '../services/persistentChange.ts';
+import {
+  downloadLibraryBackup,
+  getBackupCreationErrorMessage,
+} from '../services/libraryBackup.ts';
 import {
   getSyncUiStatus,
   getGoogleDriveSyncCoordinator,
@@ -97,13 +99,12 @@ export function SyncControl() {
     setBackupMessage(null);
     setBackupProgress({ completed: 0, total: 0 });
     try {
-      await flushLocalPersistence();
       await downloadLibraryBackup((completed, total) => {
         setBackupProgress({ completed, total });
       });
       setBackupMessage('Local backup downloaded.');
-    } catch {
-      setBackupError('The local 39Note backup could not be created. Please try again.');
+    } catch (error) {
+      setBackupError(getBackupCreationErrorMessage(error));
     } finally {
       setBackupProgress(null);
     }
@@ -645,15 +646,19 @@ function IssueDetails({ state }: { state: SyncViewState }) {
         <dt>Ordinary sync</dt>
         <dd>{issue.blocksOrdinarySync ? 'Paused' : 'May retry'}</dd>
       </div>
-      <div>
-        <dt>Source</dt>
-        <dd>
-          {issue.diagnostic.source}
-          {issue.diagnostic.httpStatus ? ` · HTTP ${issue.diagnostic.httpStatus}` : ''}
-          {issue.diagnostic.reason ? ` · ${issue.diagnostic.reason}` : ''}
-          {issue.diagnostic.operation ? ` · ${issue.diagnostic.operation}` : ''}
-        </dd>
-      </div>
+      {import.meta.env.DEV ? (
+        <div>
+          <dt>Source</dt>
+          <dd>
+            {issue.diagnostic.source}
+            {issue.diagnostic.httpStatus
+              ? ` · HTTP ${issue.diagnostic.httpStatus}`
+              : ''}
+            {issue.diagnostic.reason ? ` · ${issue.diagnostic.reason}` : ''}
+            {issue.diagnostic.operation ? ` · ${issue.diagnostic.operation}` : ''}
+          </dd>
+        </div>
+      ) : null}
     </dl>
   );
 }
@@ -667,29 +672,38 @@ function IntegrityDetails({ state }: { state: SyncViewState }) {
         <dt>Affected item</dt>
         <dd>{integrityTypeLabel(issue.logicalType)}</dd>
       </div>
-      {issue.documentId ? (
+      {issue.documentTitle || (import.meta.env.DEV && issue.documentId) ? (
         <div>
           <dt>Document</dt>
           <dd>
-            {issue.documentTitle ? <>{issue.documentTitle} · </> : null}
-            <code>{issue.documentId}</code>
+            {issue.documentTitle ?? 'Affected document'}
+            {import.meta.env.DEV && issue.documentId ? (
+              <>
+                {' · '}
+                <code>{issue.documentId}</code>
+              </>
+            ) : null}
           </dd>
         </div>
       ) : null}
-      <div>
-        <dt>Drive role</dt>
-        <dd>
-          <code>{issue.logicalPath}</code>
-        </dd>
-      </div>
-      <div>
-        <dt>Verification</dt>
-        <dd>
-          expected {issue.expectedHashPrefix}… · downloaded {issue.actualHashPrefix}… ·
-          file {issue.fileIdFingerprint}
-          {issue.driveFileVersion ? ` · version ${issue.driveFileVersion}` : ''}
-        </dd>
-      </div>
+      {import.meta.env.DEV ? (
+        <>
+          <div>
+            <dt>Drive role</dt>
+            <dd>
+              <code>{issue.logicalPath}</code>
+            </dd>
+          </div>
+          <div>
+            <dt>Verification</dt>
+            <dd>
+              expected {issue.expectedHashPrefix}… · downloaded {issue.actualHashPrefix}
+              … · file {issue.fileIdFingerprint}
+              {issue.driveFileVersion ? ` · version ${issue.driveFileVersion}` : ''}
+            </dd>
+          </div>
+        </>
+      ) : null}
       <div>
         <dt>Evidence</dt>
         <dd>

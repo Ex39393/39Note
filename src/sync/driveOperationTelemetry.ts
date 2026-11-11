@@ -6,6 +6,7 @@ export type DriveSyncOperationType =
   | 'keep-local'
   | 'remove'
   | 'restore'
+  | 'restore-revalidation'
   | 'upload'
   | 'scan'
   | 'migration'

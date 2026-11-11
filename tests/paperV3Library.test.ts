@@ -108,7 +108,7 @@ test('Paper-v3 Library bulk Drive removal is selective, independent, and explici
       assert.match(method, /outcome\.failed\.push/u);
       assert.match(
         method,
-        /if \(settledCloud\.length\) await this\.applyTransferCatalog/u,
+        /if \(settledCloud\.length\) \{\s*await this\.applyTransferCatalog\(/u,
       );
       assert.doesNotMatch(method, /rollback|Promise\.all\(/iu);
       assert.equal(
@@ -423,7 +423,7 @@ test('Paper-v3 Library cloud management remains identity-safe and explicit', asy
     const coordinator = source('../src/sync/paperCoordinator.ts');
     assert.match(
       panel,
-      /will stay on this device with its source document, annotations, Notes, Glossary, reading state, Collections, Tags, and Print Draft/u,
+      /will stay on this device with its source document, annotations, Notes, Glossary, reading state, Collections, and Print Draft/u,
     );
     assert.match(coordinator, /state\.availability = 'local-only'/u);
     assert.match(coordinator, /state\.cloudPresence = 'removed'/u);
@@ -434,7 +434,7 @@ test('Paper-v3 Library cloud management remains identity-safe and explicit', asy
     const localBranch = coordinator.indexOf('if (hasLocalCopy) {');
     const cloudOnlyBranch = coordinator.indexOf('} else {', localBranch);
     const deleteRecord = coordinator.indexOf(
-      'await deletePaperSyncRecords([documentId]);',
+      'await deletePaperSyncRecords(',
       cloudOnlyBranch,
     );
     const nextLocalFactory = coordinator.indexOf(

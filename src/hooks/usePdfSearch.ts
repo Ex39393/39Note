@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { PDFDocumentProxy } from 'pdfjs-dist';
 import type { PdfSearchPageIndex, PdfSearchResult } from '../types/pdfSearch';
 import { createPdfSearchPageIndex, findPdfSearchResults } from '../utils/pdfSearch';
+import { mergePdfSearchPageIndexes } from '../utils/pdfOcr.ts';
 
 export interface PdfSearchController {
   isOpen: boolean;
@@ -17,7 +18,10 @@ export interface PdfSearchController {
   goToPreviousResult: () => void;
 }
 
-export function usePdfSearch(document: PDFDocumentProxy | null): PdfSearchController {
+export function usePdfSearch(
+  document: PDFDocumentProxy | null,
+  supplementalIndexes: readonly PdfSearchPageIndex[] = [],
+): PdfSearchController {
   const [isOpen, setIsOpen] = useState(false);
   const [query, setQuery] = useState('');
   const [index, setIndex] = useState<PdfSearchPageIndex[]>([]);
@@ -73,7 +77,9 @@ export function usePdfSearch(document: PDFDocumentProxy | null): PdfSearchContro
           if (isDisposed || generation !== generationRef.current) {
             return;
           }
-          const orderedIndex = [...nextIndex].sort((first, second) => first.pageNumber - second.pageNumber);
+          const orderedIndex = [...nextIndex].sort(
+            (first, second) => first.pageNumber - second.pageNumber,
+          );
           indexRef.current = orderedIndex;
           setIndex(orderedIndex);
           setIndexedPageCount(orderedIndex.length);
@@ -91,8 +97,16 @@ export function usePdfSearch(document: PDFDocumentProxy | null): PdfSearchContro
     };
   }, [document, isOpen, query]);
 
-  const results = useMemo(() => findPdfSearchResults(index, query), [index, query]);
-  const activeResult = results.find((result) => result.id === activeResultId) ?? results[0] ?? null;
+  const searchableIndex = useMemo(
+    () => mergePdfSearchPageIndexes(index, supplementalIndexes),
+    [index, supplementalIndexes],
+  );
+  const results = useMemo(
+    () => findPdfSearchResults(searchableIndex, query),
+    [query, searchableIndex],
+  );
+  const activeResult =
+    results.find((result) => result.id === activeResultId) ?? results[0] ?? null;
 
   useEffect(() => {
     if (activeResult?.id !== activeResultId) {
@@ -100,16 +114,27 @@ export function usePdfSearch(document: PDFDocumentProxy | null): PdfSearchContro
     }
   }, [activeResult, activeResultId]);
 
-  const moveResult = useCallback((direction: 1 | -1) => {
-    if (results.length === 0) {
-      return;
-    }
-    const currentIndex = activeResult
-      ? results.findIndex((result) => result.id === activeResult.id)
-      : -1;
-    const nextIndex = (currentIndex + direction + results.length) % results.length;
-    setActiveResultId(results[nextIndex].id);
-  }, [activeResult, results]);
+  const moveResult = useCallback(
+    (direction: 1 | -1) => {
+      if (results.length === 0) {
+        return;
+      }
+      const currentIndex = activeResult
+        ? results.findIndex((result) => result.id === activeResult.id)
+        : -1;
+      const nextIndex = (currentIndex + direction + results.length) % results.length;
+      setActiveResultId(results[nextIndex].id);
+    },
+    [activeResult, results],
+  );
+  const open = useCallback(() => setIsOpen(true), []);
+  const close = useCallback(() => {
+    setIsOpen(false);
+    setQuery('');
+    setActiveResultId(null);
+  }, []);
+  const goToNextResult = useCallback(() => moveResult(1), [moveResult]);
+  const goToPreviousResult = useCallback(() => moveResult(-1), [moveResult]);
 
   return {
     isOpen,
@@ -118,15 +143,11 @@ export function usePdfSearch(document: PDFDocumentProxy | null): PdfSearchContro
     query,
     results,
     activeResult,
-    open: () => setIsOpen(true),
-    close: () => {
-      setIsOpen(false);
-      setQuery('');
-      setActiveResultId(null);
-    },
+    open,
+    close,
     setQuery,
-    goToNextResult: () => moveResult(1),
-    goToPreviousResult: () => moveResult(-1),
+    goToNextResult,
+    goToPreviousResult,
   };
 }
 

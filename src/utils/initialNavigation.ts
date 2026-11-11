@@ -56,9 +56,9 @@ export function resolveInitialNavigation({
   pageCount,
 }: ResolveInitialNavigationInput): InitialNavigationDecision | null {
   if (
-    !openRequest
-    || openRequest.requestId !== activeRequestId
-    || openRequest.navigationEpoch !== activeNavigationEpoch
+    !openRequest ||
+    openRequest.requestId !== activeRequestId ||
+    openRequest.navigationEpoch !== activeNavigationEpoch
   ) {
     return null;
   }
@@ -75,7 +75,10 @@ export function resolveInitialNavigation({
       }
 
       if (annotationLookupState === 'missing') {
-        const validSavedPosition = getValidReadingPosition(savedReadingPosition, pageCount);
+        const validSavedPosition = getValidReadingPosition(
+          savedReadingPosition,
+          pageCount,
+        );
         return validSavedPosition
           ? {
               type: 'invalid-target-fallback',
@@ -131,15 +134,15 @@ export function getValidReadingPosition(
   pageCount?: number,
 ): ReadingPosition | null {
   if (
-    !position
-    || !Number.isInteger(position.pageNumber)
-    || position.pageNumber < 1
-    || (pageCount !== undefined && pageCount > 0 && position.pageNumber > pageCount)
-    || !Number.isFinite(position.pageOffsetRatio)
-    || position.pageOffsetRatio < 0
-    || position.pageOffsetRatio > 1
-    || !Number.isFinite(position.zoomPercent)
-    || position.zoomPercent <= 0
+    !position ||
+    !Number.isInteger(position.pageNumber) ||
+    position.pageNumber < 1 ||
+    (pageCount !== undefined && pageCount > 0 && position.pageNumber > pageCount) ||
+    !Number.isFinite(position.pageOffsetRatio) ||
+    position.pageOffsetRatio < 0 ||
+    position.pageOffsetRatio > 1 ||
+    !Number.isFinite(position.zoomPercent) ||
+    position.zoomPercent <= 0
   ) {
     return null;
   }

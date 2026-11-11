@@ -48,13 +48,19 @@ for (const word of words) {
 await mkdir(outputRoot, { recursive: true });
 await writeFile(outputPath, bytes);
 
-console.log(JSON.stringify({
-  outputPath,
-  entries: words.size,
-  bitCount,
-  hashCount,
-  bytes: bytes.length,
-}, null, 2));
+console.log(
+  JSON.stringify(
+    {
+      outputPath,
+      entries: words.size,
+      bitCount,
+      hashCount,
+      bytes: bytes.length,
+    },
+    null,
+    2,
+  ),
+);
 
 function getBloomHashes(value) {
   const firstHash = fnv1a(value, 0x811c9dc5);

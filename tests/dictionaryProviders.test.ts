@@ -9,10 +9,7 @@ import {
   moveDefinitionUp,
 } from '../src/utils/dictionary.ts';
 import { runProgressiveDictionaryLookup } from '../src/utils/progressiveDictionary.ts';
-import {
-  NcbiRequestQueue,
-  runBoundedRetry,
-} from '../src/utils/ncbiRequestPolicy.ts';
+import { NcbiRequestQueue, runBoundedRetry } from '../src/utils/ncbiRequestPolicy.ts';
 import { createSharedRequestRegistry } from '../src/services/dictionary/sharedRequest.ts';
 import { parseWiktionaryDefinitions } from '../src/services/dictionary/providers/wiktionaryParser.ts';
 import {
@@ -36,8 +33,12 @@ const dictionaryServiceSource = source('../src/services/dictionaryService.ts');
 const dictionaryCacheSource = source('../src/services/dictionary/dictionaryCache.ts');
 const libraryBackupSource = source('../src/services/libraryBackup.ts');
 const meshProviderSource = source('../src/services/dictionary/providers/mesh.ts');
-const ncbiQueueSource = source('../src/services/dictionary/providers/ncbiRequestQueue.ts');
-const wiktionaryProviderSource = source('../src/services/dictionary/providers/wiktionary.ts');
+const ncbiQueueSource = source(
+  '../src/services/dictionary/providers/ncbiRequestQueue.ts',
+);
+const wiktionaryProviderSource = source(
+  '../src/services/dictionary/providers/wiktionary.ts',
+);
 const notesPanelSource = source('../src/components/NotesPanel.tsx');
 const dictionarySourcesDocumentation = source('../DICTIONARY_SOURCES.md');
 
@@ -288,7 +289,9 @@ test('useful general coverage prevents unnecessary MeSH fallback', async () => {
       normalizedWord: 'participant',
       definitions: [definition('local', 'Someone who takes part.', wordNetSource)],
     }),
-    generalLookups: [async () => [definition('wiki', 'One who participates.', wiktionarySource)]],
+    generalLookups: [
+      async () => [definition('wiki', 'One who participates.', wiktionarySource)],
+    ],
     specialistLookup: async () => {
       specialistCalls += 1;
       return [definition('mesh', 'Specialist.', meshSource)];
@@ -309,10 +312,12 @@ test('empty general coverage allows MeSH only after Wiktionary completes', async
   await runProgressiveDictionaryLookup({
     fallbackNormalizedWord: 'specialistterm',
     localLookup: async () => ({ normalizedWord: 'specialistterm', definitions: [] }),
-    generalLookups: [async () => {
-      events.push('wiktionary');
-      return [];
-    }],
+    generalLookups: [
+      async () => {
+        events.push('wiktionary');
+        return [];
+      },
+    ],
     specialistLookup: async () => {
       events.push('mesh');
       return [definition('mesh', 'Specialist definition.', meshSource)];
@@ -436,7 +441,10 @@ test('AbortController cancels queued NCBI work before it starts', async () => {
   const first = deferred<string>();
   let secondStarted = false;
   const queue = new NcbiRequestQueue(0);
-  const firstRequest = queue.schedule(() => first.promise, new AbortController().signal);
+  const firstRequest = queue.schedule(
+    () => first.promise,
+    new AbortController().signal,
+  );
   const secondController = new AbortController();
   const secondRequest = queue.schedule(async () => {
     secondStarted = true;
@@ -464,7 +472,8 @@ test('HTTP 429/transient retry uses bounded exponential backoff', async () => {
       baseBackoffMs: 500,
       maxBackoffMs: 2_000,
       isTransient: (error) => (error as { status?: number }).status === 429,
-      getRetryAfterMs: (error) => (error as { retryAfterMs?: number | null }).retryAfterMs ?? null,
+      getRetryAfterMs: (error) =>
+        (error as { retryAfterMs?: number | null }).retryAfterMs ?? null,
       delay: async (milliseconds) => {
         delays.push(milliseconds);
       },
@@ -477,12 +486,18 @@ test('HTTP 429/transient retry uses bounded exponential backoff', async () => {
 
 test('provider identification and privacy wording remain provider-specific', () => {
   assert.match(wiktionaryProviderSource, /'Api-User-Agent'/);
-  assert.match(wiktionaryProviderSource, /39Note\/0\.1\.0 \(https:\/\/github\.com\/Ex39393\/39Note\)/);
+  assert.match(
+    wiktionaryProviderSource,
+    /39Note\/1\.0\.0 \(https:\/\/github\.com\/Ex39393\/39Note\)/,
+  );
   assert.match(meshProviderSource, /searchParams\.set\('tool', '39Note'\)/);
   assert.doesNotMatch(meshProviderSource, /searchParams\.set\('email'/);
   assert.match(ncbiQueueSource, /runBoundedRetry/);
   assert.match(notesPanelSource, /Normal network metadata may still be/);
-  assert.match(dictionarySourcesDocumentation, /Normal network metadata may still be visible/);
+  assert.match(
+    dictionarySourcesDocumentation,
+    /Normal network metadata may still be visible/,
+  );
   assert.doesNotMatch(dictionarySourcesDocumentation, /never sends.*user identity/i);
 });
 

@@ -84,7 +84,7 @@ test('OAuth start uses offline Web Server flow, PKCE S256, state, and only drive
   assert.equal(started.authorization.searchParams.get('access_type'), 'offline');
   assert.equal(
     started.authorization.searchParams.get('include_granted_scopes'),
-    'true',
+    'false',
   );
   assert.equal(started.authorization.searchParams.get('code_challenge_method'), 'S256');
   const storedState = [...store.oauthStates.values()][0];
@@ -372,6 +372,59 @@ test('Google code-exchange and Drive-identity 5xx or malformed responses are saf
   }
 });
 
+test('code exchange and refresh reject every broader or missing Google scope', async () => {
+  for (const scope of [
+    `${GOOGLE_DRIVE_SCOPE} https://www.googleapis.com/auth/drive`,
+    `${GOOGLE_DRIVE_SCOPE} https://www.googleapis.com/auth/userinfo.email`,
+    null,
+  ]) {
+    const code = harness({
+      codeResponses: [
+        {
+          body: tokenBody('over-scoped-code', 'refresh-token', scope),
+        },
+      ],
+    });
+    const started = await startAuthorization(code.app, 'device-alpha', randomToken());
+    const callback = await code.app(
+      new Request(
+        `${WORKER_ORIGIN}/api/oauth/callback?state=${started.state}&code=valid`,
+      ),
+    );
+    assert.equal(
+      redirectFragment(callback).get('sync_auth_error'),
+      'authorization_rejected',
+    );
+    assert.equal(code.store.users.size, 0);
+  }
+
+  for (const scope of [
+    `${GOOGLE_DRIVE_SCOPE} https://www.googleapis.com/auth/drive`,
+    null,
+  ]) {
+    const refresh = harness({
+      codeResponses: [{ body: tokenBody('code-access', 'refresh-token') }],
+      refreshResponses: [
+        {
+          body: tokenBody('unsafe-refresh', undefined, scope),
+        },
+      ],
+    });
+    const authorized = await authorizeDevice(refresh.app, 'device-alpha');
+    const response = await authenticated(
+      refresh.app,
+      '/api/google/access-token',
+      authorized.sessionToken,
+      { method: 'POST' },
+    );
+    assert.equal(response.status, 401);
+    assert.deepEqual(await response.json(), {
+      error: 'google_reauthorization_required',
+    });
+    assert.equal([...refresh.store.users.values()][0].revokedAt, refresh.now());
+  }
+});
+
 test('authorization grants reject wrong verifier, device, origin, and double use', async () => {
   const { app } = harness({
     codeResponses: [{ body: tokenBody('access', 'refresh') }],
@@ -484,6 +537,47 @@ test('OAuth start applies a bounded per-origin/device rate safeguard', async () 
   }
   assert.equal(last?.status, 429);
   assert.deepEqual(await last?.json(), { error: 'rate_limited' });
+});
+
+test('OAuth start also bounds unique devices by the Cloudflare client address', async () => {
+  const { app, store } = harness();
+  let last: Response | undefined;
+  for (let count = 0; count < 31; count += 1) {
+    last = await api(
+      app,
+      '/api/oauth/start',
+      {
+        deviceId: `device-${count.toString().padStart(8, '0')}`,
+        exchangeChallenge: await sha256Base64Url(randomToken()),
+        returnUrl: `${ORIGIN}/reader`,
+      },
+      ORIGIN,
+      {
+        'CF-Connecting-IP': '203.0.113.10',
+        'X-Forwarded-For': `198.51.100.${count + 1}`,
+      },
+    );
+  }
+  assert.equal(last?.status, 429);
+  assert.deepEqual(await last?.json(), { error: 'rate_limited' });
+  assert.equal(store.oauthStates.size, 30);
+
+  const independentClient = await api(
+    app,
+    '/api/oauth/start',
+    {
+      deviceId: 'independent-device',
+      exchangeChallenge: await sha256Base64Url(randomToken()),
+      returnUrl: `${ORIGIN}/reader`,
+    },
+    ORIGIN,
+    {
+      'CF-Connecting-IP': '203.0.113.11',
+      'X-Forwarded-For': '203.0.113.10',
+    },
+  );
+  assert.equal(independentClient.status, 200);
+  assert.equal(store.oauthStates.size, 31);
 });
 
 test('random and revoked sessions fail; this-device disconnect revokes only that session', async () => {
@@ -786,11 +880,16 @@ function api(
   path: string,
   body: unknown,
   origin = ORIGIN,
+  additionalHeaders: Record<string, string> = {},
 ) {
   return app(
     new Request(`${WORKER_ORIGIN}${path}`, {
       method: 'POST',
-      headers: { Origin: origin, 'Content-Type': 'application/json' },
+      headers: {
+        Origin: origin,
+        'Content-Type': 'application/json',
+        ...additionalHeaders,
+      },
       body: JSON.stringify(body),
     }),
   );
@@ -820,11 +919,15 @@ function redirectFragment(response: Response): URLSearchParams {
   return new URLSearchParams(new URL(location).hash.replace(/^#/u, ''));
 }
 
-function tokenBody(accessToken: string, refreshToken?: string) {
+function tokenBody(
+  accessToken: string,
+  refreshToken?: string,
+  scope: string | null = GOOGLE_DRIVE_SCOPE,
+) {
   return {
     access_token: accessToken,
     expires_in: 3600,
-    scope: GOOGLE_DRIVE_SCOPE,
+    ...(scope === null ? {} : { scope }),
     ...(refreshToken ? { refresh_token: refreshToken } : {}),
   };
 }

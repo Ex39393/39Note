@@ -18,9 +18,7 @@ export function createSelectedTextContext(
     throw new Error('Select text in the PDF before using Selected text scope.');
   }
 
-  const pages = [
-    ...new Set(selectedText.map((selection) => selection.pageNumber)),
-  ];
+  const pages = [...new Set(selectedText.map((selection) => selection.pageNumber))];
   const bounded = text.slice(0, contextCharacterBudget);
   return {
     excerpts: `--- DOCUMENT EXCERPT | selected text | pages ${pages.join(', ')} ---\n${bounded}`,

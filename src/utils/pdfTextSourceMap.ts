@@ -28,20 +28,22 @@ export function attachPdfTextSourceMap(
 ): PdfTextSourceMap {
   const items = textContent.items.flatMap((item, index) => {
     if (!('str' in item)) return [];
-    return [{
-      index,
-      str: item.str,
-      hasEOL: item.hasEOL,
-      width: item.width,
-      height: item.height,
-      transform: [...item.transform],
-      fontName: item.fontName,
-    } satisfies PdfTextSourceItem];
+    return [
+      {
+        index,
+        str: item.str,
+        hasEOL: item.hasEOL,
+        width: item.width,
+        height: item.height,
+        transform: [...item.transform],
+        fontName: item.fontName,
+      } satisfies PdfTextSourceItem,
+    ];
   });
   const sourceMap: PdfTextSourceMap = {
     pageNumber,
     items,
-    lineBoundaries: items.flatMap((item) => item.hasEOL ? [item.index] : []),
+    lineBoundaries: items.flatMap((item) => (item.hasEOL ? [item.index] : [])),
   };
   sourceMaps.set(textLayer, sourceMap);
   mapTextLayerNodes(textLayer, items);
@@ -52,15 +54,11 @@ export function detachPdfTextSourceMap(textLayer: HTMLElement): void {
   sourceMaps.delete(textLayer);
 }
 
-export function getPdfTextSourceMap(
-  textLayer: HTMLElement,
-): PdfTextSourceMap | null {
+export function getPdfTextSourceMap(textLayer: HTMLElement): PdfTextSourceMap | null {
   return sourceMaps.get(textLayer) ?? null;
 }
 
-export function getPdfTextSourceItem(
-  textNode: Text,
-): PdfTextSourceItem | null {
+export function getPdfTextSourceItem(textNode: Text): PdfTextSourceItem | null {
   return sourceItemsByTextNode.get(textNode) ?? null;
 }
 

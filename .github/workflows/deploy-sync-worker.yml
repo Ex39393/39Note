@@ -30,6 +30,8 @@ jobs:
           cache-dependency-path: sync-worker/package-lock.json
       - name: Install Worker dependencies
         run: npm ci
+      - name: Audit high-severity Worker dependency vulnerabilities
+        run: npm audit --audit-level=high
       - name: Run Worker tests
         run: npm test
       - name: Type-check Worker
@@ -38,10 +40,13 @@ jobs:
         run: npm run build
 
   deploy:
-    if: ${{ vars.SYNC_WORKER_DEPLOY_ENABLED == 'true' }}
+    if: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/master' && vars.SYNC_WORKER_DEPLOY_ENABLED == 'true' }}
     needs: validate
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    concurrency:
+      group: sync-worker-production
+      cancel-in-progress: false
     defaults:
       run:
         working-directory: sync-worker

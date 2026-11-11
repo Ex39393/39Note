@@ -1,4 +1,6 @@
 import {
+  lazy,
+  Suspense,
   useCallback,
   useEffect,
   useMemo,
@@ -8,27 +10,33 @@ import {
   type ReactNode,
 } from 'react';
 import {
-  createTag,
   deleteCollection,
-  deleteTag,
   listCollections,
   listLibraryDocuments,
-  listTags,
-  renameTag,
   saveCollectionDraft,
-  updateDocumentOrganization,
   type LibraryDocument,
 } from '../services/annotationPersistence.ts';
-import { downloadLibraryBackup } from '../services/libraryBackup.ts';
+import {
+  downloadLibraryBackup,
+  getBackupCreationErrorMessage,
+} from '../services/libraryBackup.ts';
 import { isTemporaryWorkspaceActive } from '../services/temporaryWorkspace.ts';
 import { readingThemes, themes } from '../themes.ts';
 import { useTheme } from '../theme/ThemeContext.ts';
-import type { CollectionRecord, TagRecord } from '../types/library.ts';
+import type { CollectionRecord } from '../types/library.ts';
 import { PANEL_MOTION_MS } from '../uiMotion.ts';
+import {
+  markGettingStartedCompleted,
+  markGettingStartedDismissed,
+  readGettingStartedPreference,
+  shouldAutoOpenGettingStarted,
+} from '../utils/gettingStarted.ts';
+import type { ReaderStatusIndicatorDisplay } from '../utils/readerPreferences.ts';
 import {
   CollectionDraftPaperList,
   CollectionView,
 } from './CollectionWorkspaceViews.tsx';
+import { FeedbackNotice } from './FeedbackNotice.tsx';
 import {
   beginCollectionCreate,
   beginCollectionEdit,
@@ -40,19 +48,42 @@ import {
   updateCollectionDraftMembership,
 } from './collectionEditorModel.ts';
 
+const GettingStartedWalkthrough = lazy(() =>
+  import('./GettingStartedWalkthrough.tsx').then((module) => ({
+    default: module.GettingStartedWalkthrough,
+  })),
+);
+
 export type HomeSection =
-  'home' | 'library' | 'collections' | 'tags' | 'theme' | 'ai' | 'drive' | 'settings';
+  'home' | 'library' | 'collections' | 'theme' | 'ai' | 'drive' | 'settings';
 
 const NAVIGATION: readonly { id: HomeSection; label: string }[] = [
   { id: 'home', label: 'Home' },
   { id: 'library', label: 'Library' },
   { id: 'collections', label: 'Collections' },
-  { id: 'tags', label: 'Tags' },
   { id: 'theme', label: 'Theme' },
   { id: 'ai', label: 'AI' },
   { id: 'drive', label: 'Google Drive' },
   { id: 'settings', label: 'Settings' },
 ];
+
+function legalDocumentUrl(fileName: 'privacy.html' | 'terms.html'): string {
+  return `${import.meta.env.BASE_URL}${fileName}`;
+}
+
+function LegalDocumentLinks({ label }: { label: string }) {
+  return (
+    <nav aria-label={label} className="home-legal-links">
+      <a href={legalDocumentUrl('privacy.html')} rel="noreferrer" target="_blank">
+        Privacy Policy
+      </a>
+      <span aria-hidden="true">·</span>
+      <a href={legalDocumentUrl('terms.html')} rel="noreferrer" target="_blank">
+        Terms of Service
+      </a>
+    </nav>
+  );
+}
 
 export function HomeFloatingButton({ onClick }: { onClick(): void }) {
   return (
@@ -84,6 +115,33 @@ export function HomeWorkspace({
   children: ReactNode;
 }) {
   const [retainedForExit, setRetainedForExit] = useState(isOpen);
+  const backButtonRef = useRef<HTMLButtonElement>(null);
+  const returnFocusRef = useRef<HTMLElement | null>(null);
+  const wasOpenRef = useRef(false);
+
+  useEffect(() => {
+    if (isOpen) {
+      if (!wasOpenRef.current) {
+        returnFocusRef.current =
+          window.document.activeElement instanceof HTMLElement
+            ? window.document.activeElement
+            : null;
+      }
+      wasOpenRef.current = true;
+      const focusFrame = window.requestAnimationFrame(() => {
+        backButtonRef.current?.focus({ preventScroll: true });
+      });
+      return () => window.cancelAnimationFrame(focusFrame);
+    }
+    if (!wasOpenRef.current) return undefined;
+    wasOpenRef.current = false;
+    const returnFocus = returnFocusRef.current;
+    returnFocusRef.current = null;
+    const focusFrame = window.requestAnimationFrame(() => {
+      if (returnFocus?.isConnected) returnFocus.focus({ preventScroll: true });
+    });
+    return () => window.cancelAnimationFrame(focusFrame);
+  }, [isOpen]);
 
   useEffect(() => {
     if (isOpen) {
@@ -128,6 +186,7 @@ export function HomeWorkspace({
       <header className="home-workspace-header">
         <strong>39Note</strong>
         <button
+          ref={backButtonRef}
           aria-label="Back to reader"
           className="home-back-button"
           title="Back to reader"
@@ -166,11 +225,15 @@ export function HomeWorkspace({
 }
 
 export function HomeLandingPage({
+  gettingStartedRequestId = 0,
+  onGettingStartedRequestHandled,
   onOpenLibrary,
   onOpenCollections,
   onOpenDrive,
   onOpenOfficeConverter,
 }: {
+  gettingStartedRequestId?: number;
+  onGettingStartedRequestHandled?(): void;
   onOpenLibrary(): void;
   onOpenCollections(): void;
   onOpenDrive(): void;
@@ -178,24 +241,97 @@ export function HomeLandingPage({
 }) {
   const [documents, setDocuments] = useState<LibraryDocument[]>([]);
   const [collectionCount, setCollectionCount] = useState(0);
+  const [summaryState, setSummaryState] = useState<'loading' | 'ready' | 'failed'>(
+    'loading',
+  );
+  const [summaryReloadToken, setSummaryReloadToken] = useState(0);
+  const [isGettingStartedOpen, setIsGettingStartedOpen] = useState(false);
+  const [focusGettingStarted, setFocusGettingStarted] = useState(false);
+  const handledGettingStartedRequestRef = useRef(0);
+  const homeLandingRef = useRef<HTMLElement>(null);
+
   useEffect(() => {
     let disposed = false;
-    void Promise.all([listLibraryDocuments(), listCollections()]).then(
-      ([nextDocuments, collections]) => {
+    setSummaryState('loading');
+    void Promise.all([listLibraryDocuments(), listCollections()])
+      .then(([nextDocuments, collections]) => {
         if (disposed) return;
         setDocuments(nextDocuments);
         setCollectionCount(collections.length);
-      },
-    );
+        setSummaryState('ready');
+      })
+      .catch(() => {
+        if (!disposed) setSummaryState('failed');
+      });
     return () => {
       disposed = true;
     };
+  }, [summaryReloadToken]);
+
+  useEffect(() => {
+    if (
+      shouldAutoOpenGettingStarted({
+        documentCount: documents.length,
+        libraryState: summaryState,
+        preference: readGettingStartedPreference(),
+      })
+    ) {
+      setFocusGettingStarted(false);
+      setIsGettingStartedOpen(true);
+    }
+  }, [documents.length, summaryState]);
+
+  useEffect(() => {
+    if (
+      gettingStartedRequestId <= 0 ||
+      handledGettingStartedRequestRef.current === gettingStartedRequestId
+    ) {
+      return;
+    }
+    handledGettingStartedRequestRef.current = gettingStartedRequestId;
+    setFocusGettingStarted(true);
+    setIsGettingStartedOpen(true);
+    onGettingStartedRequestHandled?.();
+  }, [gettingStartedRequestId, onGettingStartedRequestHandled]);
+
+  const returnFocusToHome = useCallback(() => {
+    window.requestAnimationFrame(() => {
+      homeLandingRef.current?.focus({ preventScroll: true });
+    });
   }, []);
+
+  const closeGettingStarted = useCallback(() => {
+    setIsGettingStartedOpen(false);
+    setFocusGettingStarted(false);
+    returnFocusToHome();
+  }, [returnFocusToHome]);
+
+  const dismissGettingStarted = useCallback(() => {
+    markGettingStartedDismissed();
+    closeGettingStarted();
+  }, [closeGettingStarted]);
+
+  const finishGettingStarted = useCallback(() => {
+    markGettingStartedCompleted();
+  }, []);
+
+  const openLibraryFromGettingStarted = useCallback(() => {
+    markGettingStartedCompleted();
+    setIsGettingStartedOpen(false);
+    setFocusGettingStarted(false);
+    onOpenLibrary();
+  }, [onOpenLibrary]);
+
   const recent = [...documents]
     .sort((first, second) => (second.lastReadAt ?? 0) - (first.lastReadAt ?? 0))
     .slice(0, 3);
   return (
-    <section className="home-landing" aria-labelledby="home-landing-title">
+    <section
+      ref={homeLandingRef}
+      aria-labelledby="home-landing-title"
+      className="home-landing"
+      tabIndex={-1}
+    >
       <header className="home-page-header">
         <div>
           <p>Workspace</p>
@@ -205,6 +341,44 @@ export function HomeLandingPage({
           Manage papers and application settings without leaving your reading state.
         </p>
       </header>
+      {summaryState === 'failed' ? (
+        <FeedbackNotice
+          actions={
+            <button
+              type="button"
+              onClick={() => setSummaryReloadToken((current) => current + 1)}
+            >
+              Retry
+            </button>
+          }
+          description="39Note could not read the local Library summary. No Library data was changed."
+          persistent
+          title="Home summary unavailable"
+          tone="error"
+        />
+      ) : null}
+      {isGettingStartedOpen ? (
+        <>
+          <span className="visually-hidden" role="status">
+            Getting Started guide opened.
+          </span>
+          <Suspense
+            fallback={
+              <div className="getting-started-loading" role="status">
+                Opening Getting Started…
+              </div>
+            }
+          >
+            <GettingStartedWalkthrough
+              focusOnOpen={focusGettingStarted}
+              onClose={closeGettingStarted}
+              onDismiss={dismissGettingStarted}
+              onFinish={finishGettingStarted}
+              onOpenLibrary={openLibraryFromGettingStarted}
+            />
+          </Suspense>
+        </>
+      ) : null}
       <div className="home-summary-grid">
         <button type="button" onClick={onOpenLibrary}>
           <strong>{documents.length}</strong>
@@ -240,6 +414,10 @@ export function HomeLandingPage({
           Convert Word / PowerPoint to PDF
         </button>
       </aside>
+      <footer className="home-legal-footer">
+        <span>39Note 1.0.0 · Local-first study workspace</span>
+        <LegalDocumentLinks label="39Note legal documents" />
+      </footer>
     </section>
   );
 }
@@ -273,7 +451,7 @@ export function ThemeHomePage() {
             >
               <span
                 className="theme-preview-surface"
-                style={{ background: theme.surfaceBackground }}
+                style={{ background: theme.shellBackground ?? theme.surfaceBackground }}
               >
                 <span style={{ background: theme.accentColor }} />
                 <span style={{ background: theme.highlightColor }} />
@@ -289,12 +467,26 @@ export function ThemeHomePage() {
   );
 }
 
-export function CollectionsHomePage() {
+export function CollectionsHomePage({
+  initialCollectionId = null,
+  onOpenDocument,
+  onOpenLibrary,
+}: {
+  initialCollectionId?: string | null;
+  onOpenDocument(documentId: string, collectionId: string): Promise<boolean>;
+  onOpenLibrary(): void;
+}) {
   const [collections, setCollections] = useState<CollectionRecord[]>([]);
   const [documents, setDocuments] = useState<LibraryDocument[]>([]);
-  const [editor, setEditor] = useState(createInitialCollectionEditorState);
+  const [editor, setEditor] = useState(() => ({
+    ...createInitialCollectionEditorState(),
+    selectedCollectionId: initialCollectionId,
+  }));
   const [isSaving, setIsSaving] = useState(false);
   const [collectionError, setCollectionError] = useState('');
+  const [collectionRecovery, setCollectionRecovery] = useState<'retry-load' | null>(
+    null,
+  );
   const collectionOperationRef = useRef(false);
   const refreshSequenceRef = useRef(0);
   const { draft, mode, paperSearch, selectedCollectionId } = editor;
@@ -308,6 +500,7 @@ export function CollectionsHomePage() {
     if (sequence !== refreshSequenceRef.current) return;
     setCollections(nextCollections);
     setDocuments(nextDocuments);
+    setCollectionRecovery(null);
     setEditor((current) => {
       if (
         !current.selectedCollectionId ||
@@ -329,6 +522,7 @@ export function CollectionsHomePage() {
   useEffect(() => {
     void refresh().catch(() => {
       setCollectionError('Collections could not be loaded. Please try again.');
+      setCollectionRecovery('retry-load');
     });
   }, [refresh]);
 
@@ -364,12 +558,14 @@ export function CollectionsHomePage() {
     if (isSaving) return;
     setEditor((current) => openCollectionEditorView(current, collection.id));
     setCollectionError('');
+    setCollectionRecovery(null);
   };
 
   const beginCreate = () => {
     if (isSaving) return;
     setEditor(beginCollectionCreate);
     setCollectionError('');
+    setCollectionRecovery(null);
   };
 
   const beginEdit = () => {
@@ -382,12 +578,14 @@ export function CollectionsHomePage() {
       ),
     );
     setCollectionError('');
+    setCollectionRecovery(null);
   };
 
   const cancelEditing = () => {
     if (isSaving) return;
     setEditor(cancelCollectionEditing);
     setCollectionError('');
+    setCollectionRecovery(null);
   };
 
   const commitDraft = async () => {
@@ -395,6 +593,7 @@ export function CollectionsHomePage() {
     collectionOperationRef.current = true;
     setIsSaving(true);
     setCollectionError('');
+    setCollectionRecovery(null);
     try {
       const saved = await saveCollectionDraft({
         ...(draft.collectionId ? { collectionId: draft.collectionId } : {}),
@@ -405,12 +604,17 @@ export function CollectionsHomePage() {
         setCollectionError('Collection names must be unique and non-empty.');
         return;
       }
-      await refresh();
       setEditor((current) => completeCollectionEditing(current, saved.id));
+      try {
+        await refresh();
+      } catch {
+        setCollectionError(
+          'The Collection was saved, but the Collection list could not be refreshed.',
+        );
+        setCollectionRecovery('retry-load');
+      }
     } catch {
-      setCollectionError(
-        'The Collection could not be refreshed after saving. Please reopen Collections.',
-      );
+      setCollectionError('The Collection could not be saved. Please try again.');
     } finally {
       collectionOperationRef.current = false;
       setIsSaving(false);
@@ -422,16 +626,24 @@ export function CollectionsHomePage() {
     collectionOperationRef.current = true;
     setIsSaving(true);
     setCollectionError('');
+    setCollectionRecovery(null);
     try {
       const deleted = await deleteCollection(selectedCollection.id);
       if (!deleted) {
         setCollectionError('The Collection could not be deleted. Please try again.');
         return;
       }
-      await refresh();
       setEditor((current) =>
         cancelCollectionEditing({ ...current, selectedCollectionId: null }),
       );
+      try {
+        await refresh();
+      } catch {
+        setCollectionError(
+          'The Collection was deleted, but the Collection list could not be refreshed.',
+        );
+        setCollectionRecovery('retry-load');
+      }
     } catch {
       setCollectionError('The Collection could not be deleted. Please try again.');
     } finally {
@@ -447,7 +659,7 @@ export function CollectionsHomePage() {
           <p>Organization</p>
           <h2 id="home-collections-title">Collections</h2>
         </div>
-        <p>Arrange papers into structural shelves without changing their tags.</p>
+        <p>Arrange papers into structural shelves without changing their contents.</p>
       </header>
       <div className="collections-toolbar">
         <button
@@ -487,6 +699,10 @@ export function CollectionsHomePage() {
               collection={selectedCollection}
               documents={selectedDocuments}
               onEdit={beginEdit}
+              onOpenDocument={(documentId) =>
+                onOpenDocument(documentId, selectedCollection.id)
+              }
+              onOpenLibrary={onOpenLibrary}
             />
           ) : null}
           {mode === 'view' && !selectedCollection ? (
@@ -511,8 +727,22 @@ export function CollectionsHomePage() {
                 void commitDraft();
               }}
             >
-              <header>
-                <h3>{mode === 'create' ? 'Create Collection' : 'Edit Collection'}</h3>
+              <header className="collection-editor-header">
+                <div className="collection-editor-heading-row">
+                  <h3>{mode === 'create' ? 'Create Collection' : 'Edit Collection'}</h3>
+                  <div className="collection-editor-header-actions">
+                    <button disabled={isSaving} type="button" onClick={cancelEditing}>
+                      Cancel
+                    </button>
+                    <button
+                      className="collection-editor-done"
+                      disabled={isSaving}
+                      type="submit"
+                    >
+                      {isSaving ? 'Saving…' : 'Done'}
+                    </button>
+                  </div>
+                </div>
                 <p>Changes are saved together when you choose Done.</p>
               </header>
               <label>
@@ -600,9 +830,8 @@ export function CollectionsHomePage() {
                   }
                 />
               </section>
-              {collectionError ? <p role="alert">{collectionError}</p> : null}
-              <div className="collection-editor-actions">
-                {mode === 'edit' && selectedCollection ? (
+              {mode === 'edit' && selectedCollection ? (
+                <div className="collection-editor-danger">
                   <button
                     className="is-destructive"
                     disabled={isSaving}
@@ -611,182 +840,72 @@ export function CollectionsHomePage() {
                   >
                     Delete Collection
                   </button>
-                ) : null}
-                <span />
-                <button disabled={isSaving} type="button" onClick={cancelEditing}>
-                  Cancel
-                </button>
-                <button disabled={isSaving} type="submit">
-                  {isSaving ? 'Saving…' : 'Done'}
-                </button>
-              </div>
+                </div>
+              ) : null}
             </form>
           ) : null}
         </div>
       </div>
-    </section>
-  );
-}
-
-export function TagsHomePage() {
-  const [tags, setTags] = useState<TagRecord[]>([]);
-  const [documents, setDocuments] = useState<LibraryDocument[]>([]);
-  const [selectedTagId, setSelectedTagId] = useState<string | null>(null);
-  const [renameDraft, setRenameDraft] = useState('');
-  const [newTagName, setNewTagName] = useState('');
-  const [tagError, setTagError] = useState('');
-  const refresh = useCallback(async () => {
-    const [nextTags, nextDocuments] = await Promise.all([
-      listTags(),
-      listLibraryDocuments(),
-    ]);
-    setTags(nextTags);
-    setDocuments(nextDocuments);
-    setSelectedTagId((current) =>
-      current && nextTags.some((tag) => tag.id === current)
-        ? current
-        : (nextTags[0]?.id ?? null),
-    );
-  }, []);
-  useEffect(() => {
-    void refresh();
-  }, [refresh]);
-  const selectedTag = tags.find((tag) => tag.id === selectedTagId) ?? null;
-  const selectedDocuments = useMemo(
-    () =>
-      documents.filter(
-        (paper) => selectedTagId && paper.tagIds.includes(selectedTagId),
-      ),
-    [documents, selectedTagId],
-  );
-  return (
-    <section className="home-tags-page" aria-labelledby="home-tags-title">
-      <header className="home-page-header">
-        <div>
-          <p>Organization</p>
-          <h2 id="home-tags-title">Tags</h2>
-        </div>
-        <p>Inspect tags and the papers attached to them.</p>
-      </header>
-      <form
-        className="tag-create-form"
-        onSubmit={(event) => {
-          event.preventDefault();
-          setTagError('');
-          void createTag(newTagName).then(async (record) => {
-            if (!record) {
-              setTagError('Tag names must be unique and non-empty.');
-              return;
-            }
-            setNewTagName('');
-            await refresh();
-            setSelectedTagId(record.id);
-            setRenameDraft(record.name);
-          });
-        }}
-      >
-        <label>
-          New tag
-          <input
-            placeholder="Tag name"
-            value={newTagName}
-            onChange={(event) => setNewTagName(event.target.value)}
-          />
-        </label>
-        <button type="submit">Add tag</button>
-        {tagError ? <span role="alert">{tagError}</span> : null}
-      </form>
-      <div className="tags-workspace">
-        <nav aria-label="Tags" className="tags-list">
-          {tags.map((tag) => {
-            const count = documents.filter((paper) =>
-              paper.tagIds.includes(tag.id),
-            ).length;
-            return (
+      {collectionError ? (
+        <FeedbackNotice
+          actions={
+            collectionRecovery === 'retry-load' ? (
               <button
-                aria-current={selectedTagId === tag.id ? 'page' : undefined}
-                key={tag.id}
                 type="button"
                 onClick={() => {
-                  setSelectedTagId(tag.id);
-                  setRenameDraft(tag.name);
+                  setCollectionError('');
+                  setCollectionRecovery(null);
+                  void refresh().catch(() => {
+                    setCollectionError(
+                      'Collections could not be loaded. Please try again.',
+                    );
+                    setCollectionRecovery('retry-load');
+                  });
                 }}
               >
-                <span>{tag.name}</span>
-                <small>
-                  {count} {count === 1 ? 'paper' : 'papers'}
-                </small>
+                Retry
               </button>
-            );
-          })}
-          {!tags.length ? <p>No tags yet.</p> : null}
-        </nav>
-        <div className="tag-detail">
-          {selectedTag ? (
-            <>
-              <div className="tag-detail-heading">
-                <label>
-                  Tag name
-                  <input
-                    value={renameDraft || selectedTag.name}
-                    onChange={(event) => setRenameDraft(event.target.value)}
-                  />
-                </label>
-                <button
-                  type="button"
-                  onClick={() =>
-                    void renameTag(
-                      selectedTag.id,
-                      renameDraft || selectedTag.name,
-                    ).then(refresh)
-                  }
-                >
-                  Rename
-                </button>
-                <button
-                  className="is-destructive"
-                  type="button"
-                  onClick={() => void deleteTag(selectedTag.id).then(refresh)}
-                >
-                  Delete tag
-                </button>
-              </div>
-              <h3>Papers</h3>
-              <ul>
-                {documents.map((paper) => {
-                  const tagged = paper.tagIds.includes(selectedTag.id);
-                  return (
-                    <li key={paper.documentId}>
-                      <span>{paper.displayTitle}</span>
-                      <button
-                        type="button"
-                        onClick={() =>
-                          void updateDocumentOrganization([paper.documentId], {
-                            tagIds: tagged
-                              ? paper.tagIds.filter((id) => id !== selectedTag.id)
-                              : [...paper.tagIds, selectedTag.id],
-                          }).then(refresh)
-                        }
-                      >
-                        {tagged ? 'Remove' : 'Add'}
-                      </button>
-                    </li>
-                  );
-                })}
-              </ul>
-              {!selectedDocuments.length ? <p>No papers use this tag yet.</p> : null}
-            </>
-          ) : (
-            <p>Select a tag to inspect its papers.</p>
-          )}
-        </div>
-      </div>
+            ) : (
+              <button type="button" onClick={() => setCollectionError('')}>
+                Dismiss
+              </button>
+            )
+          }
+          description={collectionError}
+          persistent
+          title="Collection action not completed"
+          tone="error"
+        />
+      ) : null}
     </section>
   );
 }
 
-export function SettingsHomePage() {
+export function SettingsHomePage({
+  readerStatusIndicatorDisplay,
+  onReaderStatusIndicatorDisplayChange,
+  onOpenGettingStarted,
+}: {
+  readerStatusIndicatorDisplay: ReaderStatusIndicatorDisplay;
+  onReaderStatusIndicatorDisplayChange(display: ReaderStatusIndicatorDisplay): void;
+  onOpenGettingStarted(): void;
+}) {
   const [backupBusy, setBackupBusy] = useState(false);
+  const [backupError, setBackupError] = useState<string | null>(null);
+
+  const createBackup = async () => {
+    if (backupBusy) return;
+    setBackupBusy(true);
+    setBackupError(null);
+    try {
+      await downloadLibraryBackup(() => undefined);
+    } catch (error) {
+      setBackupError(getBackupCreationErrorMessage(error));
+    } finally {
+      setBackupBusy(false);
+    }
+  };
+
   return (
     <section className="home-settings-page" aria-labelledby="home-settings-title">
       <header className="home-page-header">
@@ -799,18 +918,65 @@ export function SettingsHomePage() {
       <article className="home-settings-card">
         <h3>Local backup</h3>
         <p>Create a complete 39Note package directly on this device.</p>
-        <button
-          disabled={backupBusy}
-          type="button"
-          onClick={() => {
-            setBackupBusy(true);
-            void downloadLibraryBackup(() => undefined).finally(() =>
-              setBackupBusy(false),
-            );
-          }}
-        >
+        <button disabled={backupBusy} type="button" onClick={() => void createBackup()}>
           {backupBusy ? 'Preparing backup…' : 'Download local backup'}
         </button>
+        {backupError ? (
+          <FeedbackNotice
+            actions={
+              <>
+                <button type="button" onClick={() => void createBackup()}>
+                  Retry
+                </button>
+                <button type="button" onClick={() => setBackupError(null)}>
+                  Dismiss
+                </button>
+              </>
+            }
+            description={`${backupError} Your Library was not replaced or removed.`}
+            persistent
+            title="Backup not created"
+            tone="error"
+          />
+        ) : null}
+      </article>
+      <article className="home-settings-card">
+        <h3>Status indicator display</h3>
+        <p>Choose how Google Drive connection status appears in the Reader.</p>
+        <fieldset className="settings-choice-group">
+          <legend className="visually-hidden">Status indicator display</legend>
+          {(['full', 'compact', 'hidden'] as const).map((display) => (
+            <label key={display}>
+              <input
+                checked={readerStatusIndicatorDisplay === display}
+                name="reader-status-indicator-display"
+                type="radio"
+                value={display}
+                onChange={() => onReaderStatusIndicatorDisplayChange(display)}
+              />
+              <span>{display[0].toUpperCase() + display.slice(1)}</span>
+            </label>
+          ))}
+        </fieldset>
+        <p className="settings-preference-note">
+          Hidden changes presentation only. Drive connection, pending work, and
+          integrity warnings continue normally.
+        </p>
+      </article>
+      <article className="home-settings-card">
+        <h3>Getting Started</h3>
+        <p>
+          Reopen the visual tour of reading, annotation, organization, backup, and
+          optional Drive sync.
+        </p>
+        <button type="button" onClick={onOpenGettingStarted}>
+          Open Getting Started tour
+        </button>
+      </article>
+      <article className="home-settings-card">
+        <h3>About 39Note</h3>
+        <p>Version 1.0.0. Copyright © 2026 Ex39393. All rights reserved.</p>
+        <LegalDocumentLinks label="39Note policies" />
       </article>
     </section>
   );

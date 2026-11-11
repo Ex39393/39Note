@@ -9,6 +9,14 @@ import {
   deriveReaderOcclusionInsets,
   measureReaderEdgeOverlap,
 } from '../src/utils/readerOcclusion.ts';
+import { readingThemes } from '../src/themes.ts';
+import {
+  DARK_EMPTY_READER_MOTE_COUNT,
+  EMPTY_READER_AMBIENT_EFFECT_BY_THEME,
+  TWILIGHT_EMPTY_READER_MOTE_COUNT,
+  darkEmptyReaderDustGroups,
+  twilightEmptyReaderDustGroups,
+} from '../src/utils/emptyReaderAmbient.ts';
 
 const appLayoutSource = source('../src/components/AppLayout.tsx');
 const viewerSource = source('../src/components/Viewer.tsx');
@@ -18,6 +26,285 @@ const occlusionHookSource = source('../src/hooks/useReaderOcclusionInsets.ts');
 const notesPanelSource = source('../src/components/NotesPanel.tsx');
 const sidebarSource = source('../src/components/Sidebar.tsx');
 const styleSource = source('../src/styles/index.css');
+const emptyReaderAmbientSource = source('../src/components/EmptyReaderAmbient.tsx');
+const emptyReaderAmbientModelSource = source('../src/utils/emptyReaderAmbient.ts');
+
+test('empty Reader ambient model covers ten distinct active-theme concepts', () => {
+  assert.deepEqual(Object.keys(EMPTY_READER_AMBIENT_EFFECT_BY_THEME), readingThemes);
+  assert.equal(
+    new Set(Object.values(EMPTY_READER_AMBIENT_EFFECT_BY_THEME)).size,
+    readingThemes.length,
+  );
+  assert.deepEqual(EMPTY_READER_AMBIENT_EFFECT_BY_THEME, {
+    original: 'paper-window',
+    'soft-gray': 'frosted-reflections',
+    mint: 'water-caustics',
+    dark: 'white-dust',
+    midnight: 'aurora-curtains',
+    twilight: 'tyndall-dust',
+    dawn: 'sunrise-clouds',
+    sea: 'subsurface-light',
+    bay: 'coastal-horizon',
+    bright: 'cherry-sky',
+  });
+
+  const twilightCount = countMotes(twilightEmptyReaderDustGroups);
+  const darkCount = countMotes(darkEmptyReaderDustGroups);
+  assert.equal(twilightCount, TWILIGHT_EMPTY_READER_MOTE_COUNT);
+  assert.equal(darkCount, DARK_EMPTY_READER_MOTE_COUNT);
+  assert.ok(twilightCount >= 40 && twilightCount <= 60);
+  assert.ok(darkCount >= 35 && darkCount <= 55);
+  assert.ok(countCompactMotes(twilightEmptyReaderDustGroups) < twilightCount);
+  assert.ok(countCompactMotes(darkEmptyReaderDustGroups) < darkCount);
+
+  for (const group of [
+    ...twilightEmptyReaderDustGroups,
+    ...darkEmptyReaderDustGroups,
+  ]) {
+    assert.ok(group.duration >= 7 && group.duration <= 35);
+    assert.ok(group.delay < 0);
+    for (const mote of group.motes) {
+      assert.ok(mote.x >= 0 && mote.x <= 100);
+      assert.ok(mote.y >= 0 && mote.y <= 100);
+      assert.ok(mote.size >= 0.8 && mote.size <= 3.35);
+      assert.ok(mote.opacity >= 0.32 && mote.opacity <= 0.88);
+    }
+  }
+  assert.doesNotMatch(
+    emptyReaderAmbientModelSource,
+    /Math\.random|requestAnimationFrame/u,
+  );
+});
+
+test('empty Reader renders one assistive-hidden, theme-specific atmosphere only', () => {
+  assert.match(
+    viewerSource,
+    /className=\{`viewer is-empty \$\{isDragging \? 'is-dragging' : ''\}`\}/u,
+  );
+  assert.equal(viewerSource.match(/<EmptyReaderAmbient \/>/gu)?.length, 1);
+  assert.match(
+    viewerSource,
+    /if \(!file\)[\s\S]*?<EmptyReaderAmbient \/>[\s\S]*?className="viewer is-document-loaded"/u,
+  );
+  assert.doesNotMatch(
+    viewerSource.slice(viewerSource.indexOf('className="viewer is-document-loaded"')),
+    /EmptyReaderAmbient/u,
+  );
+  assert.match(emptyReaderAmbientSource, /const \{ themeId \} = useTheme\(\)/u);
+  assert.match(emptyReaderAmbientSource, /aria-hidden="true"/u);
+  assert.match(emptyReaderAmbientSource, /data-empty-reader-theme=\{themeId\}/u);
+  assert.match(
+    emptyReaderAmbientSource,
+    /data-empty-reader-effect=\{EMPTY_READER_AMBIENT_EFFECT_BY_THEME\[themeId\]\}/u,
+  );
+  for (const theme of readingThemes) {
+    assert.match(emptyReaderAmbientSource, new RegExp(`case '${theme}'`, 'u'));
+  }
+  assert.doesNotMatch(
+    emptyReaderAmbientSource,
+    /tabIndex=|<button|<input|<a\s|setInterval|requestAnimationFrame/u,
+  );
+
+  const midnightCase = emptyReaderAmbientSource.slice(
+    emptyReaderAmbientSource.indexOf("case 'midnight':"),
+    emptyReaderAmbientSource.indexOf("case 'dawn':"),
+  );
+  assert.match(
+    midnightCase,
+    /<svg[\s\S]*?reader-empty-aurora-curtains[\s\S]*?focusable="false"/u,
+  );
+  assert.equal(midnightCase.match(/reader-empty-aurora-curtain--/gu)?.length, 2);
+  assert.match(midnightCase, /reader-empty-aurora-curtain--left/u);
+  assert.match(midnightCase, /reader-empty-aurora-curtain--right/u);
+  assert.equal(midnightCase.match(/reader-empty-midnight-depth/gu)?.length, 1);
+  assert.equal(
+    midnightCase.match(
+      /className="reader-empty-aurora-fold reader-empty-aurora-fold--left-/gu,
+    )?.length,
+    3,
+  );
+  assert.equal(
+    midnightCase.match(
+      /className="reader-empty-aurora-fold reader-empty-aurora-fold--right-/gu,
+    )?.length,
+    2,
+  );
+  assert.match(midnightCase, /reader-aurora-left-fold-volume/u);
+  assert.match(midnightCase, /reader-aurora-right-fold-volume/u);
+  assert.equal(
+    midnightCase.match(/fill="url\(#reader-aurora-left-fold-volume\)"/gu)?.length,
+    3,
+  );
+  assert.equal(
+    midnightCase.match(/fill="url\(#reader-aurora-right-fold-volume\)"/gu)?.length,
+    2,
+  );
+  assert.equal(
+    midnightCase.match(/mask="url\(#reader-aurora-left-mask\)"/gu)?.length,
+    4,
+  );
+  assert.equal(
+    midnightCase.match(/mask="url\(#reader-aurora-right-mask\)"/gu)?.length,
+    3,
+  );
+  assert.doesNotMatch(
+    midnightCase,
+    /reader-empty-aurora-ribbon|fill="none"|\bstroke(?:Width)?=/u,
+  );
+  assert.doesNotMatch(midnightCase, /DustFields|dust-mote/u);
+
+  const dawnCase = emptyReaderAmbientSource.slice(
+    emptyReaderAmbientSource.indexOf("case 'dawn':"),
+    emptyReaderAmbientSource.indexOf("case 'mint':"),
+  );
+  assert.match(dawnCase, /<svg[\s\S]*?reader-empty-dawn-clouds/u);
+  assert.equal(dawnCase.match(/reader-empty-dawn-wisp--/gu)?.length, 3);
+  assert.doesNotMatch(dawnCase, /reader-empty-dawn-cloud reader/u);
+
+  const softGrayCase = emptyReaderAmbientSource.slice(
+    emptyReaderAmbientSource.indexOf("case 'soft-gray':"),
+    emptyReaderAmbientSource.indexOf("case 'original':"),
+  );
+  assert.match(softGrayCase, /reader-empty-frosted-sheen--primary/u);
+  assert.match(softGrayCase, /reader-empty-frosted-sheen--secondary/u);
+  assert.equal(softGrayCase.match(/reader-empty-frosted-curve--/gu)?.length, 2);
+  assert.doesNotMatch(softGrayCase, /reader-empty-frosted-contour/u);
+
+  const seaCase = emptyReaderAmbientSource.slice(
+    emptyReaderAmbientSource.indexOf("case 'sea':"),
+    emptyReaderAmbientSource.indexOf("case 'bay':"),
+  );
+  assert.equal(seaCase.match(/reader-empty-sea-shaft--/gu)?.length, 2);
+  assert.match(seaCase, /reader-empty-sea-surface/u);
+  assert.match(seaCase, /reader-empty-sea-current/u);
+  assert.doesNotMatch(seaCase, /DustFields|<svg/u);
+
+  const bayCase = emptyReaderAmbientSource.slice(
+    emptyReaderAmbientSource.indexOf("case 'bay':"),
+    emptyReaderAmbientSource.indexOf("case 'bright':"),
+  );
+  assert.match(bayCase, /return null;/u);
+  assert.doesNotMatch(bayCase, /reader-empty-bay-|DustFields|<span|<svg/u);
+
+  const brightCase = emptyReaderAmbientSource.slice(
+    emptyReaderAmbientSource.indexOf("case 'bright':"),
+    emptyReaderAmbientSource.indexOf("case 'twilight':"),
+  );
+  assert.equal(brightCase.match(/reader-empty-bright-bloom--/gu)?.length, 2);
+  assert.match(brightCase, /reader-empty-bright-lustre/u);
+  assert.match(brightCase, /reader-empty-bright-veil/u);
+  assert.doesNotMatch(brightCase, /DustFields|<svg/u);
+});
+
+test('empty Reader atmosphere stays clipped, responsive, and motion-accessible', () => {
+  const ambientCss = styleSource.slice(
+    styleSource.indexOf('.reader-empty-ambient {'),
+    styleSource.indexOf('.viewer-icon {'),
+  );
+  assert.match(
+    ambientCss,
+    /\.reader-empty-ambient\s*\{[^}]*position:\s*absolute[^}]*inset:\s*0[^}]*overflow:\s*hidden[^}]*contain:\s*paint[^}]*pointer-events:\s*none/su,
+  );
+  assert.match(
+    ambientCss,
+    /\.viewer\.is-empty \.viewer-panel > :not\(\.reader-empty-ambient\)\s*\{[^}]*z-index:\s*2/su,
+  );
+  for (const className of [
+    'reader-empty-ambient--original',
+    'reader-empty-ambient--soft-gray',
+    'reader-empty-ambient--mint',
+    'reader-empty-ambient--dark',
+    'reader-empty-ambient--midnight',
+    'reader-empty-ambient--twilight',
+    'reader-empty-ambient--dawn',
+    'reader-empty-ambient--sea',
+    'reader-empty-ambient--bay',
+    'reader-empty-ambient--bright',
+  ]) {
+    assert.match(ambientCss, new RegExp(`\\.${className}\\s*\\{`, 'u'));
+  }
+  assert.match(ambientCss, /@keyframes reader-empty-dust-drift/u);
+  assert.match(ambientCss, /@keyframes reader-empty-aurora-curtain-left/u);
+  assert.match(ambientCss, /@keyframes reader-empty-aurora-curtain-right/u);
+  assert.match(ambientCss, /@keyframes reader-empty-dawn-wisp-one/u);
+  assert.match(ambientCss, /@keyframes reader-empty-mint-caustic-one/u);
+  assert.match(ambientCss, /@keyframes reader-empty-frosted-sheen-primary/u);
+  assert.match(ambientCss, /@keyframes reader-empty-frosted-curve-primary/u);
+  assert.match(ambientCss, /@keyframes reader-empty-window-shadow-one/u);
+  assert.match(ambientCss, /@keyframes reader-empty-sea-shaft-left/u);
+  assert.doesNotMatch(ambientCss, /reader-empty-bay-sun/u);
+  assert.match(ambientCss, /@keyframes reader-empty-bright-lustre/u);
+  const midnightCss = ambientCss.slice(
+    ambientCss.indexOf('/* Midnight:'),
+    ambientCss.indexOf('/* Dawn:'),
+  );
+  assert.match(
+    midnightCss,
+    /\.reader-empty-aurora-curtain--left\s*\{[\s\S]*?animation:\s*reader-empty-aurora-curtain-left 34s/u,
+  );
+  assert.match(
+    midnightCss,
+    /\.reader-empty-aurora-curtain--right\s*\{[\s\S]*?animation:\s*reader-empty-aurora-curtain-right 41s/u,
+  );
+  assert.match(
+    midnightCss,
+    /\.reader-empty-midnight-depth\s*\{[\s\S]*?animation:\s*reader-empty-midnight-depth 48s/u,
+  );
+  assert.match(
+    midnightCss,
+    /\.reader-empty-aurora-folds\s*\{[^}]*filter:\s*blur\(3px\)[^}]*mix-blend-mode:\s*screen/su,
+  );
+  assert.match(
+    midnightCss,
+    /\.reader-empty-aurora-fold\s*\{[^}]*opacity:\s*var\(--reader-aurora-fold-opacity-rest\)/su,
+  );
+  assert.match(ambientCss, /@keyframes reader-empty-aurora-fold-breathe/u);
+  for (const [foldClass, duration, delay] of [
+    ['left-one', 37, -19],
+    ['left-two', 43, -31],
+    ['left-three', 46, -9],
+    ['right-one', 39, -24],
+    ['right-two', 47, -13],
+  ] as const) {
+    assert.match(
+      midnightCss,
+      new RegExp(
+        `\\.reader-empty-aurora-fold--${foldClass}\\s*\\{[\\s\\S]*?--reader-aurora-fold-duration:\\s*${duration}s;[\\s\\S]*?--reader-aurora-fold-delay:\\s*${delay}s`,
+        'u',
+      ),
+    );
+  }
+  assert.doesNotMatch(
+    midnightCss,
+    /aurora-ribbon|aurora-curtain--(?:one|two|three)|aurora-curtain-three/u,
+  );
+  assert.doesNotMatch(midnightCss, /\bstroke(?:-width)?\s*:/u);
+  const softGrayCss = ambientCss.slice(
+    ambientCss.indexOf('/* Soft Gray:'),
+    ambientCss.indexOf('/* Original:'),
+  );
+  assert.match(softGrayCss, /reader-empty-frosted-reflections/u);
+  assert.doesNotMatch(softGrayCss, /frosted-contour|border:\s*1px/iu);
+  const keyframes = ambientCss.slice(ambientCss.indexOf('@keyframes'));
+  assert.doesNotMatch(
+    keyframes,
+    /background-position:|filter:|backdrop-filter:|(?:^|\s)(?:top|left|width|height):/mu,
+  );
+  assert.doesNotMatch(ambientCss, /will-change:|position:\s*fixed/u);
+  assert.match(
+    ambientCss,
+    /@media \(max-width: 620px\)[\s\S]*?\.reader-empty-dust-field\[data-compact-hidden='true'\][\s\S]*?display:\s*none/u,
+  );
+  assert.match(
+    ambientCss,
+    /@media \(max-width: 620px\)[\s\S]*?\.reader-empty-sea-shaft--right[\s\S]*?\.reader-empty-bright-lustre[\s\S]*?display:\s*none/u,
+  );
+  assert.match(
+    ambientCss,
+    /@media \(prefers-reduced-motion: reduce\)[\s\S]*?\.reader-empty-ambient \*[\s\S]*?animation:\s*none !important;[\s\S]*?transition:\s*none !important;/u,
+  );
+  assert.doesNotMatch(ambientCss, /viewer-empty-particles-drift/u);
+});
 
 test('Fit Width with closed Reader drawers retains the full Reader content width', () => {
   const insets = deriveReaderOcclusionInsets([
@@ -44,8 +331,8 @@ test('opening and closing Notes recalculates Fit Width against its measured occl
   assert.match(notesPanelSource, /data-reader-occlusion-edge="right"/);
 });
 
-test('Notes and Glossary share one measured right drawer rather than double counting', () => {
-  assert.match(notesPanelSource, /aria-label="Notes and Glossary"/);
+test('Notes, Glossary, and Links share one measured right drawer rather than double counting', () => {
+  assert.match(notesPanelSource, /aria-label="Notes, Glossary, and Links"/);
   const insets = deriveReaderOcclusionInsets([
     { edge: 'right', width: 340, active: true },
     { edge: 'right', width: 340, active: true },
@@ -277,6 +564,19 @@ test('repeated drawer transitions are equality-guarded and use no animation-fram
   assert.match(occlusionHookSource, /transitionend/);
   assert.match(occlusionHookSource, /closingOccluders/);
 });
+
+function countMotes(groups: readonly { motes: readonly unknown[] }[]): number {
+  return groups.reduce((total, group) => total + group.motes.length, 0);
+}
+
+function countCompactMotes(
+  groups: readonly { compactHidden: boolean; motes: readonly unknown[] }[],
+): number {
+  return groups.reduce(
+    (total, group) => total + (group.compactHidden ? 0 : group.motes.length),
+    0,
+  );
+}
 
 function fitWidthScale(containerWidth: number): number {
   return calculatePdfPageScale({

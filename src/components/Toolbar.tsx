@@ -12,6 +12,7 @@ const SUPPORTED_DOCUMENT_ACCEPT = [
 ].join(',');
 
 interface ToolbarProps {
+  isCompactReader: boolean;
   onOpenFile: (file: File) => void;
   onZoomIn: () => void;
   onZoomOut: () => void;
@@ -22,7 +23,9 @@ interface ToolbarProps {
   onOpenSearch: () => void;
   openFileRequestId: number;
   onExportAnnotatedPdf: () => void;
+  onExportNotes: () => void;
   isAnnotatedPdfExporting: boolean;
+  canExportNotes: boolean;
   hasDocument: boolean;
   documentType: DocumentType | null;
   pageCount: number;
@@ -32,9 +35,11 @@ interface ToolbarProps {
   isAiOpen: boolean;
   aiStatus: 'disconnected' | 'connected' | 'generating';
   onToggleAi: () => void;
+  isInteractionDisabled?: boolean;
 }
 
 export function Toolbar({
+  isCompactReader,
   onOpenFile,
   onZoomIn,
   onZoomOut,
@@ -45,7 +50,9 @@ export function Toolbar({
   onOpenSearch,
   openFileRequestId,
   onExportAnnotatedPdf,
+  onExportNotes,
   isAnnotatedPdfExporting,
+  canExportNotes,
   hasDocument,
   documentType,
   pageCount,
@@ -55,8 +62,12 @@ export function Toolbar({
   isAiOpen,
   aiStatus,
   onToggleAi,
+  isInteractionDisabled = false,
 }: ToolbarProps) {
+  const toolbarRef = useRef<HTMLElement>(null);
+  const compactToolsTriggerRef = useRef<HTMLButtonElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const [isCompactToolsOpen, setIsCompactToolsOpen] = useState(false);
   const [zoomDraft, setZoomDraft] = useState(formatZoomPercentage(effectiveZoom));
   const [isZoomEditing, setIsZoomEditing] = useState(false);
   const [pageDraft, setPageDraft] = useState('');
@@ -79,6 +90,53 @@ export function Toolbar({
     lastOpenFileRequestRef.current = openFileRequestId;
     fileInputRef.current?.click();
   }, [openFileRequestId]);
+
+  useEffect(() => {
+    if (!isCompactReader || isInteractionDisabled) {
+      setIsCompactToolsOpen(false);
+    }
+  }, [isCompactReader, isInteractionDisabled]);
+
+  useEffect(() => {
+    if (!isCompactReader || !isCompactToolsOpen) return undefined;
+
+    const closeCompactTools = (restoreFocus: boolean) => {
+      setIsCompactToolsOpen(false);
+      if (restoreFocus) {
+        window.requestAnimationFrame(() => {
+          compactToolsTriggerRef.current?.focus({ preventScroll: true });
+        });
+      }
+    };
+    const handleOutsidePointer = (event: PointerEvent) => {
+      const toolbar = toolbarRef.current;
+      if (
+        !toolbar ||
+        !(event.target instanceof Node) ||
+        toolbar.contains(event.target)
+      ) {
+        return;
+      }
+      closeCompactTools(false);
+    };
+    const handleEscape = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape' || event.defaultPrevented) return;
+      event.preventDefault();
+      closeCompactTools(true);
+    };
+
+    window.addEventListener('pointerdown', handleOutsidePointer);
+    window.addEventListener('keydown', handleEscape);
+    return () => {
+      window.removeEventListener('pointerdown', handleOutsidePointer);
+      window.removeEventListener('keydown', handleEscape);
+    };
+  }, [isCompactReader, isCompactToolsOpen]);
+
+  const closeCompactToolsBefore = (action: () => void) => {
+    if (isCompactReader) setIsCompactToolsOpen(false);
+    action();
+  };
 
   const applyZoomDraft = () => {
     const parsedZoom = parseZoomPercentage(zoomDraft);
@@ -105,25 +163,53 @@ export function Toolbar({
   };
 
   return (
-    <header className="toolbar">
+    <header
+      ref={toolbarRef}
+      className={`toolbar ${isCompactToolsOpen ? 'is-compact-tools-open' : ''}`}
+      aria-hidden={isInteractionDisabled ? true : undefined}
+      inert={isInteractionDisabled ? true : undefined}
+    >
       <div className="toolbar-left">
         <span className="wordmark" aria-label="39Note">
           39Note
         </span>
         <span className="document-title">{documentTitle}</span>
+        <button
+          ref={compactToolsTriggerRef}
+          aria-controls="toolbar-compact-tools-drawer"
+          aria-expanded={isCompactToolsOpen}
+          aria-label={
+            isCompactToolsOpen
+              ? 'Close Reader toolbar controls'
+              : 'Open Reader toolbar controls'
+          }
+          className="toolbar-button toolbar-compact-tools-trigger"
+          type="button"
+          onClick={() => setIsCompactToolsOpen((open) => !open)}
+        >
+          <span aria-hidden="true">{isCompactToolsOpen ? '×' : 'Tools'}</span>
+        </button>
       </div>
 
-      <div className="toolbar-actions">
-        <ProductivityTimer />
+      <div
+        id="toolbar-compact-tools-drawer"
+        aria-hidden={isCompactReader && !isCompactToolsOpen ? true : undefined}
+        aria-label="Reader toolbar controls"
+        className="toolbar-actions"
+        inert={isCompactReader && !isCompactToolsOpen ? true : undefined}
+      >
+        <div className="toolbar-clock-slot">
+          <ProductivityTimer />
+        </div>
         {documentType ? (
           <button
             aria-expanded={isAiOpen}
             aria-label={`AI Assistant: ${aiStatus}`}
-            className={`toolbar-button ai-toolbar-trigger is-${aiStatus}`}
+            className={`toolbar-button ai-toolbar-trigger toolbar-ai-trigger is-${aiStatus}`}
             disabled={!hasDocument}
             title="Open AI Assistant"
             type="button"
-            onClick={onToggleAi}
+            onClick={() => closeCompactToolsBefore(onToggleAi)}
           >
             <span aria-hidden="true">✦</span>
             <span className="ai-toolbar-label">AI</span>
@@ -147,15 +233,19 @@ export function Toolbar({
         />
         <button
           className="toolbar-button toolbar-button-primary"
+          aria-label="Open PDF or convert Office document"
           type="button"
-          onClick={() => fileInputRef.current?.click()}
+          onClick={() => closeCompactToolsBefore(() => fileInputRef.current?.click())}
         >
-          Open PDF / Convert Office
+          <span className="toolbar-open-full">Open PDF / Convert Office</span>
+          <span className="toolbar-open-compact" aria-hidden="true">
+            Open
+          </span>
         </button>
         <div className="viewer-controls" aria-label="PDF viewer controls">
           <button
             aria-label="Zoom out"
-            className="toolbar-button"
+            className="toolbar-button toolbar-zoom-control toolbar-zoom-button"
             title="Zoom out"
             type="button"
             disabled={!hasDocument}
@@ -165,7 +255,7 @@ export function Toolbar({
           </button>
           <input
             aria-label="Zoom percentage"
-            className="zoom-percentage-input"
+            className="zoom-percentage-input toolbar-zoom-control toolbar-zoom-input"
             disabled={!hasDocument}
             inputMode="decimal"
             value={zoomDraft}
@@ -185,7 +275,7 @@ export function Toolbar({
           />
           <button
             aria-label="Zoom in"
-            className="toolbar-button"
+            className="toolbar-button toolbar-zoom-control toolbar-zoom-button"
             title="Zoom in"
             type="button"
             disabled={!hasDocument}
@@ -194,15 +284,19 @@ export function Toolbar({
             +
           </button>
           <button
-            className="toolbar-button"
+            aria-label="Fit PDF to width"
+            className="toolbar-button toolbar-fit-width"
             type="button"
             disabled={!hasDocument}
             onClick={onFitWidth}
           >
-            Fit Width
+            <span className="toolbar-fit-full">Fit Width</span>
+            <span className="toolbar-fit-compact" aria-hidden="true">
+              Fit
+            </span>
           </button>
           <button
-            className="toolbar-button"
+            className="toolbar-button toolbar-fit-page"
             type="button"
             disabled={!hasDocument}
             onClick={onFitPage}
@@ -215,7 +309,7 @@ export function Toolbar({
             disabled={!hasDocument}
             title="Search document (Ctrl+F)"
             type="button"
-            onClick={onOpenSearch}
+            onClick={() => closeCompactToolsBefore(onOpenSearch)}
           >
             Search
           </button>
@@ -243,15 +337,20 @@ export function Toolbar({
         </div>
         {documentType === 'pdf' ? (
           <button
-            className="toolbar-button"
+            className="toolbar-button toolbar-export-annotated"
             disabled={!hasDocument || isAnnotatedPdfExporting}
             type="button"
-            onClick={onExportAnnotatedPdf}
+            onClick={() => closeCompactToolsBefore(onExportAnnotatedPdf)}
           >
             {isAnnotatedPdfExporting ? 'Exporting PDF...' : 'Export Annotated PDF'}
           </button>
         ) : null}
-        <button className="toolbar-button" type="button" disabled>
+        <button
+          className="toolbar-button toolbar-export-notes"
+          type="button"
+          disabled={!canExportNotes}
+          onClick={() => closeCompactToolsBefore(onExportNotes)}
+        >
           Export Notes
         </button>
       </div>

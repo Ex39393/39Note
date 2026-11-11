@@ -3,6 +3,18 @@ import type { CollectionRecord } from '../types/library.ts';
 
 export type CollectionEditorMode = 'view' | 'create' | 'edit';
 
+export type CollectionPaperAvailability =
+  'available' | 'missing-source' | 'unsupported-source' | 'open-failed';
+
+export function getCollectionPaperAvailability(
+  paper: Pick<LibraryDocument, 'documentType' | 'hasStoredSource'>,
+  openFailed = false,
+): CollectionPaperAvailability {
+  if (openFailed) return 'open-failed';
+  if (!paper.hasStoredSource) return 'missing-source';
+  return paper.documentType === 'pdf' ? 'available' : 'unsupported-source';
+}
+
 export interface CollectionEditorDraft {
   collectionId?: string;
   name: string;

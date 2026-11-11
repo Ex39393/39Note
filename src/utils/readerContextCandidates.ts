@@ -1,9 +1,11 @@
 import type { PdfGlossaryEntry } from '../types/glossary';
 import type { PdfAnnotation } from '../types/highlight';
+import type { DocumentLinkEndpointReference } from './documentLinkPresentation.ts';
 
 export type ReaderContextCandidateReference =
   | { kind: 'annotation'; annotationId: string }
-  | { kind: 'glossary'; glossaryEntryId: string };
+  | { kind: 'glossary'; glossaryEntryId: string }
+  | { kind: 'link'; linkId: string; endpointId: string };
 
 export interface ReaderContextCandidateSelection {
   candidates: ReaderContextCandidateReference[];
@@ -13,6 +15,7 @@ export interface ReaderContextCandidateSelection {
 export function createReaderContextCandidates(
   annotations: readonly PdfAnnotation[],
   glossaryEntries: readonly PdfGlossaryEntry[],
+  linkEndpoints: readonly DocumentLinkEndpointReference[] = [],
 ): ReaderContextCandidateReference[] {
   const candidates: ReaderContextCandidateReference[] = [];
   const seen = new Set<string>();
@@ -41,15 +44,28 @@ export function createReaderContextCandidates(
     }
   }
 
+  for (const target of [...linkEndpoints].sort(compareLinkCandidates)) {
+    const candidate: ReaderContextCandidateReference = {
+      kind: 'link',
+      linkId: target.link.id,
+      endpointId: target.endpoint.id,
+    };
+    const key = getReaderContextCandidateKey(candidate);
+    if (!seen.has(key)) {
+      seen.add(key);
+      candidates.push(candidate);
+    }
+  }
+
   return candidates;
 }
 
 export function getReaderContextCandidateKey(
   candidate: ReaderContextCandidateReference,
 ): string {
-  return candidate.kind === 'annotation'
-    ? `annotation:${candidate.annotationId}`
-    : `glossary:${candidate.glossaryEntryId}`;
+  if (candidate.kind === 'annotation') return `annotation:${candidate.annotationId}`;
+  if (candidate.kind === 'glossary') return `glossary:${candidate.glossaryEntryId}`;
+  return `link:${candidate.linkId}:${candidate.endpointId}`;
 }
 
 export function getAdjacentReaderContextCandidateKey(
@@ -113,4 +129,20 @@ function compareGlossaryCandidates(
     first.createdAt - second.createdAt ||
     first.glossaryEntryId.localeCompare(second.glossaryEntryId)
   );
+}
+
+function compareLinkCandidates(
+  first: DocumentLinkEndpointReference,
+  second: DocumentLinkEndpointReference,
+): number {
+  return (
+    first.link.visibleNumber - second.link.visibleNumber ||
+    compareStableText(first.link.id, second.link.id) ||
+    compareStableText(first.endpointLabel, second.endpointLabel) ||
+    compareStableText(first.endpoint.id, second.endpoint.id)
+  );
+}
+
+function compareStableText(first: string, second: string): number {
+  return first < second ? -1 : first > second ? 1 : 0;
 }

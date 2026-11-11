@@ -30,10 +30,8 @@ export function getAnchoredDefinitionBubblePosition(
 ): DefinitionBubblePosition {
   const anchorLeft = (anchor?.x ?? 0.5) * pageSize.width;
   const anchorTop = (anchor?.y ?? 0.5) * pageSize.height;
-  const anchorBottom =
-    ((anchor?.y ?? 0.5) + (anchor?.height ?? 0)) * pageSize.height;
-  const placeAbove =
-    anchorBottom + 210 > pageSize.height && anchorTop > 220;
+  const anchorBottom = ((anchor?.y ?? 0.5) + (anchor?.height ?? 0)) * pageSize.height;
+  const placeAbove = anchorBottom + 210 > pageSize.height && anchorTop > 220;
 
   return clampDefinitionBubblePosition(
     {
@@ -52,8 +50,14 @@ export function clampDefinitionBubblePosition(
   pageSize: DefinitionBubbleSize,
   bubbleSize: DefinitionBubbleSize,
 ): DefinitionBubblePosition {
-  const maxLeft = Math.max(BUBBLE_MARGIN, pageSize.width - bubbleSize.width - BUBBLE_MARGIN);
-  const maxTop = Math.max(BUBBLE_MARGIN, pageSize.height - bubbleSize.height - BUBBLE_MARGIN);
+  const maxLeft = Math.max(
+    BUBBLE_MARGIN,
+    pageSize.width - bubbleSize.width - BUBBLE_MARGIN,
+  );
+  const maxTop = Math.max(
+    BUBBLE_MARGIN,
+    pageSize.height - bubbleSize.height - BUBBLE_MARGIN,
+  );
   return {
     left: clamp(position.left, BUBBLE_MARGIN, maxLeft),
     top: clamp(position.top, BUBBLE_MARGIN, maxTop),

@@ -1,13 +1,14 @@
 import {
   PERSISTENCE_SCHEMA_VERSION,
+  FORMAT_GENERIC_PERSISTENCE_SCHEMA_VERSION,
   deleteDocumentState,
   getBackupDocumentData,
   listCollections,
   listLibraryDocuments,
-  listTags,
   loadStoredPdfFile,
   replaceLibraryEntities,
   restoreBackupDocument,
+  withWorkspaceMutation,
   validateBackupDocumentState,
   validateLibraryEntities,
   type PersistedDocumentState,
@@ -20,6 +21,7 @@ import {
   sanitizeProductivityBackupData,
   type ProductivityBackupDocument,
 } from '../services/productivityPersistence.ts';
+import type { WorkspaceRestoreLease } from '../services/workspaceRestoreLock.ts';
 import {
   clearAiConfigurationWithoutCredentials,
   loadAiConfiguration,
@@ -30,9 +32,14 @@ import {
   saveDefaultPromptProfileId,
 } from '../ai/configuration.ts';
 import type { AiPromptProfile } from '../ai/types.ts';
-import type { CollectionRecord, TagRecord } from '../types/library.ts';
+import type { CollectionRecord } from '../types/library.ts';
 import { isDocumentType, type DocumentType } from '../types/document.ts';
 import type { AiConversationRecord, PrintDraftRecord } from '../types/productivity.ts';
+import {
+  DOCUMENT_LINK_HIGH_WATER_ENTITY_ID,
+  createDocumentLinkNumberHighWater,
+  sanitizeDocumentLinkNumberHighWater,
+} from '../utils/documentLinks.ts';
 import { compareCanonicalStrings, sha256Hex, stableStringify } from './hash.ts';
 import {
   deserializeSafeAiConfiguration,
@@ -62,7 +69,6 @@ interface DocumentMetadataValue {
   displayTitle: string;
   nextNoteNumber: number;
   collectionIds: string[];
-  tagIds: string[];
   isPinned: boolean;
   pinnedAt?: number;
   lastReadAt?: number;
@@ -86,6 +92,24 @@ export class BrowserSyncLocalAdapter implements SyncLocalAdapter {
         documentValue(document),
         Math.max(document.updatedAt, document.lastReadAt ?? 0, document.pinnedAt ?? 0),
       );
+      const linkNumberHighWater = createDocumentLinkNumberHighWater(
+        document.documentId,
+        document.nextLinkNumber,
+      );
+      if (!linkNumberHighWater) {
+        throw new Error(
+          `Local document ${document.documentId} has invalid Link numbering.`,
+        );
+      }
+      await addEntity(
+        entities,
+        state,
+        'link-number-high-water',
+        DOCUMENT_LINK_HIGH_WATER_ENTITY_ID,
+        linkNumberHighWater,
+        document.updatedAt,
+        document.documentId,
+      );
       for (const annotation of document.annotations) {
         await addEntity(
           entities,
@@ -94,6 +118,17 @@ export class BrowserSyncLocalAdapter implements SyncLocalAdapter {
           annotation.id,
           annotation,
           annotation.updatedAt,
+          document.documentId,
+        );
+      }
+      for (const link of document.links) {
+        await addEntity(
+          entities,
+          state,
+          'annotation',
+          link.id,
+          link,
+          link.updatedAt,
           document.documentId,
         );
       }
@@ -174,9 +209,6 @@ export class BrowserSyncLocalAdapter implements SyncLocalAdapter {
         collection,
         collection.updatedAt,
       );
-    }
-    for (const tag of await listTags()) {
-      await addEntity(entities, state, 'tag', tag.id, tag, tag.updatedAt);
     }
     for (const record of productivity) {
       if (record.printDraft) {
@@ -301,6 +333,21 @@ export class BrowserSyncLocalAdapter implements SyncLocalAdapter {
     availablePdfs: ReadonlyMap<string, StoredPdfFile>,
     signal?: AbortSignal,
   ): Promise<SyncApplyResult> {
+    // Reject malformed remote data before opening any persistence service. The
+    // exact same validation remains inside the owned apply path as a defensive
+    // invariant for future callers.
+    this.validateSnapshot(snapshot);
+    return withWorkspaceMutation((lease) =>
+      this.applySnapshotWithLease(snapshot, availablePdfs, signal, lease),
+    );
+  }
+
+  private async applySnapshotWithLease(
+    snapshot: SyncSnapshot,
+    availablePdfs: ReadonlyMap<string, StoredPdfFile>,
+    signal: AbortSignal | undefined,
+    workspaceLease: WorkspaceRestoreLease,
+  ): Promise<SyncApplyResult> {
     signal?.throwIfAborted();
     this.validateSnapshot(snapshot);
     const byDocument = groupEntitiesByDocument(snapshot.entities);
@@ -340,10 +387,10 @@ export class BrowserSyncLocalAdapter implements SyncLocalAdapter {
     for (const documentId of currentIds) {
       signal?.throwIfAborted();
       if (nextIds.has(documentId)) continue;
-      if (await deleteDocumentState(documentId, false, signal)) {
+      if (await deleteDocumentState(documentId, false, signal, workspaceLease)) {
         deletedDocumentIds.push(documentId);
       }
-      await deleteProductivityDocumentData(documentId, false, signal);
+      await deleteProductivityDocumentData(documentId, false, signal, workspaceLease);
     }
 
     for (const prepared of preparedDocuments) {
@@ -355,6 +402,7 @@ export class BrowserSyncLocalAdapter implements SyncLocalAdapter {
           true,
           false,
           signal,
+          workspaceLease,
         ))
       ) {
         throw new Error(`Could not restore cloud document ${prepared.documentId}.`);
@@ -364,21 +412,19 @@ export class BrowserSyncLocalAdapter implements SyncLocalAdapter {
 
     for (const documentId of nextIds) {
       signal?.throwIfAborted();
-      await deleteProductivityDocumentData(documentId, false, signal);
+      await deleteProductivityDocumentData(documentId, false, signal, workspaceLease);
     }
     await restoreProductivityBackupData(
       preparedDocuments.map((document) => document.productivity),
       false,
       signal,
+      workspaceLease,
     );
     const collections = snapshot.entities
       .filter((entity) => entity.kind === 'collection')
       .map((entity) => entity.value as CollectionRecord);
-    const tags = snapshot.entities
-      .filter((entity) => entity.kind === 'tag')
-      .map((entity) => entity.value as TagRecord);
-    if (!(await replaceLibraryEntities(collections, tags, false, signal))) {
-      throw new Error('Cloud collections or tags failed validation.');
+    if (!(await replaceLibraryEntities(collections, false, signal, workspaceLease))) {
+      throw new Error('Cloud Collections failed validation.');
     }
     signal?.throwIfAborted();
     applyAiSettings(snapshot.entities);
@@ -394,11 +440,8 @@ export class BrowserSyncLocalAdapter implements SyncLocalAdapter {
     const collections = snapshot.entities
       .filter((entity) => entity.kind === 'collection')
       .map((entity) => entity.value as CollectionRecord);
-    const tags = snapshot.entities
-      .filter((entity) => entity.kind === 'tag')
-      .map((entity) => entity.value as TagRecord);
-    if (!validateLibraryEntities(collections, tags)) {
-      throw new Error('Cloud collections or tags failed validation.');
+    if (!validateLibraryEntities(collections)) {
+      throw new Error('Cloud Collections failed validation.');
     }
     validatedAiSettings(snapshot.entities);
   }
@@ -437,7 +480,6 @@ export function documentValue(state: PersistedDocumentState): DocumentMetadataVa
     displayTitle: state.displayTitle,
     nextNoteNumber: state.nextNoteNumber,
     collectionIds: state.collectionIds,
-    tagIds: state.tagIds,
     isPinned: state.isPinned,
     ...(state.pinnedAt ? { pinnedAt: state.pinnedAt } : {}),
     ...(state.lastReadAt ? { lastReadAt: state.lastReadAt } : {}),
@@ -475,7 +517,54 @@ export function validatedDocumentState(
   if (!documentType) {
     throw new Error(`Cloud document ${documentId} failed validation.`);
   }
-  const annotations = valuesFor(records, 'annotation');
+  const annotationRecords = records.filter((record) => record.kind === 'annotation');
+  const linkRecords = annotationRecords.filter(
+    (record) => isRecord(record.value) && record.value.type === 'link',
+  );
+  if (
+    documentEntity.value.schemaVersion !== PERSISTENCE_SCHEMA_VERSION &&
+    linkRecords.length > 0
+  ) {
+    throw new Error(`Cloud document ${documentId} failed validation.`);
+  }
+  if (
+    linkRecords.some(
+      (record) =>
+        record.documentId !== documentId ||
+        !isRecord(record.value) ||
+        record.value.id !== record.id ||
+        record.value.documentId !== documentId,
+    )
+  ) {
+    throw new Error(`Cloud document ${documentId} failed validation.`);
+  }
+  const links = linkRecords.map((record) => record.value);
+  const highWaterRecords = records.filter(
+    (record) => record.kind === 'link-number-high-water',
+  );
+  const isCurrentSchema =
+    documentEntity.value.schemaVersion === PERSISTENCE_SCHEMA_VERSION;
+  if (
+    (isCurrentSchema && highWaterRecords.length !== 1) ||
+    (!isCurrentSchema && highWaterRecords.length !== 0)
+  ) {
+    throw new Error(`Cloud document ${documentId} failed validation.`);
+  }
+  const linkNumberHighWater = highWaterRecords[0];
+  const validatedHighWater = linkNumberHighWater
+    ? sanitizeDocumentLinkNumberHighWater(linkNumberHighWater.value, documentId)
+    : null;
+  if (
+    linkNumberHighWater &&
+    (linkNumberHighWater.id !== DOCUMENT_LINK_HIGH_WATER_ENTITY_ID ||
+      linkNumberHighWater.documentId !== documentId ||
+      !validatedHighWater)
+  ) {
+    throw new Error(`Cloud document ${documentId} failed validation.`);
+  }
+  const annotations = annotationRecords
+    .filter((record) => !isRecord(record.value) || record.value.type !== 'link')
+    .map((record) => record.value);
   const readingPosition = valuesFor(records, 'reading-position')[0];
   const rawState = {
     ...documentEntity.value,
@@ -484,6 +573,8 @@ export function validatedDocumentState(
     documentId,
     annotations: documentType === 'pdf' ? annotations : [],
     officeAnnotations: documentType === 'pdf' ? [] : annotations,
+    links: documentType === 'pdf' ? links : [],
+    nextLinkNumber: validatedHighWater?.nextLinkNumber ?? 1,
     noteAnchors: valuesFor(records, 'note-anchor'),
     notes: valuesFor(records, 'note'),
     glossaryEntries: valuesFor(records, 'glossary'),
@@ -503,8 +594,15 @@ export function validatedDocumentState(
  * schema metadata must carry an explicit, valid type so Office sources cannot
  * be smuggled through the legacy PDF default.
  */
-function cloudDocumentType(value: Record<string, unknown>): DocumentType | null {
-  if (value.schemaVersion === PERSISTENCE_SCHEMA_VERSION) {
+export function cloudDocumentType(
+  value: Record<string, unknown>,
+  supportedPersistenceSchemaVersion = PERSISTENCE_SCHEMA_VERSION,
+): DocumentType | null {
+  if (
+    value.schemaVersion === supportedPersistenceSchemaVersion ||
+    (supportedPersistenceSchemaVersion > FORMAT_GENERIC_PERSISTENCE_SCHEMA_VERSION &&
+      value.schemaVersion === FORMAT_GENERIC_PERSISTENCE_SCHEMA_VERSION)
+  ) {
     return isDocumentType(value.documentType) ? value.documentType : null;
   }
   const isLegacySchema =
@@ -512,7 +610,7 @@ function cloudDocumentType(value: Record<string, unknown>): DocumentType | null 
     (typeof value.schemaVersion === 'number' &&
       Number.isInteger(value.schemaVersion) &&
       value.schemaVersion >= 1 &&
-      value.schemaVersion < PERSISTENCE_SCHEMA_VERSION);
+      value.schemaVersion < FORMAT_GENERIC_PERSISTENCE_SCHEMA_VERSION);
   if (!isLegacySchema) return null;
   return value.documentType === undefined || value.documentType === 'pdf'
     ? 'pdf'

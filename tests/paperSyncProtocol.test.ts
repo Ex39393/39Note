@@ -22,10 +22,15 @@ import type {
 } from '../src/sync/paperDriveRepository.ts';
 import { sha256Hex, stableStringify } from '../src/sync/hash.ts';
 import { isRecognizedPaperRootMetadata } from '../src/sync/paperRootValidation.ts';
-import { PAPER_PRESENCE_PROTOCOL_VERSION } from '../src/sync/paperPresence.ts';
+import {
+  PAPER_PRESENCE_PROTOCOL_VERSION,
+  PAPER_PRESENCE_ROLE,
+  createPaperPresenceGeneration,
+  type PaperPresenceGeneration,
+} from '../src/sync/paperPresence.ts';
 import {
   LEGACY_PAPER_PACKAGE_LAYOUT_VERSION,
-  PAPER_MANIFEST_STORAGE,
+  LEGACY_PAPER_SYNC_PROTOCOL_VERSION,
   PAPER_PACKAGE_LAYOUT_VERSION,
   PAPER_SYNC_PROTOCOL_VERSION,
   SYNC_LAYOUT_VERSION,
@@ -34,6 +39,7 @@ import {
   type PaperSyncState,
 } from '../src/sync/paperTypes.ts';
 import {
+  PAPER_MANIFEST_READ_CONCURRENCY,
   PAPER_MEDIA_CONCURRENCY,
   PAPER_METADATA_CONCURRENCY,
   PAPER_TRANSFER_CONCURRENCY,
@@ -41,6 +47,11 @@ import {
   mapWithConcurrency,
 } from '../src/sync/syncConcurrency.ts';
 import { derivePaperStatus } from '../src/sync/paperStateMachine.ts';
+import {
+  DOCUMENT_LINK_HIGH_WATER_ENTITY_ID,
+  DOCUMENT_LINK_PERSISTENCE_SCHEMA_VERSION,
+  createDocumentLinkNumberHighWater,
+} from '../src/utils/documentLinks.ts';
 import {
   SYNC_SCHEMA_VERSION,
   createSyncEntityKey,
@@ -118,10 +129,54 @@ test('Paper-v3 compatibility versions remain unchanged', () => {
     {
       rootLayout: 3,
       paperPackageLayout: 3,
-      paperSyncProtocol: 2,
+      paperSyncProtocol: 3,
       presenceProtocol: 1,
     },
   );
+});
+
+test('Paper-v3 round trip preserves an opaque new-paper instance identity', async () => {
+  const documentId =
+    'pdfjs:synthetic-source-fingerprint:instance:11111111-1111-4111-8111-111111111111';
+  const drive = new MemoryDrive();
+  const repository = await initializedRepository(drive);
+  const local = await localPackage(documentId, 'Separate paper');
+
+  const published = await repository.publishPaper(
+    local,
+    paperState(documentId),
+    signal,
+  );
+  assert.equal(published.cloud.documentId, documentId);
+  assert.equal(published.manifest.documentId, documentId);
+  assert.equal(
+    drive.file(published.cloud.paperFolderId).appProperties?.documentId,
+    documentId,
+  );
+
+  const downloaded = await repository.downloadPaper(published.cloud, signal);
+  assert.equal(downloaded.documentId, documentId);
+  assert.equal(
+    downloaded.snapshot.entities.find(({ kind }) => kind === 'document')?.id,
+    documentId,
+  );
+  assert.equal(downloaded.sourcePdf?.documentId, documentId);
+});
+
+test('Paper publication rejects a locally valid overlong identity before Drive mutation', async () => {
+  const documentId = 'x'.repeat(257);
+  const drive = new MemoryDrive();
+  const repository = await initializedRepository(drive);
+  const local = await localPackage(documentId, 'Local-only paper');
+  drive.resetRequestLog();
+  const uploadCount = drive.uploads.length;
+
+  await assert.rejects(
+    () => repository.publishPaper(local, paperState(documentId), signal),
+    /cannot be published by the current sync format/u,
+  );
+  assert.equal(drive.writes.length, 0);
+  assert.equal(drive.uploads.length, uploadCount);
 });
 
 test('layout-3 Drive round trip preserves an honestly typed Office source', async () => {
@@ -187,6 +242,321 @@ test('a layout-2 client rejects layout 3 before applying payloads or publishing 
     fixture.drive.byRole('paper-manifest-generation').length,
     manifestCountBefore,
   );
+});
+
+test('protocol-2 root migration is verified, resumable, root-last, and fail-closed', async () => {
+  const fixture = await protocol2RootFixture('doc-protocol-cutover', 'Protocol paper');
+  const manifestFile = fixture.drive.byRole('paper-manifest-generation')[0];
+  const protocol2ManifestText = await fixture.drive.peekText(manifestFile.id);
+  const sourceFile = fixture.drive.byRole('paper-source-pdf')[0];
+  const protocol2Source = await fixture.drive.peekBlob(sourceFile.id);
+
+  assert.equal(
+    (await fixture.repository.detectLayout(signal)).state,
+    'protocol-upgrade-required',
+  );
+  const blockedLocal = await localPackage(
+    'doc-protocol-cutover',
+    'Blocked publication',
+  );
+  fixture.drive.resetRequestLog();
+  await assert.rejects(
+    () =>
+      fixture.repository.publishPaper(
+        blockedLocal,
+        paperState('doc-protocol-cutover'),
+        signal,
+      ),
+    (error: unknown) =>
+      Reflect.get(Object(error), 'code') === 'protocol-upgrade-required',
+  );
+  assert.equal(fixture.drive.writes.length, 0);
+
+  fixture.drive.failNextRootActivation();
+  await assert.rejects(() =>
+    fixture.repository.upgradePaperSyncProtocol({ deviceId: 'device-a' }, signal),
+  );
+  assert.equal(
+    fixture.drive.file('root').appProperties?.paperProtocolVersion,
+    String(LEGACY_PAPER_SYNC_PROTOCOL_VERSION),
+  );
+  assert.equal(fixture.drive.byRole('paper-protocol-migration-completion').length, 1);
+  assert.equal(await fixture.drive.peekText(manifestFile.id), protocol2ManifestText);
+  assert.deepEqual(
+    new Uint8Array(await (await fixture.drive.peekBlob(sourceFile.id)).arrayBuffer()),
+    new Uint8Array(await protocol2Source.arrayBuffer()),
+  );
+
+  fixture.drive.resetRequestLog();
+  const migrated = await fixture.repository.upgradePaperSyncProtocol(
+    { deviceId: 'device-a' },
+    signal,
+  );
+  assert.equal(migrated.alreadyActive, false);
+  assert.equal(
+    fixture.drive.file('root').appProperties?.paperProtocolVersion,
+    String(PAPER_SYNC_PROTOCOL_VERSION),
+  );
+  assert.equal(
+    fixture.drive.file('root').appProperties?.protocolMigrationCompletionId,
+    migrated.completion.id,
+  );
+  assert.equal(fixture.drive.writes.at(-1)?.kind, 'update-metadata');
+  assert.equal(fixture.drive.writes.at(-1)?.fileId, 'root');
+  assert.equal(fixture.drive.uploadsByRole('paper-protocol-migration-completion'), 1);
+  assert.equal(await fixture.drive.peekText(manifestFile.id), protocol2ManifestText);
+
+  fixture.drive.resetRequestLog();
+  const retried = await fixture.repository.upgradePaperSyncProtocol(
+    { deviceId: 'device-a' },
+    signal,
+  );
+  assert.equal(retried.alreadyActive, true);
+  assert.equal(retried.completion.id, migrated.completion.id);
+  assert.equal(fixture.drive.writes.length, 0);
+
+  const republished = await fixture.repository.publishPaper(
+    await localPackage('doc-protocol-cutover', 'Protocol paper', 'after-cutover'),
+    paperState('doc-protocol-cutover'),
+    signal,
+  );
+  assert.equal(republished.manifest.paperSyncProtocolVersion, 3);
+  assert.equal(await fixture.drive.peekText(manifestFile.id), protocol2ManifestText);
+  assert.ok(
+    fixture.drive
+      .byRole('paper-manifest-generation')
+      .some(
+        (file) =>
+          file.id === manifestFile.id &&
+          file.appProperties?.paperProtocolVersion ===
+            String(LEGACY_PAPER_SYNC_PROTOCOL_VERSION),
+      ),
+  );
+});
+
+test('protocol migration verifies a removed package through inherited Drive Trash without restoring it', async () => {
+  const fixture = await protocol2RootFixture(
+    'doc-protocol-removed',
+    'Removed protocol paper',
+  );
+  const paperFolderId = fixture.first.cloud.paperFolderId;
+  const dataFolderId = fixture.first.cloud.dataFolderId!;
+  const manifestFile = fixture.drive.byRole('paper-manifest-generation')[0];
+  const sourceFile = fixture.drive.byRole('paper-source-pdf')[0];
+  const manifestText = await fixture.drive.peekText(manifestFile.id);
+  const sourceBytes = new Uint8Array(
+    await (await fixture.drive.peekBlob(sourceFile.id)).arrayBuffer(),
+  );
+  const releasedClient = new PaperDriveRepository(fixture.drive, 'root', {
+    now: monotonicNow(),
+    supportedPaperSyncProtocolVersion: LEGACY_PAPER_SYNC_PROTOCOL_VERSION,
+  });
+  assert.equal((await releasedClient.detectLayout(signal)).state, 'paper-v3');
+  const removed = await releasedClient.removePaperFromDrive(
+    fixture.first.cloud,
+    { deviceId: 'device-remover' },
+    signal,
+  );
+  assert.equal(removed.cloud.presenceState, 'removed');
+  fixture.drive.simulateInheritedTrash(paperFolderId);
+  assert.equal(fixture.drive.file(paperFolderId).trashed, true);
+  assert.equal(fixture.drive.file(dataFolderId).trashed, true);
+  assert.equal(fixture.drive.file(manifestFile.id).trashed, true);
+  assert.equal(fixture.drive.file(sourceFile.id).trashed, true);
+
+  fixture.drive.resetRequestLog();
+  const eventCountBeforeMigration = fixture.drive.events.length;
+  const migrated = await fixture.repository.upgradePaperSyncProtocol(
+    { deviceId: 'device-migrator' },
+    signal,
+  );
+
+  assert.equal(migrated.alreadyActive, false);
+  assert.equal(migrated.completion.papers['doc-protocol-removed']?.state, 'removed');
+  assert.equal(
+    fixture.drive.file('root').appProperties?.paperProtocolVersion,
+    String(PAPER_SYNC_PROTOCOL_VERSION),
+  );
+  assert.equal(fixture.drive.file(paperFolderId).trashed, true);
+  assert.equal(fixture.drive.file(dataFolderId).trashed, true);
+  assert.equal(fixture.drive.file(manifestFile.id).trashed, true);
+  assert.equal(fixture.drive.file(sourceFile.id).trashed, true);
+  assert.equal(await fixture.drive.peekText(manifestFile.id), manifestText);
+  assert.deepEqual(
+    new Uint8Array(await (await fixture.drive.peekBlob(sourceFile.id)).arrayBuffer()),
+    sourceBytes,
+  );
+  assert.equal(
+    fixture.drive.events
+      .slice(eventCountBeforeMigration)
+      .some((event) => event.startsWith('untrash:')),
+    false,
+  );
+  assert.equal(
+    fixture.drive.writes.some(({ fileId }) => fileId === paperFolderId),
+    false,
+  );
+});
+
+test('protocol migration still rejects an explicitly trashed removed-package descendant', async () => {
+  const fixture = await protocol2RootFixture(
+    'doc-protocol-explicit-trash',
+    'Explicitly trashed child',
+  );
+  const paperFolderId = fixture.first.cloud.paperFolderId;
+  const releasedClient = new PaperDriveRepository(fixture.drive, 'root', {
+    now: monotonicNow(),
+    supportedPaperSyncProtocolVersion: LEGACY_PAPER_SYNC_PROTOCOL_VERSION,
+  });
+  assert.equal((await releasedClient.detectLayout(signal)).state, 'paper-v3');
+  await releasedClient.removePaperFromDrive(
+    fixture.first.cloud,
+    { deviceId: 'device-remover' },
+    signal,
+  );
+  fixture.drive.simulateInheritedTrash(paperFolderId);
+  const manifestFile = [...fixture.drive.allByRole('paper-manifest-generation')][0];
+  fixture.drive.markExplicitlyTrashed(manifestFile.id);
+
+  fixture.drive.resetRequestLog();
+  await assert.rejects(
+    () =>
+      fixture.repository.upgradePaperSyncProtocol(
+        { deviceId: 'device-migrator' },
+        signal,
+      ),
+    (error: unknown) =>
+      error instanceof PaperManifestIntegrityError &&
+      /invalid Drive metadata/u.test(error.message),
+  );
+  assert.equal(
+    fixture.drive.file('root').appProperties?.paperProtocolVersion,
+    String(LEGACY_PAPER_SYNC_PROTOCOL_VERSION),
+  );
+  assert.equal(fixture.drive.uploadsByRole('paper-protocol-migration-completion'), 0);
+  assert.equal(
+    fixture.drive.writes.some(({ fileId }) => fileId === 'root'),
+    false,
+  );
+});
+
+test('protocol migration verifies immutable protocol-2 bytes before root activation', async () => {
+  const fixture = await protocol2RootFixture('doc-protocol-corrupt', 'Corrupt paper');
+  const stateFile = fixture.drive.byRole('paper-state')[0];
+  fixture.drive.replaceBlob(
+    stateFile.id,
+    new Blob(['{"tampered":true}'], { type: 'application/json' }),
+  );
+  fixture.drive.resetRequestLog();
+  await assert.rejects(() =>
+    fixture.repository.upgradePaperSyncProtocol({ deviceId: 'device-a' }, signal),
+  );
+  assert.equal(
+    fixture.drive.file('root').appProperties?.paperProtocolVersion,
+    String(LEGACY_PAPER_SYNC_PROTOCOL_VERSION),
+  );
+  assert.equal(fixture.drive.byRole('paper-protocol-migration-completion').length, 0);
+  assert.equal(
+    fixture.drive.writes.some(({ fileId }) => fileId === 'root'),
+    false,
+  );
+});
+
+test('simulated released protocol-2 Keep local and Restore fail at root before writes', async () => {
+  const fixture = await protocol2RootFixture('doc-old-client', 'Old client guard');
+  await fixture.repository.upgradePaperSyncProtocol({ deviceId: 'device-a' }, signal);
+  const releasedClient = new PaperDriveRepository(fixture.drive, 'root', {
+    now: monotonicNow(),
+    supportedPaperSyncProtocolVersion: LEGACY_PAPER_SYNC_PROTOCOL_VERSION,
+  });
+  const local = await localPackage('doc-old-client', 'Old client guard', 'stale');
+  const state = paperState('doc-old-client');
+  incorporate(state, fixture.first);
+
+  fixture.drive.resetRequestLog();
+  await assert.rejects(
+    () => releasedClient.initializeEmptyLayout(signal),
+    (error: unknown) => Reflect.get(Object(error), 'code') === 'unsupported-protocol',
+  );
+  assert.equal(fixture.drive.blobReads.length, 0);
+  assert.equal(fixture.drive.writes.length, 0);
+
+  fixture.drive.resetRequestLog();
+  await assert.rejects(
+    () =>
+      releasedClient.upgradePaperSyncProtocol({ deviceId: 'released-device' }, signal),
+    (error: unknown) => Reflect.get(Object(error), 'code') === 'unsupported-protocol',
+  );
+  assert.equal(fixture.drive.blobReads.length, 0);
+  assert.equal(fixture.drive.writes.length, 0);
+
+  fixture.drive.resetRequestLog();
+  await assert.rejects(() =>
+    releasedClient.reconcileKeepLocalPaper(local, state, signal),
+  );
+  assert.equal(fixture.drive.blobReads.length, 0);
+  assert.equal(fixture.drive.writes.length, 0);
+
+  state.cloudPresence = 'removed';
+  fixture.drive.deletePermanently(fixture.first.cloud.paperFolderId);
+  fixture.drive.resetRequestLog();
+  await assert.rejects(() => releasedClient.restorePaper(local, state, signal));
+  assert.equal(fixture.drive.writes.length, 0);
+  const inspection = await releasedClient.detectLayout(signal);
+  assert.equal(inspection.state, 'unsupported-protocol');
+  assert.equal(
+    inspection.detectedPaperSyncProtocolVersion,
+    PAPER_SYNC_PROTOCOL_VERSION,
+  );
+});
+
+test('a future Drive protocol is a compatibility block, not an incomplete migration', async () => {
+  const fixture = await publishedFixture('doc-future-protocol', 'Future protocol');
+  fixture.drive.rewrite('root', {
+    appProperties: {
+      ...fixture.drive.file('root').appProperties!,
+      paperProtocolVersion: String(PAPER_SYNC_PROTOCOL_VERSION + 1),
+    },
+  });
+
+  fixture.drive.resetRequestLog();
+  const inspection = await fixture.repository.detectLayout(signal);
+  assert.equal(inspection.state, 'unsupported-protocol');
+  assert.equal(
+    inspection.detectedPaperSyncProtocolVersion,
+    PAPER_SYNC_PROTOCOL_VERSION + 1,
+  );
+  assert.equal(fixture.drive.blobReads.length, 0);
+  assert.equal(fixture.drive.writes.length, 0);
+
+  fixture.drive.resetRequestLog();
+  await assert.rejects(
+    () => fixture.repository.initializeEmptyLayout(signal),
+    (error: unknown) =>
+      Reflect.get(Object(error), 'code') === 'unsupported-protocol' &&
+      /too old.*latest 39Note version/iu.test(
+        error instanceof Error ? error.message : '',
+      ) &&
+      /do not attempt another Drive upgrade/iu.test(
+        error instanceof Error ? error.message : '',
+      ),
+  );
+  assert.equal(fixture.drive.blobReads.length, 0);
+  assert.equal(fixture.drive.writes.length, 0);
+
+  fixture.drive.rewrite('root', {
+    appProperties: {
+      ...fixture.drive.file('root').appProperties!,
+      paperProtocolVersion: '3.5',
+    },
+  });
+  fixture.drive.resetRequestLog();
+  assert.equal(
+    (await fixture.repository.detectLayout(signal)).state,
+    'migration-incomplete',
+  );
+  assert.equal(fixture.drive.blobReads.length, 0);
+  assert.equal(fixture.drive.writes.length, 0);
 });
 
 test('Office papers use the same explicit Remove and exact-folder Restore path', async () => {
@@ -321,6 +691,324 @@ test('rendered Print PDF replacement updates only the verified secondary artifac
       (record) => record.kind === 'print-draft',
     )?.value,
     printDraftValue,
+  );
+});
+
+test('protocol-3 activation remains bound to exact layout, control, and protocol evidence', async () => {
+  const missingEvidence = await protocol2RootFixture(
+    'doc-missing-protocol-evidence',
+    'Missing evidence',
+  );
+  await missingEvidence.repository.upgradePaperSyncProtocol(
+    { deviceId: 'device-a' },
+    signal,
+  );
+  const missingRootProperties = {
+    ...missingEvidence.drive.file('root').appProperties!,
+  };
+  delete missingRootProperties.protocolMigrationCompletionId;
+  missingEvidence.drive.rewrite('root', {
+    appProperties: missingRootProperties,
+  });
+  assert.equal(
+    (await missingEvidence.repository.detectLayout(signal)).state,
+    'migration-incomplete',
+  );
+
+  const mismatchedEvidence = await protocol2RootFixture(
+    'doc-mismatched-protocol-evidence',
+    'Mismatched evidence',
+  );
+  await mismatchedEvidence.repository.upgradePaperSyncProtocol(
+    { deviceId: 'device-a' },
+    signal,
+  );
+  const protocolFile = mismatchedEvidence.drive.byRole(
+    'paper-protocol-migration-completion',
+  )[0];
+  const protocolCompletion = JSON.parse(
+    await mismatchedEvidence.drive.peekText(protocolFile.id),
+  ) as Record<string, unknown>;
+  const mismatchedWithoutId = {
+    ...protocolCompletion,
+    layoutMigrationCompletionId: 'f'.repeat(64),
+  };
+  delete mismatchedWithoutId.id;
+  const mismatchedId = await sha256Hex(stableStringify(mismatchedWithoutId));
+  const mismatchedText = stableStringify({
+    ...mismatchedWithoutId,
+    id: mismatchedId,
+  });
+  mismatchedEvidence.drive.rewrite(
+    protocolFile.id,
+    {
+      name: `paper-protocol-v${PAPER_SYNC_PROTOCOL_VERSION}-${mismatchedId}.json`,
+      appProperties: {
+        ...protocolFile.appProperties!,
+        completionId: mismatchedId,
+      },
+    },
+    new Blob([mismatchedText], { type: 'application/json' }),
+  );
+  mismatchedEvidence.drive.rewrite('root', {
+    appProperties: {
+      ...mismatchedEvidence.drive.file('root').appProperties!,
+      protocolMigrationCompletionId: mismatchedId,
+    },
+  });
+  assert.equal(
+    (await mismatchedEvidence.repository.detectLayout(signal)).state,
+    'migration-incomplete',
+  );
+
+  const nativeDrive = new MemoryDrive();
+  const nativeRepository = await initializedRepository(nativeDrive);
+  const nativeControl = nativeDrive.byRole('paper-v3-control')[0];
+  nativeDrive.rewrite(nativeControl.id, {
+    appProperties: {
+      ...nativeControl.appProperties!,
+      paperProtocolVersion: String(LEGACY_PAPER_SYNC_PROTOCOL_VERSION),
+    },
+  });
+  assert.equal(
+    (await nativeRepository.detectLayout(signal)).state,
+    'migration-incomplete',
+  );
+});
+
+test('late protocol-2 package and presence writes cannot cross the cutover fence', async () => {
+  const packageFixture = await protocol2RootFixture('doc-late-package', 'Late package');
+  const lateManifest = await siblingManifest(
+    packageFixture.first.manifest,
+    'Late package child',
+    packageFixture.first.manifest.generation.createdAt + 1,
+  );
+  await packageFixture.repository.upgradePaperSyncProtocol(
+    { deviceId: 'device-a' },
+    signal,
+  );
+  packageFixture.drive.injectManifest(lateManifest);
+  const localAfterCutover = await localPackage(
+    'doc-late-package',
+    'Local after cutover',
+  );
+  packageFixture.drive.resetRequestLog();
+  await assert.rejects(
+    () =>
+      packageFixture.repository.publishPaper(
+        localAfterCutover,
+        paperState('doc-late-package'),
+        signal,
+      ),
+    (error: unknown) =>
+      error instanceof PaperManifestIntegrityError &&
+      /protocol cutover boundary/u.test(error.message),
+  );
+  assert.equal(packageFixture.drive.writes.length, 0);
+
+  const presenceFixture = await protocol2RootFixture(
+    'doc-late-presence',
+    'Late presence',
+  );
+  const controlFolderId = presenceFixture.drive.byRole('paper-v3-control')[0].id;
+  const paperFolderId = presenceFixture.first.cloud.paperFolderId;
+  const cutoverPresence = presenceFixture.drive.byRole(PAPER_PRESENCE_ROLE)[0];
+  const cutoverPresenceRecord = JSON.parse(
+    await presenceFixture.drive.peekText(cutoverPresence.id),
+  ) as { generation: { id: string } };
+  await presenceFixture.repository.upgradePaperSyncProtocol(
+    { deviceId: 'device-a' },
+    signal,
+  );
+  const legitimateRemoval = await presenceFixture.repository.removePaperFromDrive(
+    presenceFixture.first.cloud,
+    { deviceId: 'device-current' },
+    signal,
+  );
+  assert.equal(legitimateRemoval.cloud.presenceState, 'removed');
+  const latePresence = await createPaperPresenceGeneration(
+    {
+      app: '39Note',
+      syncLayoutVersion: SYNC_LAYOUT_VERSION,
+      presenceProtocolVersion: PAPER_PRESENCE_PROTOCOL_VERSION,
+      rootFolderId: 'root',
+      controlFolderId,
+      documentId: 'doc-late-presence',
+      displayName: 'Late presence',
+      state: 'removed',
+      intent: 'remove',
+      paperFolderId,
+      writer: { deviceId: 'device-old' },
+    },
+    {
+      createdAt: 2_000_000_000_000,
+      createdBy: 'device-old',
+      parents: [cutoverPresenceRecord.generation.id],
+    },
+  );
+  const latePresenceText = stableStringify(latePresence);
+  presenceFixture.drive.seed(
+    {
+      id: `late-presence-${latePresence.generation.id.slice(0, 12)}`,
+      name: `paper-presence-${latePresence.generation.id}.json`,
+      mimeType: 'application/json',
+      ownedByMe: true,
+      parents: [controlFolderId],
+      appProperties: {
+        application: '39Note',
+        role: PAPER_PRESENCE_ROLE,
+        rootFolderId: 'root',
+        controlFolderId,
+        documentId: 'doc-late-presence',
+        state: 'removed',
+        generationId: latePresence.generation.id,
+        presenceProtocolVersion: String(PAPER_PRESENCE_PROTOCOL_VERSION),
+        paperProtocolVersion: String(LEGACY_PAPER_SYNC_PROTOCOL_VERSION),
+      },
+    },
+    new Blob([latePresenceText], { type: 'application/json' }),
+  );
+  presenceFixture.drive.resetRequestLog();
+  await assert.rejects(
+    () => presenceFixture.repository.discover([], signal),
+    (error: unknown) => {
+      const cause = Reflect.get(Object(error), 'cause');
+      return /paper-presence generation crosses the verified protocol cutover boundary/u.test(
+        `${error instanceof Error ? error.message : ''} ${cause instanceof Error ? cause.message : ''}`,
+      );
+    },
+  );
+  assert.equal(presenceFixture.drive.writes.length, 0);
+
+  presenceFixture.drive.resetRequestLog();
+  const preview = await presenceFixture.repository.inspectTargetedPaperPurge(
+    'doc-late-presence',
+    signal,
+  );
+  assert.equal(preview.eligible, false);
+  assert.equal(preview.validPresenceCount, 3);
+  assert.equal(preview.corruptPresenceCount, 0);
+  assert.equal(preview.proof, undefined);
+  assert.equal(preview.ancestryDiagnostic?.validationStage, 'protocol-boundary');
+  assert.equal(
+    preview.ancestryDiagnostic?.failureCode,
+    'presence-crosses-cutover-boundary',
+  );
+  assert.equal(preview.ancestryDiagnostic?.topology.status, 'valid');
+  assert.equal(preview.ancestryDiagnostic?.topology.rootCount, 1);
+  assert.equal(preview.ancestryDiagnostic?.topology.structuralHeadCount, 2);
+  assert.equal(preview.ancestryDiagnostic?.topology.weakComponentCount, 1);
+  assert.equal(presenceFixture.drive.writes.length, 0);
+});
+
+test('a protocol-2 layout activation checkpoint resumes before protocol-3 cutover', async () => {
+  const fixture = await protocol2RootFixture(
+    'doc-layout-protocol-resume',
+    'Layout protocol resume',
+  );
+  const protocol2ManifestFile = fixture.drive.byRole('paper-manifest-generation')[0];
+  const protocol2ManifestText = await fixture.drive.peekText(protocol2ManifestFile.id);
+  const presenceFile = fixture.drive.byRole(PAPER_PRESENCE_ROLE)[0];
+  const presence = JSON.parse(await fixture.drive.peekText(presenceFile.id)) as {
+    paperFolderId: string;
+    state: 'present' | 'removed';
+    generation: { id: string };
+  };
+  const rootProperties = { ...fixture.drive.file('root').appProperties! };
+  rootProperties.layoutVersion = String(LEGACY_PAPER_PACKAGE_LAYOUT_VERSION);
+  delete rootProperties.presenceProtocolVersion;
+  delete rootProperties.controlFolderId;
+  delete rootProperties.migrationCompletionId;
+  delete rootProperties.protocolMigrationCompletionId;
+  fixture.drive.rewrite('root', { appProperties: rootProperties });
+
+  const preparation = await fixture.repository.prepareV3Migration([], signal);
+  assert.equal(fixture.drive.byRole('paper-v3-layout-descriptor').length, 1);
+  const seed: PaperV3MigrationSeed = {
+    documentId: 'doc-layout-protocol-resume',
+    generationId: presence.generation.id,
+    paperFolderId: presence.paperFolderId,
+    state: presence.state,
+    packageHeadIds: [fixture.first.manifest.generation.id],
+  };
+  await fixture.repository.activateV3Migration(
+    preparation.controlFolderId,
+    [seed],
+    { deviceId: 'device-a' },
+    signal,
+  );
+  assert.equal(
+    fixture.drive.file('root').appProperties?.paperProtocolVersion,
+    String(PAPER_SYNC_PROTOCOL_VERSION),
+  );
+  assert.equal(fixture.drive.byRole('paper-protocol-migration-completion').length, 1);
+  assert.equal(
+    await fixture.drive.peekText(protocol2ManifestFile.id),
+    protocol2ManifestText,
+  );
+
+  const rootActivated = await protocol2RootFixture(
+    'doc-layout-root-activated',
+    'Layout root activated',
+  );
+  const activatedRootProperties = {
+    ...rootActivated.drive.file('root').appProperties!,
+  };
+  activatedRootProperties.layoutVersion = String(LEGACY_PAPER_PACKAGE_LAYOUT_VERSION);
+  delete activatedRootProperties.presenceProtocolVersion;
+  delete activatedRootProperties.controlFolderId;
+  delete activatedRootProperties.migrationCompletionId;
+  delete activatedRootProperties.protocolMigrationCompletionId;
+  rootActivated.drive.rewrite('root', {
+    appProperties: activatedRootProperties,
+  });
+  const activatedPreparation = await rootActivated.repository.prepareV3Migration(
+    [],
+    signal,
+  );
+  const activatedPresenceFile = rootActivated.drive.byRole(PAPER_PRESENCE_ROLE)[0];
+  const activatedPresence = JSON.parse(
+    await rootActivated.drive.peekText(activatedPresenceFile.id),
+  ) as {
+    paperFolderId: string;
+    state: 'present' | 'removed';
+    generation: { id: string };
+  };
+  const activatedSeeds: PaperV3MigrationSeed[] = [
+    {
+      documentId: 'doc-layout-root-activated',
+      generationId: activatedPresence.generation.id,
+      paperFolderId: activatedPresence.paperFolderId,
+      state: activatedPresence.state,
+      packageHeadIds: [rootActivated.first.manifest.generation.id],
+    },
+  ];
+  rootActivated.drive.failNextUploadForRole(
+    'paper-protocol-migration-completion',
+    new Error('Injected protocol evidence interruption.'),
+  );
+  await assert.rejects(() =>
+    rootActivated.repository.activateV3Migration(
+      activatedPreparation.controlFolderId,
+      activatedSeeds,
+      { deviceId: 'device-a' },
+      signal,
+    ),
+  );
+  assert.equal(rootActivated.drive.file('root').appProperties?.layoutVersion, '3');
+  assert.equal(
+    rootActivated.drive.file('root').appProperties?.paperProtocolVersion,
+    String(LEGACY_PAPER_SYNC_PROTOCOL_VERSION),
+  );
+  await rootActivated.repository.activateV3Migration(
+    activatedPreparation.controlFolderId,
+    activatedSeeds,
+    { deviceId: 'device-a' },
+    signal,
+  );
+  assert.equal(
+    rootActivated.drive.file('root').appProperties?.paperProtocolVersion,
+    String(PAPER_SYNC_PROTOCOL_VERSION),
   );
 });
 
@@ -1784,10 +2472,69 @@ test('paper discovery is metadata-only, paginated, selective, and isolated', asy
       }
       assert.ok(
         [...manifestReadsByWave.values()].every(
-          (count) => count <= PAPER_MEDIA_CONCURRENCY,
+          (count) => count <= PAPER_MANIFEST_READ_CONCURRENCY,
         ),
       );
       assertLatencyWaveCeiling(measured, 14);
+    },
+  );
+
+  await context.test(
+    'cold 24-paper baseline verifies a large manifest history in a dedicated bounded read lane',
+    async () => {
+      const drive = new MemoryDrive();
+      const publishingRepository = await initializedRepository(drive);
+      const paperCount = 24;
+      const manifestsPerPaper = 37;
+      const states: PaperSyncState[] = [];
+      for (let paperIndex = 0; paperIndex < paperCount; paperIndex += 1) {
+        const documentId = `cold-baseline-${paperIndex + 1}`;
+        const state = paperState(documentId);
+        const first = await publishingRepository.publishPaper(
+          await localPackage(documentId, `Cold baseline ${paperIndex + 1}`),
+          state,
+          signal,
+        );
+        states.push(state);
+        const siblings = await Promise.all(
+          Array.from({ length: manifestsPerPaper - 1 }, (_, generationIndex) =>
+            siblingManifest(
+              first.manifest,
+              `Cold baseline ${paperIndex + 1} branch ${generationIndex + 1}`,
+              first.manifest.generation.createdAt + generationIndex + 1,
+            ),
+          ),
+        );
+        for (const sibling of siblings) drive.injectManifest(sibling);
+      }
+
+      const coldRepository = new PaperDriveRepository(drive, 'root');
+      drive.resetRequestLog();
+      const scheduler = new VirtualDriveLatencyScheduler(150);
+      drive.useVirtualLatency(scheduler);
+      const measured = await scheduler.run(() =>
+        coldRepository.discover(states, signal),
+      );
+
+      assert.equal(measured.result.length, paperCount);
+      const manifestRecords = scheduler.records.filter(
+        ({ label }) => label === 'paper-manifest-generation',
+      );
+      assert.equal(manifestRecords.length, paperCount * manifestsPerPaper);
+      const readsByWave = new Map<number, number>();
+      for (const record of manifestRecords) {
+        readsByWave.set(record.wave, (readsByWave.get(record.wave) ?? 0) + 1);
+      }
+      const maximumParallelReads = Math.max(...readsByWave.values());
+      assert.ok(maximumParallelReads <= PAPER_MANIFEST_READ_CONCURRENCY);
+      assert.ok(
+        maximumParallelReads > PAPER_MEDIA_CONCURRENCY,
+        'manifest verification must not be serialized behind the heavier media lane',
+      );
+      assert.ok(
+        readsByWave.size <=
+          paperCount * Math.ceil(manifestsPerPaper / PAPER_MANIFEST_READ_CONCURRENCY),
+      );
     },
   );
 
@@ -2053,6 +2800,7 @@ test('per-paper publication remains immutable, selective, and race-safe', async 
 
   await context.test('bounded transfer and metadata limits are conservative', () => {
     assert.equal(PAPER_METADATA_CONCURRENCY, 4);
+    assert.equal(PAPER_MANIFEST_READ_CONCURRENCY, 12);
     assert.equal(PAPER_MEDIA_CONCURRENCY, 4);
     assert.equal(PAPER_TRANSFER_CONCURRENCY, 2);
   });
@@ -2068,6 +2816,63 @@ test('per-paper publication remains immutable, selective, and race-safe', async 
     });
     assert.equal(maximum, 2);
   });
+
+  await context.test(
+    'bounded mapper preserves the first failure when another worker rejects later',
+    async () => {
+      const firstFailure = new Error('first failure');
+      const lateFailure = new Error('late failure');
+      let releaseLate!: () => void;
+      const lateGate = new Promise<void>((resolve) => {
+        releaseLate = resolve;
+      });
+      const operation = mapWithConcurrency([0, 1], 2, async (value) => {
+        if (value === 0) {
+          await Promise.resolve();
+          throw firstFailure;
+        }
+        await lateGate;
+        throw lateFailure;
+      });
+      await Promise.resolve();
+      await Promise.resolve();
+      releaseLate();
+      await assert.rejects(operation, (error: unknown) => error === firstFailure);
+    },
+  );
+
+  await context.test(
+    'a custom abort reason cannot be wrapped as a presence-integrity failure',
+    async () => {
+      const repository = new PaperDriveRepository({} as DriveClient, 'synthetic-root');
+      const controller = new AbortController();
+      const timeoutReason = new Error('synthetic read timeout');
+      Reflect.set(repository, 'requireActiveV3Root', async () => ({
+        id: 'synthetic-root',
+        appProperties: { controlFolderId: 'synthetic-control' },
+      }));
+      Reflect.set(repository, 'presence', {
+        async resolveAll() {
+          controller.abort(timeoutReason);
+          throw new Error('late presence parser failure');
+        },
+      });
+      const discoverPresenceAware = Reflect.get(
+        repository,
+        'discoverPresenceAware',
+      ) as (
+        states: readonly PaperSyncState[],
+        signal: AbortSignal,
+        requestedDocumentIds: readonly string[] | undefined,
+        options: object,
+      ) => Promise<unknown>;
+
+      await assert.rejects(
+        discoverPresenceAware.call(repository, [], controller.signal, undefined, {}),
+        (error: unknown) => error === timeoutReason,
+      );
+    },
+  );
 
   await context.test(
     'current-package media verification shares one repository-wide cap',
@@ -2156,6 +2961,70 @@ test('per-paper publication remains immutable, selective, and race-safe', async 
 });
 
 test('Keep local performs an explicit immutable graph reconciliation', async (context) => {
+  await context.test(
+    'preserves the verified remote Link-number maximum while local editable state wins',
+    async () => {
+      const fixture = await publishedFixture('doc-link-high-water', 'Links');
+      incorporate(fixture.state, fixture.first);
+      fixture.state.cloudPresence = 'present';
+
+      const remoteState = structuredClone(fixture.state);
+      const remotePackage = await localPackage(
+        'doc-link-high-water',
+        'Links',
+        'remote-marker',
+      );
+      remotePackage.writer = { deviceId: 'device-b' };
+      remotePackage.snapshot.generatedBy = 'device-b';
+      remotePackage.snapshot.entities = await currentLinkNumberEntities(
+        'doc-link-high-water',
+        'remote-marker',
+        20,
+        20,
+      );
+      const remote = await fixture.repository.publishPaper(
+        remotePackage,
+        remoteState,
+        signal,
+      );
+
+      const local = await localPackage('doc-link-high-water', 'Links', 'local-marker');
+      local.sourcePdfHashVerified = true;
+      local.snapshot.entities = await currentLinkNumberEntities(
+        'doc-link-high-water',
+        'local-marker',
+        3,
+        30,
+      );
+      fixture.state.status = 'both-changed';
+      fixture.state.dirtyReasons = ['metadata'];
+
+      const result = await fixture.repository.reconcileKeepLocalPaper(
+        local,
+        fixture.state,
+        signal,
+      );
+      assert.ok(
+        result.manifest.generation.parents.includes(remote.manifest.generation.id),
+      );
+      assert.equal(
+        (
+          result.snapshot.entities.find((record) => record.kind === 'document')
+            ?.value as { marker?: string }
+        ).marker,
+        'local-marker',
+      );
+      assert.equal(
+        (
+          result.snapshot.entities.find(
+            (record) => record.kind === 'link-number-high-water',
+          )?.value as { nextLinkNumber?: number }
+        ).nextLinkNumber,
+        20,
+      );
+    },
+  );
+
   await context.test(
     'current local editable state wins and acknowledges every current remote head',
     async () => {
@@ -2907,6 +3776,8 @@ test('Paper-v3 removal and restore preserve presence authority', async (context)
 
       assert.equal(discovered.status, 'needs-attention');
       assert.equal(discovered.issue?.code, 'paper-presence-invalid');
+      assert.equal(discovered.issue?.phase, 'paper-presence-folder-resolution');
+      assert.equal(discovered.issue?.causeCode, 'presence-folder-missing');
     },
   );
 
@@ -3489,6 +4360,393 @@ test('Paper-v3 removal and restore preserve presence authority', async (context)
       }
       assert.equal(
         fixture.drive.events.some((event) => event.startsWith('trash:')),
+        false,
+      );
+    },
+  );
+});
+
+test('Targeted Purge is scoped, confirmation-bound, and retryable', async (context) => {
+  await context.test(
+    'read-only preview accepts only a corrupt sibling beside verified ancestry',
+    async () => {
+      const fixture = await publishedFixture('purge-preview', 'Purge preview');
+      const corrupt = await seedCorruptPresence(
+        fixture.drive,
+        'purge-preview',
+        'preview',
+      );
+      fixture.drive.resetRequestLog();
+      const eventCount = fixture.drive.events.length;
+
+      const preview = await fixture.repository.inspectTargetedPaperPurge(
+        'purge-preview',
+        signal,
+      );
+
+      assert.equal(preview.eligible, true);
+      assert.ok(preview.proof);
+      assert.equal(preview.documentId, 'purge-preview');
+      assert.equal(preview.validPresenceCount, 1);
+      assert.equal(preview.corruptPresenceCount, 1);
+      assert.equal(preview.preservedPresenceCount, 1);
+      assert.equal(preview.presenceState, 'present');
+      assert.equal(preview.paperFolderCount, 2);
+      assert.ok(preview.paperFileCount > 0);
+      assert.deepEqual(preview.proof.presence.corruptPresenceFileIds, [corrupt.id]);
+      assert.equal(fixture.drive.writes.length, 0);
+      assert.equal(fixture.drive.events.length, eventCount);
+      assert.equal(fixture.drive.file(corrupt.id).trashed, false);
+      assert.equal(
+        fixture.drive.file(fixture.first.cloud.paperFolderId).trashed,
+        false,
+      );
+    },
+  );
+
+  await context.test(
+    'no valid presence ancestry blocks with zero Drive writes',
+    async () => {
+      const fixture = await publishedFixture('purge-no-ancestry', 'No ancestry');
+      const onlyPresence = fixture.drive.byRole(PAPER_PRESENCE_ROLE)[0];
+      assert.ok(onlyPresence);
+      fixture.drive.replaceBlob(
+        onlyPresence.id,
+        new Blob(['{"malformed":'], { type: 'application/json' }),
+      );
+      fixture.drive.resetRequestLog();
+      const eventCount = fixture.drive.events.length;
+
+      const preview = await fixture.repository.inspectTargetedPaperPurge(
+        'purge-no-ancestry',
+        signal,
+      );
+
+      assert.equal(preview.eligible, false);
+      assert.equal(preview.blocker?.code, 'presence-no-valid-ancestry');
+      assert.equal(preview.validPresenceCount, 0);
+      assert.equal(preview.corruptPresenceCount, 1);
+      assert.equal(preview.proof, undefined);
+      assert.equal(fixture.drive.writes.length, 0);
+      assert.equal(fixture.drive.events.length, eventCount);
+      assert.equal(fixture.drive.file(onlyPresence.id).trashed, false);
+      assert.equal(
+        fixture.drive.file(fixture.first.cloud.paperFolderId).trashed,
+        false,
+      );
+    },
+  );
+
+  await context.test(
+    'two valid records with a missing parent expose redacted topology and remain read-only',
+    async () => {
+      const fixture = await publishedFixture(
+        'purge-broken-ancestry',
+        'Broken ancestry',
+      );
+      const orphan = await seedValidOrphanPresence(
+        fixture.drive,
+        'purge-broken-ancestry',
+      );
+      fixture.drive.resetRequestLog();
+      const eventCount = fixture.drive.events.length;
+
+      const preview = await fixture.repository.inspectTargetedPaperPurge(
+        'purge-broken-ancestry',
+        signal,
+      );
+
+      assert.equal(preview.eligible, false);
+      assert.equal(preview.blocker?.code, 'presence-validation-failed');
+      assert.equal(preview.validPresenceCount, 2);
+      assert.equal(preview.corruptPresenceCount, 0);
+      assert.equal(preview.presenceHeadCount, 0);
+      assert.equal(preview.presenceState, undefined);
+      assert.equal(preview.paperFolderCount, 0);
+      assert.equal(preview.paperFileCount, 0);
+      assert.equal(preview.proof, undefined);
+      assert.equal(preview.ancestryDiagnostic?.mode, 'read-only');
+      assert.equal(preview.ancestryDiagnostic?.validationStage, 'ancestry');
+      assert.equal(preview.ancestryDiagnostic?.failureCode, 'presence-missing-parent');
+      assert.equal(preview.ancestryDiagnostic?.topology.status, 'invalid');
+      assert.equal(preview.ancestryDiagnostic?.topology.recordCount, 2);
+      assert.equal(preview.ancestryDiagnostic?.topology.uniqueGenerationCount, 2);
+      assert.equal(preview.ancestryDiagnostic?.topology.rootCount, 1);
+      assert.equal(preview.ancestryDiagnostic?.topology.structuralHeadCount, 2);
+      assert.equal(preview.ancestryDiagnostic?.topology.weakComponentCount, 2);
+      assert.equal(preview.ancestryDiagnostic?.topology.missingParentReferenceCount, 1);
+      const redacted = stableStringify(preview.ancestryDiagnostic);
+      assert.equal(redacted.includes(orphan.record.generation.id), false);
+      assert.equal(redacted.includes('0'.repeat(64)), false);
+      assert.equal(redacted.includes('purge-broken-ancestry'), false);
+      assert.equal(fixture.drive.writes.length, 0);
+      assert.equal(fixture.drive.events.length, eventCount);
+      assert.equal(fixture.drive.file(orphan.file.id).trashed, false);
+      assert.equal(
+        fixture.drive.file(fixture.first.cloud.paperFolderId).trashed,
+        false,
+      );
+    },
+  );
+
+  await context.test(
+    'ordinary discovery quarantines one exact broken graph before resolution and still verifies its records',
+    async () => {
+      const fixture = await publishedFixture(
+        'quarantined-broken-paper',
+        'Broken paper',
+      );
+      const healthyState = paperState('healthy-unrelated-paper');
+      await fixture.repository.publishPaper(
+        await localPackage('healthy-unrelated-paper', 'Healthy paper'),
+        healthyState,
+        signal,
+      );
+      const orphan = await seedValidOrphanPresence(
+        fixture.drive,
+        'quarantined-broken-paper',
+      );
+      fixture.drive.resetRequestLog();
+
+      const discovered = await fixture.repository.discover(
+        [fixture.state, healthyState],
+        signal,
+        { ignoredDocumentIds: ['quarantined-broken-paper'] },
+      );
+
+      assert.deepEqual(
+        discovered.map(({ documentId }) => documentId),
+        ['healthy-unrelated-paper'],
+      );
+      assert.ok(
+        fixture.drive.textReads.includes(orphan.file.id),
+        'ignored records must still be downloaded and immutably verified',
+      );
+      assert.equal(fixture.drive.writes.length, 0);
+      assert.equal(fixture.drive.file(orphan.file.id).trashed, false);
+      await assert.rejects(
+        () => fixture.repository.discover([fixture.state, healthyState], signal),
+        hasRepositoryCode('paper-presence-invalid'),
+      );
+
+      await seedCorruptPresence(
+        fixture.drive,
+        'different-malformed-paper',
+        'must-not-be-suppressed',
+      );
+      await assert.rejects(
+        () =>
+          fixture.repository.discover([fixture.state, healthyState], signal, {
+            ignoredDocumentIds: ['quarantined-broken-paper'],
+          }),
+        hasRepositoryCode('paper-presence-invalid'),
+      );
+    },
+  );
+
+  await context.test(
+    'removed tombstone precedes corrupt cleanup and exact-folder Trash without touching another paper',
+    async () => {
+      const fixture = await publishedFixture('purge-selected', 'Selected paper');
+      const unrelatedState = paperState('purge-unrelated');
+      const unrelated = await fixture.repository.publishPaper(
+        await localPackage('purge-unrelated', 'Unrelated paper'),
+        unrelatedState,
+        signal,
+      );
+      const unrelatedPresenceIds = fixture.drive
+        .byRole(PAPER_PRESENCE_ROLE)
+        .filter(({ appProperties }) => appProperties?.documentId === 'purge-unrelated')
+        .map(({ id }) => id);
+      const corrupt = await seedCorruptPresence(
+        fixture.drive,
+        'purge-selected',
+        'ordered-cleanup',
+      );
+      const preview = await fixture.repository.inspectTargetedPaperPurge(
+        'purge-selected',
+        signal,
+      );
+      assert.ok(preview.eligible && preview.proof);
+      const eventStart = fixture.drive.events.length;
+
+      const result = await fixture.repository.executeTargetedPaperPurge(
+        preview.proof,
+        { deviceId: 'device-purger' },
+        signal,
+      );
+
+      assert.equal(result.cleanupPending, false);
+      assert.equal(result.corruptPresenceFilesTrashed, 1);
+      assert.equal(result.folderState, 'trashed');
+      assert.equal(result.cloud.presenceState, 'removed');
+      const events = fixture.drive.events.slice(eventStart);
+      const tombstoneIndex = events.indexOf('upload:paper-presence-generation:removed');
+      const corruptTrashIndex = events.indexOf(`trash-targeted-presence:${corrupt.id}`);
+      const folderTrashIndex = events.indexOf(
+        `trash:${fixture.first.cloud.paperFolderId}`,
+      );
+      assert.ok(tombstoneIndex >= 0);
+      assert.ok(corruptTrashIndex > tombstoneIndex);
+      assert.ok(folderTrashIndex > corruptTrashIndex);
+      assert.equal(fixture.drive.file(corrupt.id).trashed, true);
+      assert.equal(fixture.drive.file(fixture.first.cloud.paperFolderId).trashed, true);
+      assert.equal(fixture.drive.file(unrelated.cloud.paperFolderId).trashed, false);
+      assert.equal(
+        unrelatedPresenceIds.every((id) => fixture.drive.file(id).trashed === false),
+        true,
+      );
+      assert.equal(fixture.drive.file('root').trashed, false);
+      assert.equal(
+        fixture.drive.byRole('paper-v3-control').every(({ trashed }) => !trashed),
+        true,
+      );
+
+      const discovered = await fixture.repository.discover(
+        [fixture.state, unrelatedState],
+        signal,
+      );
+      assert.equal(
+        discovered.find(({ documentId }) => documentId === 'purge-selected')
+          ?.presenceState,
+        'removed',
+      );
+      assert.equal(
+        discovered.find(({ documentId }) => documentId === 'purge-unrelated')
+          ?.presenceState,
+        'present',
+      );
+    },
+  );
+
+  await context.test(
+    'interrupted corrupt cleanup retains the tombstone and a fresh proof safely retries',
+    async () => {
+      const fixture = await publishedFixture('purge-retry', 'Retry purge');
+      const corrupt = await seedCorruptPresence(fixture.drive, 'purge-retry', 'retry');
+      const preview = await fixture.repository.inspectTargetedPaperPurge(
+        'purge-retry',
+        signal,
+      );
+      assert.ok(preview.eligible && preview.proof);
+      fixture.drive.failNextTargetedPresenceTrash(
+        new Error('Injected targeted presence Trash failure.'),
+      );
+
+      const interrupted = await fixture.repository.executeTargetedPaperPurge(
+        preview.proof,
+        { deviceId: 'device-purger' },
+        signal,
+      );
+
+      assert.equal(interrupted.cleanupPending, true);
+      assert.equal(interrupted.corruptPresenceFilesTrashed, 0);
+      assert.equal(interrupted.cloud.presenceState, 'removed');
+      assert.equal(fixture.drive.file(corrupt.id).trashed, false);
+      assert.equal(
+        fixture.drive.file(fixture.first.cloud.paperFolderId).trashed,
+        false,
+      );
+      const presenceUploads = fixture.drive.uploadsByRole(PAPER_PRESENCE_ROLE);
+
+      const retryPreview = await fixture.repository.inspectTargetedPaperPurge(
+        'purge-retry',
+        signal,
+      );
+      assert.ok(retryPreview.eligible && retryPreview.proof);
+      assert.equal(retryPreview.presenceState, 'removed');
+      const completed = await fixture.repository.executeTargetedPaperPurge(
+        retryPreview.proof,
+        { deviceId: 'device-purger' },
+        signal,
+      );
+
+      assert.equal(completed.cleanupPending, false);
+      assert.equal(completed.corruptPresenceFilesTrashed, 1);
+      assert.equal(completed.folderState, 'trashed');
+      assert.equal(fixture.drive.uploadsByRole(PAPER_PRESENCE_ROLE), presenceUploads);
+      assert.equal(fixture.drive.file(corrupt.id).trashed, true);
+      assert.equal(fixture.drive.file(fixture.first.cloud.paperFolderId).trashed, true);
+    },
+  );
+
+  await context.test(
+    'repeating a completed purge is a read-only idempotent cloud operation',
+    async () => {
+      const fixture = await publishedFixture('purge-repeat', 'Repeat purge');
+      await seedCorruptPresence(fixture.drive, 'purge-repeat', 'repeat');
+      const preview = await fixture.repository.inspectTargetedPaperPurge(
+        'purge-repeat',
+        signal,
+      );
+      assert.ok(preview.eligible && preview.proof);
+      const completed = await fixture.repository.executeTargetedPaperPurge(
+        preview.proof,
+        { deviceId: 'device-purger' },
+        signal,
+      );
+      assert.equal(completed.cleanupPending, false);
+      const presenceUploads = fixture.drive.uploadsByRole(PAPER_PRESENCE_ROLE);
+
+      const repeatedPreview = await fixture.repository.inspectTargetedPaperPurge(
+        'purge-repeat',
+        signal,
+      );
+      assert.ok(repeatedPreview.eligible && repeatedPreview.proof);
+      assert.equal(repeatedPreview.presenceState, 'removed');
+      fixture.drive.resetRequestLog();
+      const repeated = await fixture.repository.executeTargetedPaperPurge(
+        repeatedPreview.proof,
+        { deviceId: 'device-purger' },
+        signal,
+      );
+
+      assert.equal(repeated.cleanupPending, false);
+      assert.equal(repeated.folderState, 'trashed');
+      assert.equal(repeated.corruptPresenceFilesTrashed, 0);
+      assert.equal(fixture.drive.uploadsByRole(PAPER_PRESENCE_ROLE), presenceUploads);
+      assert.equal(fixture.drive.writes.length, 0);
+    },
+  );
+
+  await context.test(
+    'a changed frozen proof fails closed before tombstone or Trash',
+    async () => {
+      const fixture = await publishedFixture('purge-toctou', 'TOCTOU purge');
+      const corrupt = await seedCorruptPresence(
+        fixture.drive,
+        'purge-toctou',
+        'toctou',
+      );
+      const preview = await fixture.repository.inspectTargetedPaperPurge(
+        'purge-toctou',
+        signal,
+      );
+      assert.ok(preview.eligible && preview.proof);
+      const presenceUploads = fixture.drive.uploadsByRole(PAPER_PRESENCE_ROLE);
+      const eventCount = fixture.drive.events.length;
+      fixture.drive.replaceBlob(
+        corrupt.id,
+        new Blob(['{"changed-after-preview":'], { type: 'application/json' }),
+      );
+      fixture.drive.resetRequestLog();
+
+      await assert.rejects(
+        () =>
+          fixture.repository.executeTargetedPaperPurge(
+            preview.proof!,
+            { deviceId: 'device-purger' },
+            signal,
+          ),
+        /scope changed after confirmation/iu,
+      );
+
+      assert.equal(fixture.drive.uploadsByRole(PAPER_PRESENCE_ROLE), presenceUploads);
+      assert.equal(fixture.drive.writes.length, 0);
+      assert.equal(fixture.drive.events.length, eventCount);
+      assert.equal(fixture.drive.file(corrupt.id).trashed, false);
+      assert.equal(
+        fixture.drive.file(fixture.first.cloud.paperFolderId).trashed,
         false,
       );
     },
@@ -4304,6 +5562,7 @@ class MemoryDrive extends DriveClient {
   private blobFailure?: { role: string; error: unknown };
   private textFailure?: { role: string; error: unknown };
   private paperTrashFailure: unknown;
+  private targetedPresenceTrashFailure: unknown;
   private uploadFailure?: { role: string; error: unknown };
   private uploadSha256OmissionRole?: string;
   private uploadOwnershipOmissionRole?: string;
@@ -4360,6 +5619,30 @@ class MemoryDrive extends DriveClient {
     return (await this.downloadBlobWithoutCount(id)).text();
   }
 
+  async peekBlob(id: string): Promise<Blob> {
+    const blob = await this.downloadBlobWithoutCount(id);
+    return blob.slice(0, blob.size, blob.type);
+  }
+
+  rewrite(
+    id: string,
+    metadata: Partial<DriveFileMetadata>,
+    blob?: Blob,
+  ): DriveFileMetadata {
+    const previous = this.file(id);
+    const previousBlob = this.blobs.get(id);
+    if (!previousBlob) throw new Error(`Missing memory blob ${id}`);
+    return this.seed(
+      {
+        ...previous,
+        ...metadata,
+        ...(metadata.appProperties ? { appProperties: metadata.appProperties } : {}),
+        id,
+      },
+      blob ?? previousBlob,
+    );
+  }
+
   replaceBlob(id: string, blob: Blob): void {
     const revision = ++this.revisionSequence;
     const previous = this.file(id);
@@ -4390,12 +5673,14 @@ class MemoryDrive extends DriveClient {
     this.seed(
       {
         id: `injected-${manifest.generation.id.slice(0, 12)}`,
-        name: `paper-manifest-v${PAPER_SYNC_PROTOCOL_VERSION}-${manifest.generation.id}.json`,
+        name: `paper-manifest-v${manifest.paperSyncProtocolVersion}-${manifest.generation.id}.json`,
         mimeType: 'application/json',
         parents: [manifest.dataFolderId],
         appProperties: {
           ...paperProperties('paper-manifest-generation', manifest.documentId),
-          manifestStorage: PAPER_MANIFEST_STORAGE,
+          layoutVersion: String(manifest.syncLayoutVersion),
+          paperProtocolVersion: String(manifest.paperSyncProtocolVersion),
+          manifestStorage: manifest.manifestStorage,
           generationId: manifest.generation.id,
         },
       },
@@ -4406,6 +5691,9 @@ class MemoryDrive extends DriveClient {
     return [...this.files.values()].filter(
       (file) => !file.trashed && file.appProperties?.role === role,
     );
+  }
+  allByRole(role: string): DriveFileMetadata[] {
+    return [...this.files.values()].filter((file) => file.appProperties?.role === role);
   }
   uploadsByRole(role: string): number {
     return this.uploads.filter((file) => file.appProperties?.role === role).length;
@@ -4444,6 +5732,10 @@ class MemoryDrive extends DriveClient {
 
   failNextPaperTrash(error: unknown): void {
     this.paperTrashFailure = error;
+  }
+
+  failNextTargetedPresenceTrash(error: unknown): void {
+    this.targetedPresenceTrashFailure = error;
   }
 
   failNextUploadForRole(role: string, error: unknown): void {
@@ -4602,8 +5894,52 @@ class MemoryDrive extends DriveClient {
       throw error;
     }
     const updated = await this.updateMetadata(fileId, { trashed: true });
+    this.files.set(fileId, { ...this.file(fileId), explicitlyTrashed: true });
     this.events.push(`trash:${fileId}`);
-    return structuredClone(updated);
+    return structuredClone({ ...updated, explicitlyTrashed: true });
+  }
+
+  override async trashManagedTargetedPurgePresence(
+    fileId: string,
+  ): Promise<DriveFileMetadata> {
+    if (this.targetedPresenceTrashFailure !== undefined) {
+      const error = this.targetedPresenceTrashFailure;
+      this.targetedPresenceTrashFailure = undefined;
+      throw error;
+    }
+    const updated = await this.updateMetadata(fileId, { trashed: true });
+    this.files.set(fileId, { ...this.file(fileId), explicitlyTrashed: true });
+    this.events.push(`trash-targeted-presence:${fileId}`);
+    return structuredClone({ ...updated, explicitlyTrashed: true });
+  }
+
+  simulateInheritedTrash(folderId: string): void {
+    const pending = [folderId];
+    const visited = new Set<string>();
+    while (pending.length > 0) {
+      const parentId = pending.pop()!;
+      if (visited.has(parentId)) continue;
+      visited.add(parentId);
+      for (const file of this.files.values()) {
+        if (!file.parents?.includes(parentId)) continue;
+        this.files.set(file.id, {
+          ...file,
+          trashed: true,
+          explicitlyTrashed: false,
+        });
+        if (file.mimeType === 'application/vnd.google-apps.folder') {
+          pending.push(file.id);
+        }
+      }
+    }
+  }
+
+  markExplicitlyTrashed(fileId: string): void {
+    this.files.set(fileId, {
+      ...this.file(fileId),
+      trashed: true,
+      explicitlyTrashed: true,
+    });
   }
 
   override async restoreManagedPaperFolder(
@@ -4612,6 +5948,7 @@ class MemoryDrive extends DriveClient {
   ): Promise<DriveFileMetadata> {
     const updated = await this.updateMetadata(fileId, {
       trashed: false,
+      explicitlyTrashed: false,
       parents: [rootFolderId],
     });
     this.events.push(`untrash:${fileId}`);
@@ -4741,6 +6078,160 @@ async function publishedFixture(documentId: string, displayName: string) {
     signal,
   );
   return { drive, repository, state, first };
+}
+
+async function protocol2RootFixture(documentId: string, displayName: string) {
+  const fixture = await publishedFixture(documentId, displayName);
+  const { drive } = fixture;
+
+  const conflictFile = drive.byRole('paper-conflicts')[0];
+  const conflictValue = JSON.parse(await drive.peekText(conflictFile.id)) as Record<
+    string,
+    unknown
+  >;
+  const protocol2Conflict = {
+    ...conflictValue,
+    paperSyncProtocolVersion: LEGACY_PAPER_SYNC_PROTOCOL_VERSION,
+  };
+  const conflictText = stableStringify(protocol2Conflict);
+  const conflictHash = await sha256Hex(conflictText);
+  drive.rewrite(
+    conflictFile.id,
+    {
+      appProperties: {
+        ...conflictFile.appProperties!,
+        paperProtocolVersion: String(LEGACY_PAPER_SYNC_PROTOCOL_VERSION),
+        sha256: conflictHash,
+      },
+    },
+    new Blob([conflictText], { type: 'application/json' }),
+  );
+
+  const manifestFile = drive.byRole('paper-manifest-generation')[0];
+  const currentManifest = JSON.parse(
+    await drive.peekText(manifestFile.id),
+  ) as PaperCloudManifest;
+  const { generation, ...currentBase } = currentManifest;
+  const protocol2Manifest = await createPaperManifestGeneration(
+    {
+      ...currentBase,
+      paperSyncProtocolVersion: LEGACY_PAPER_SYNC_PROTOCOL_VERSION,
+      conflictJournal: {
+        ...currentBase.conflictJournal,
+        sha256: conflictHash,
+      },
+    },
+    {
+      createdAt: generation.createdAt,
+      createdBy: generation.createdBy,
+      parents: generation.parents,
+    },
+  );
+  const manifestText = stableStringify(protocol2Manifest);
+  drive.rewrite(
+    manifestFile.id,
+    {
+      name: `paper-manifest-v${LEGACY_PAPER_SYNC_PROTOCOL_VERSION}-${protocol2Manifest.generation.id}.json`,
+      appProperties: {
+        ...manifestFile.appProperties!,
+        paperProtocolVersion: String(LEGACY_PAPER_SYNC_PROTOCOL_VERSION),
+        generationId: protocol2Manifest.generation.id,
+      },
+    },
+    new Blob([manifestText], { type: 'application/json' }),
+  );
+
+  for (const role of [
+    'paper-folder',
+    'paper-data',
+    'paper-state',
+    'paper-productivity',
+    'paper-source-pdf',
+    'paper-source-document',
+    'paper-rendered-print-pdf',
+    'paper-presence-generation',
+  ]) {
+    for (const file of drive.byRole(role)) {
+      drive.rewrite(file.id, {
+        appProperties: {
+          ...file.appProperties!,
+          paperProtocolVersion: String(LEGACY_PAPER_SYNC_PROTOCOL_VERSION),
+        },
+      });
+    }
+  }
+
+  const descriptorFile = drive.byRole('paper-v3-layout-descriptor')[0];
+  const descriptor = JSON.parse(await drive.peekText(descriptorFile.id)) as Record<
+    string,
+    unknown
+  >;
+  const protocol2Descriptor = {
+    ...descriptor,
+    paperSyncProtocolVersion: LEGACY_PAPER_SYNC_PROTOCOL_VERSION,
+  };
+  const descriptorText = stableStringify(protocol2Descriptor);
+  const descriptorHash = await sha256Hex(descriptorText);
+  drive.rewrite(
+    descriptorFile.id,
+    {
+      name: `paper-v3-layout-${descriptorHash}.json`,
+      appProperties: {
+        ...descriptorFile.appProperties!,
+        sha256: descriptorHash,
+      },
+    },
+    new Blob([descriptorText], { type: 'application/json' }),
+  );
+
+  const layoutCompletionFile = drive.byRole('paper-v3-migration-completion')[0];
+  const currentCompletion = JSON.parse(
+    await drive.peekText(layoutCompletionFile.id),
+  ) as Record<string, unknown>;
+  const completionWithoutId = {
+    ...currentCompletion,
+    paperSyncProtocolVersion: LEGACY_PAPER_SYNC_PROTOCOL_VERSION,
+  };
+  delete completionWithoutId.id;
+  const completionId = await sha256Hex(stableStringify(completionWithoutId));
+  const protocol2Completion = { ...completionWithoutId, id: completionId };
+  const completionText = stableStringify(protocol2Completion);
+  drive.rewrite(
+    layoutCompletionFile.id,
+    {
+      name: `paper-v3-migration-${completionId}.json`,
+      appProperties: {
+        ...layoutCompletionFile.appProperties!,
+        completionId,
+      },
+    },
+    new Blob([completionText], { type: 'application/json' }),
+  );
+
+  const control = drive.byRole('paper-v3-control')[0];
+  drive.rewrite(control.id, {
+    appProperties: {
+      ...control.appProperties!,
+      paperProtocolVersion: String(LEGACY_PAPER_SYNC_PROTOCOL_VERSION),
+    },
+  });
+  const root = drive.file('root');
+  drive.rewrite('root', {
+    appProperties: {
+      ...root.appProperties!,
+      paperProtocolVersion: String(LEGACY_PAPER_SYNC_PROTOCOL_VERSION),
+      migrationCompletionId: completionId,
+    },
+  });
+  fixture.first = {
+    ...fixture.first,
+    manifest: protocol2Manifest,
+    cloud: {
+      ...fixture.first.cloud,
+      headIds: [protocol2Manifest.generation.id],
+    },
+  };
+  return fixture;
 }
 
 async function paperV2Fixture(
@@ -4925,6 +6416,43 @@ async function entity(
   };
 }
 
+async function currentLinkNumberEntities(
+  documentId: string,
+  marker: string,
+  nextLinkNumber: number,
+  updatedAt: number,
+): Promise<SyncEntityRecord[]> {
+  const highWater = createDocumentLinkNumberHighWater(documentId, nextLinkNumber);
+  assert.ok(highWater);
+  return Promise.all([
+    entity(
+      'document',
+      documentId,
+      undefined,
+      {
+        schemaVersion: DOCUMENT_LINK_PERSISTENCE_SCHEMA_VERSION,
+        documentType: 'pdf',
+        documentId,
+        documentName: 'Links.pdf',
+        originalFileName: 'Links.pdf',
+        displayTitle: 'Links',
+        nextNoteNumber: 1,
+        collectionIds: [],
+        isPinned: false,
+        marker,
+      },
+      updatedAt,
+    ),
+    entity(
+      'link-number-high-water',
+      DOCUMENT_LINK_HIGH_WATER_ENTITY_ID,
+      documentId,
+      highWater,
+      updatedAt,
+    ),
+  ]);
+}
+
 function snapshot(
   generatedBy: string,
   entities: SyncEntityRecord[],
@@ -5024,6 +6552,97 @@ async function siblingManifest(
       parents,
     },
   );
+}
+
+async function seedCorruptPresence(
+  drive: MemoryDrive,
+  documentId: string,
+  marker = 'corrupt',
+): Promise<DriveFileMetadata> {
+  const control = drive.byRole('paper-v3-control')[0];
+  assert.ok(control);
+  const generationId = await sha256Hex(
+    stableStringify({ documentId, marker, kind: 'corrupt-presence-fixture' }),
+  );
+  return drive.seed(
+    {
+      id: `corrupt-presence-${marker}`,
+      name: `paper-presence-${generationId}.json`,
+      mimeType: 'application/json',
+      ownedByMe: true,
+      parents: [control.id],
+      appProperties: {
+        application: '39Note',
+        role: PAPER_PRESENCE_ROLE,
+        rootFolderId: 'root',
+        controlFolderId: control.id,
+        documentId,
+        state: 'present',
+        generationId,
+        presenceProtocolVersion: String(PAPER_PRESENCE_PROTOCOL_VERSION),
+        paperProtocolVersion: String(PAPER_SYNC_PROTOCOL_VERSION),
+      },
+    },
+    new Blob(['{"malformed":'], { type: 'application/json' }),
+  );
+}
+
+async function seedValidOrphanPresence(
+  drive: MemoryDrive,
+  documentId: string,
+): Promise<{ file: DriveFileMetadata; record: PaperPresenceGeneration }> {
+  const control = drive.byRole('paper-v3-control')[0];
+  const existing = drive
+    .byRole(PAPER_PRESENCE_ROLE)
+    .find((file) => file.appProperties?.documentId === documentId);
+  assert.ok(control);
+  assert.ok(existing);
+  const existingRecord = JSON.parse(
+    await drive.peekText(existing.id),
+  ) as PaperPresenceGeneration;
+  const record = await createPaperPresenceGeneration(
+    {
+      app: existingRecord.app,
+      syncLayoutVersion: existingRecord.syncLayoutVersion,
+      presenceProtocolVersion: existingRecord.presenceProtocolVersion,
+      rootFolderId: existingRecord.rootFolderId,
+      controlFolderId: existingRecord.controlFolderId,
+      documentId: existingRecord.documentId,
+      displayName: existingRecord.displayName,
+      state: 'removed',
+      intent: 'remove',
+      paperFolderId: existingRecord.paperFolderId,
+      writer: { deviceId: 'device-orphan-fixture' },
+    },
+    {
+      createdAt: existingRecord.generation.createdAt + 1,
+      createdBy: 'device-orphan-fixture',
+      parents: ['0'.repeat(64)],
+    },
+  );
+  const text = stableStringify(record);
+  const file = drive.seed(
+    {
+      id: 'valid-orphan-presence',
+      name: `paper-presence-${record.generation.id}.json`,
+      mimeType: 'application/json',
+      ownedByMe: true,
+      parents: [control.id],
+      appProperties: {
+        application: '39Note',
+        role: PAPER_PRESENCE_ROLE,
+        rootFolderId: 'root',
+        controlFolderId: control.id,
+        documentId,
+        state: record.state,
+        generationId: record.generation.id,
+        presenceProtocolVersion: String(PAPER_PRESENCE_PROTOCOL_VERSION),
+        paperProtocolVersion: String(PAPER_SYNC_PROTOCOL_VERSION),
+      },
+    },
+    new Blob([text], { type: 'application/json' }),
+  );
+  return { file, record };
 }
 
 function paperProperties(role: string, documentId: string): Record<string, string> {

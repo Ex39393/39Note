@@ -32,6 +32,9 @@ import type {
 const OAUTH_STATE_TTL = 10 * 60_000;
 const AUTHORIZATION_GRANT_TTL = 3 * 60_000;
 const LAST_USED_WRITE_INTERVAL = 15 * 60_000;
+const OAUTH_START_RATE_WINDOW_MS = 10 * 60_000;
+const OAUTH_START_DEVICE_LIMIT = 10;
+const OAUTH_START_CLIENT_LIMIT = 30;
 export const TEMPORARY_SESSION_ABSOLUTE_TTL_MS = 12 * 60 * 60_000;
 const MAX_JSON_BYTES = 8_192;
 const AUTHENTICATED_API_ROUTES = new Set([
@@ -75,16 +78,39 @@ export function createApp(env: Env, dependencies: AppDependencies = {}) {
         const exchangeChallenge = requireChallenge(body.exchangeChallenge);
         const returnUrl = validateReturnUrl(body.returnUrl, corsOrigin);
         const sessionMode = requireSessionMode(body.sessionMode);
-        const limiterKey = `oauth-start:${await sha256Base64Url(`${corsOrigin}:${deviceId}`)}`;
-        if (!(await store.checkRateLimit(limiterKey, now(), 10 * 60_000, 10))) {
+        const timestamp = now();
+        const clientLimiterKey = `oauth-start-client:${await sha256Base64Url(
+          trustedEdgeClientAddress(request),
+        )}`;
+        if (
+          !(await store.checkRateLimit(
+            clientLimiterKey,
+            timestamp,
+            OAUTH_START_RATE_WINDOW_MS,
+            OAUTH_START_CLIENT_LIMIT,
+          ))
+        ) {
           throw new PublicError('rate_limited', 429);
         }
-        await store.deleteExpiredEphemera(now());
+        const deviceLimiterKey = `oauth-start-device:${await sha256Base64Url(
+          `${corsOrigin}:${deviceId}`,
+        )}`;
+        if (
+          !(await store.checkRateLimit(
+            deviceLimiterKey,
+            timestamp,
+            OAUTH_START_RATE_WINDOW_MS,
+            OAUTH_START_DEVICE_LIMIT,
+          ))
+        ) {
+          throw new PublicError('rate_limited', 429);
+        }
+        await store.deleteExpiredEphemera(timestamp);
         const state = randomToken();
         const stateHash = await sha256Base64Url(state);
         const googleCodeVerifier = randomToken(64);
         const googleCodeChallenge = await sha256Base64Url(googleCodeVerifier);
-        const createdAt = now();
+        const createdAt = timestamp;
         await store.createOAuthState({
           stateHash,
           googleCodeVerifier,
@@ -104,7 +130,7 @@ export function createApp(env: Env, dependencies: AppDependencies = {}) {
           response_type: 'code',
           scope: GOOGLE_DRIVE_SCOPE,
           access_type: 'offline',
-          include_granted_scopes: 'true',
+          include_granted_scopes: 'false',
           state,
           code_challenge: googleCodeChallenge,
           code_challenge_method: 'S256',
@@ -519,6 +545,16 @@ function publicSession(
 function optionalAllowedOrigin(request: Request): string | undefined {
   const origin = request.headers.get('Origin');
   return origin && ALLOWED_ORIGINS.has(origin) ? origin : undefined;
+}
+
+/**
+ * Cloudflare overwrites CF-Connecting-IP for direct client-to-Worker traffic.
+ * Never fall back to attacker-controlled forwarding headers. Local/test requests
+ * without edge metadata deliberately share one bounded bucket.
+ */
+function trustedEdgeClientAddress(request: Request): string {
+  const value = request.headers.get('CF-Connecting-IP')?.trim();
+  return value && value.length <= 128 ? value : 'edge-address-unavailable';
 }
 
 function json(value: unknown, status: number, origin?: string): Response {

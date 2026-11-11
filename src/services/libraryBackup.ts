@@ -3,10 +3,8 @@ import {
   getBackupDocumentDataStrict,
   listLibraryDocuments,
   listCollections,
-  listTags,
-  restoreLibraryEntities,
-  restoreBackupDocument,
   validateBackupDocumentState,
+  validateLibraryEntities,
   type PersistedDocumentState,
   type StoredPdfFile,
 } from './annotationPersistence';
@@ -20,7 +18,7 @@ import {
   type DocumentType,
   type StoredDocumentSource,
 } from '../types/document.ts';
-import type { CollectionRecord, TagRecord } from '../types/library';
+import type { CollectionRecord } from '../types/library';
 import {
   getArchiveEntryKey,
   isSafeLegacyDocumentIdForArchive,
@@ -29,8 +27,6 @@ import {
 import {
   getProductivityBackupDataStrict,
   loadRenderedPrintPdf,
-  restoreRenderedPrintPdf,
-  restoreProductivityBackupData,
   sanitizeProductivityBackupData,
   type ProductivityBackupDocument,
 } from './productivityPersistence';
@@ -40,6 +36,8 @@ import type { PaperCloudSummary } from '../sync/paperTypes.ts';
 import { loadCloudPaperCatalog, loadPaperSyncDeviceProfile } from '../sync/storage.ts';
 import { validateStoredDocumentSource } from './documentSourceValidation.ts';
 import { isSha256, sha256Hex } from '../sync/hash.ts';
+import { flushLocalPersistence } from './persistentChange.ts';
+import { withExclusiveWorkspaceRestoreLease } from './workspaceRestoreLock.ts';
 
 export const BACKUP_FORMAT_VERSION = 5;
 const PAPER_COVERAGE_BACKUP_FORMAT_VERSION = 4;
@@ -135,57 +133,107 @@ export interface RestorePreview {
   underlineCount: number;
   noteCount: number;
   collections: CollectionRecord[];
-  tags: TagRecord[];
   productivity: ProductivityBackupDocument[];
   renderedPrintPdfCount: number;
 }
 
-export async function downloadLibraryBackup(
+export const BACKUP_PERSISTENCE_FAILURE_MESSAGE =
+  'Backup not created because 39Note could not save every pending local edit. Your edits remain available; resolve the storage warning and try again.';
+
+export class BackupPersistenceError extends Error {
+  constructor() {
+    super(BACKUP_PERSISTENCE_FAILURE_MESSAGE);
+    this.name = 'BackupPersistenceError';
+  }
+}
+
+let activeLibraryBackup: {
+  listeners: Set<(completed: number, total: number) => void>;
+  promise: Promise<void>;
+} | null = null;
+
+export function downloadLibraryBackup(
   onProgress: (completed: number, total: number) => void,
 ): Promise<void> {
-  const documents = await getBackupDocumentDataStrict();
-  const [collections, tags, paperCoverage] = await Promise.all([
-    listCollections(),
-    listTags(),
-    loadCachedLibraryPaperCoverage(documents.map(({ state }) => state.documentId)),
-  ]);
-  await downloadBackupArchive(
-    documents,
-    collections,
-    tags,
-    'library',
-    paperCoverage,
-    onProgress,
-  );
+  if (activeLibraryBackup) {
+    activeLibraryBackup.listeners.add(onProgress);
+    return activeLibraryBackup.promise;
+  }
+
+  const listeners = new Set([onProgress]);
+  const operation = createLibraryBackup((completed, total) => {
+    for (const listener of listeners) listener(completed, total);
+  });
+  const promise = operation.finally(() => {
+    if (activeLibraryBackup?.promise === promise) activeLibraryBackup = null;
+  });
+  activeLibraryBackup = { listeners, promise };
+  return promise;
+}
+
+async function createLibraryBackup(
+  onProgress: (completed: number, total: number) => void,
+): Promise<void> {
+  await flushBackupPersistence();
+  const snapshot = await withExclusiveWorkspaceRestoreLease(async () => {
+    const documents = await getBackupDocumentDataStrict();
+    const [collections, paperCoverage] = await Promise.all([
+      listCollections(),
+      loadCachedLibraryPaperCoverage(documents.map(({ state }) => state.documentId)),
+    ]);
+    return captureBackupArchiveSnapshot(
+      documents,
+      collections,
+      'library',
+      paperCoverage,
+    );
+  });
+  await downloadBackupArchive(snapshot, onProgress);
 }
 
 export async function downloadSelectedPackage(
   documentIds: readonly string[],
   onProgress: (completed: number, total: number) => void,
 ): Promise<void> {
+  await flushBackupPersistence();
   const uniqueIds = [...new Set(documentIds)];
-  const documents = await getBackupDocumentDataStrict(uniqueIds);
-  if (documents.length !== uniqueIds.length) {
-    throw new Error('One or more selected documents could not be packaged.');
-  }
-  const referencedCollectionIds = new Set(
-    documents.flatMap(({ state }) => state.collectionIds),
-  );
-  const referencedTagIds = new Set(documents.flatMap(({ state }) => state.tagIds));
-  const [allCollections, allTags] = await Promise.all([listCollections(), listTags()]);
-  await downloadBackupArchive(
-    documents,
-    allCollections.filter((collection) => referencedCollectionIds.has(collection.id)),
-    allTags.filter((tag) => referencedTagIds.has(tag.id)),
-    'selected',
-    createBackupPaperCoverage(
-      documents.map(({ state }) => state.documentId),
-      null,
-      undefined,
+  const snapshot = await withExclusiveWorkspaceRestoreLease(async () => {
+    const documents = await getBackupDocumentDataStrict(uniqueIds);
+    if (documents.length !== uniqueIds.length) {
+      throw new Error('One or more selected documents could not be packaged.');
+    }
+    const referencedCollectionIds = new Set(
+      documents.flatMap(({ state }) => state.collectionIds),
+    );
+    const allCollections = await listCollections();
+    return captureBackupArchiveSnapshot(
+      documents,
+      allCollections.filter((collection) => referencedCollectionIds.has(collection.id)),
       'selected',
-    ),
-    onProgress,
-  );
+      createBackupPaperCoverage(
+        documents.map(({ state }) => state.documentId),
+        null,
+        undefined,
+        'selected',
+      ),
+    );
+  });
+  await downloadBackupArchive(snapshot, onProgress);
+}
+
+export function getBackupCreationErrorMessage(
+  error: unknown,
+  fallback = 'The local backup could not be created. Your Library and open edits were left unchanged. Please try again.',
+): string {
+  return error instanceof BackupPersistenceError ? error.message : fallback;
+}
+
+async function flushBackupPersistence(): Promise<void> {
+  try {
+    await flushLocalPersistence();
+  } catch {
+    throw new BackupPersistenceError();
+  }
 }
 
 /**
@@ -269,21 +317,50 @@ async function loadCachedLibraryPaperCoverage(
   }
 }
 
-async function downloadBackupArchive(
+interface BackupArchiveSnapshot {
+  documents: Awaited<ReturnType<typeof getBackupDocumentDataStrict>>;
+  collections: CollectionRecord[];
+  scope: 'library' | 'selected';
+  paperCoverage: BackupPaperCoverage;
+  productivity: ProductivityBackupDocument[];
+  renderedPrintPdfs: Array<StoredRenderedPrintPdf | null>;
+}
+
+async function captureBackupArchiveSnapshot(
   documents: Awaited<ReturnType<typeof getBackupDocumentDataStrict>>,
   collections: CollectionRecord[],
-  tags: TagRecord[],
   scope: 'library' | 'selected',
   paperCoverage: BackupPaperCoverage,
-  onProgress: (completed: number, total: number) => void,
-): Promise<void> {
-  const JSZip = await loadJsZip();
-  const zip = new JSZip();
+): Promise<BackupArchiveSnapshot> {
   const documentIds = documents.map(({ state }) => state.documentId);
   const [productivity, renderedPrintPdfs] = await Promise.all([
     getProductivityBackupDataStrict(documentIds),
     Promise.all(documentIds.map((documentId) => loadRenderedPrintPdf(documentId))),
   ]);
+  return {
+    documents,
+    collections,
+    scope,
+    paperCoverage,
+    productivity,
+    renderedPrintPdfs,
+  };
+}
+
+async function downloadBackupArchive(
+  snapshot: BackupArchiveSnapshot,
+  onProgress: (completed: number, total: number) => void,
+): Promise<void> {
+  const {
+    documents,
+    collections,
+    scope,
+    paperCoverage,
+    productivity,
+    renderedPrintPdfs,
+  } = snapshot;
+  const JSZip = await loadJsZip();
+  const zip = new JSZip();
   const productivityByDocument = new Map(
     productivity.map((record) => [record.documentId, record] as const),
   );
@@ -296,6 +373,7 @@ async function downloadBackupArchive(
       (count, document) =>
         count +
         document.state.annotations.length +
+        document.state.links.length +
         document.state.officeAnnotations.length,
       0,
     ),
@@ -323,7 +401,6 @@ async function downloadBackupArchive(
 
   zip.file(`${BACKUP_ROOT}manifest.json`, JSON.stringify(manifest));
   zip.file(`${BACKUP_ROOT}collections.json`, JSON.stringify(collections));
-  zip.file(`${BACKUP_ROOT}tags.json`, JSON.stringify(tags));
   for (const [index, document] of documents.entries()) {
     const manifestDocument = manifest.documents[index];
     zip.file(
@@ -470,8 +547,8 @@ export async function inspectBackup(file: File): Promise<RestorePreview> {
       return { state, source, pdf, productivity, renderedPrintPdf };
     }),
   );
-  const collections = await readEntities<CollectionRecord>(zip, 'collections.json');
-  const tags = await readEntities<TagRecord>(zip, 'tags.json');
+  const collections = await readBackupCollections(zip, documents);
+  await validateAndDiscardLegacyTags(zip);
 
   const existingIds = new Set(
     (await listLibraryDocuments()).map((document) => document.documentId),
@@ -505,7 +582,6 @@ export async function inspectBackup(file: File): Promise<RestorePreview> {
     ),
     noteCount: documents.reduce((count, { state }) => count + state.notes.length, 0),
     collections,
-    tags,
     productivity: documents.flatMap((document) =>
       document.productivity ? [document.productivity] : [],
     ),
@@ -514,40 +590,64 @@ export async function inspectBackup(file: File): Promise<RestorePreview> {
   };
 }
 
-export async function restoreBackup(
-  preview: RestorePreview,
-  replaceExisting: boolean,
-): Promise<{ imported: number; failed: number }> {
-  const existingIds = new Set(
-    (await listLibraryDocuments()).map((document) => document.documentId),
-  );
-  let imported = 0;
-  let failed = 0;
-  const restoredDocumentIds = new Set<string>();
-  for (const document of preview.documents) {
-    if (existingIds.has(document.state.documentId) && !replaceExisting) continue;
-    if (await restoreBackupDocument(document.state, document.source, replaceExisting)) {
-      await restoreRenderedPrintPdf(
-        document.state.documentId,
-        document.renderedPrintPdf,
-        false,
-      );
-      imported += 1;
-      restoredDocumentIds.add(document.state.documentId);
-    } else failed += 1;
+async function readBackupCollections(
+  zip: JSZipType,
+  documents: readonly RestorePreview['documents'][number][],
+): Promise<CollectionRecord[]> {
+  const entry = zip.file(`${BACKUP_ROOT}collections.json`);
+  if (!entry) {
+    throw new Error('Backup Collection data is missing.');
   }
-  await restoreProductivityBackupData(
-    preview.productivity.filter((record) => restoredDocumentIds.has(record.documentId)),
-  );
-  await restoreLibraryEntities(preview.collections, preview.tags);
-  return { imported, failed };
+
+  let value: unknown;
+  try {
+    value = JSON.parse(await entry.async('text'));
+  } catch {
+    throw new Error('Backup Collection data is malformed JSON.');
+  }
+  assertValidBackupCollections(value, documents);
+  return value;
 }
 
-async function readEntities<T>(zip: JSZipType, entryName: string): Promise<T[]> {
-  const entry = zip.file(`${BACKUP_ROOT}${entryName}`);
-  if (!entry) return [];
-  const value = JSON.parse(await entry.async('text'));
-  return Array.isArray(value) ? (value as T[]) : [];
+function assertValidBackupCollections(
+  collections: unknown,
+  documents: readonly Pick<RestorePreview['documents'][number], 'state'>[],
+): asserts collections is CollectionRecord[] {
+  if (!validateLibraryEntities(collections)) {
+    throw new Error('Backup Collection data contains invalid records.');
+  }
+  const collectionIds = new Set(collections.map((collection) => collection.id));
+  if (
+    documents.some(({ state }) =>
+      state.collectionIds.some((collectionId) => !collectionIds.has(collectionId)),
+    )
+  ) {
+    throw new Error('A backup document references an unknown Collection.');
+  }
+}
+
+/** Released backups may contain the retired organizational Tags file. */
+async function validateAndDiscardLegacyTags(zip: JSZipType): Promise<void> {
+  const entry = zip.file(`${BACKUP_ROOT}tags.json`);
+  if (!entry) return;
+  const value: unknown = JSON.parse(await entry.async('text'));
+  if (!Array.isArray(value) || !value.every(isLegacyOrganizationalTagRecord)) {
+    throw new Error('Legacy organizational Tag data is invalid.');
+  }
+}
+
+function isLegacyOrganizationalTagRecord(value: unknown): boolean {
+  return (
+    isRecord(value) &&
+    typeof value.id === 'string' &&
+    value.id.length > 0 &&
+    value.id.length <= 128 &&
+    typeof value.name === 'string' &&
+    value.name.trim().length > 0 &&
+    typeof value.normalizedName === 'string' &&
+    Number.isSafeInteger(value.createdAt) &&
+    Number.isSafeInteger(value.updatedAt)
+  );
 }
 
 export function createBackupManifestDocument(

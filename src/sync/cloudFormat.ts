@@ -1,6 +1,10 @@
 import { isSha256, sha256Hex, stableStringify } from './hash.ts';
 import { assertNoSecretsInSyncPayload } from './secrets.ts';
 import {
+  MAXIMUM_SYNC_DOCUMENT_ID_LENGTH,
+  isSyncCompatibleDocumentId,
+} from '../utils/documentId.ts';
+import {
   SYNC_SCHEMA_VERSION,
   createSyncEntityKey,
   type SyncConflict,
@@ -619,7 +623,7 @@ function isRecoveryEvidence(value: unknown): value is CloudManifestRecoveryEvide
     (value.documentId === undefined ||
       (typeof value.documentId === 'string' &&
         value.documentId.length > 0 &&
-        value.documentId.length <= 256)) &&
+        isSyncCompatibleDocumentId(value.documentId))) &&
     isPayloadReference(value.expected) &&
     (value.observed === undefined || isPayloadReference(value.observed)) &&
     isPayloadReference(value.merged),
@@ -631,7 +635,7 @@ function isDocumentManifest(value: unknown): value is CloudDocumentManifest {
     isRecord(value) &&
     typeof value.documentId === 'string' &&
     value.documentId.length > 0 &&
-    value.documentId.length <= 256 &&
+    isSyncCompatibleDocumentId(value.documentId) &&
     typeof value.folderId === 'string' &&
     value.folderId.length > 0 &&
     value.folderId.length <= 256 &&
@@ -655,6 +659,7 @@ function isDocumentManifest(value: unknown): value is CloudDocumentManifest {
 const ENTITY_KINDS = new Set([
   'document',
   'annotation',
+  'link-number-high-water',
   'note-anchor',
   'note',
   'glossary',
@@ -674,11 +679,8 @@ function isSyncEntity(value: unknown): value is SyncEntityRecord {
     !ENTITY_KINDS.has(String(value.kind)) ||
     typeof value.id !== 'string' ||
     value.id.length === 0 ||
-    value.id.length > 256 ||
-    (value.documentId !== undefined &&
-      (typeof value.documentId !== 'string' ||
-        value.documentId.length === 0 ||
-        value.documentId.length > 256)) ||
+    value.id.length > MAXIMUM_SYNC_DOCUMENT_ID_LENGTH ||
+    (value.documentId !== undefined && !isSyncCompatibleDocumentId(value.documentId)) ||
     !isRecord(value.version) ||
     !isTimestamp(value.version.updatedAt) ||
     typeof value.version.deviceId !== 'string' ||
@@ -704,11 +706,8 @@ function isSyncTombstone(value: unknown): value is SyncTombstone {
     !ENTITY_KINDS.has(String(value.kind)) ||
     typeof value.id !== 'string' ||
     value.id.length === 0 ||
-    value.id.length > 256 ||
-    (value.documentId !== undefined &&
-      (typeof value.documentId !== 'string' ||
-        value.documentId.length === 0 ||
-        value.documentId.length > 256)) ||
+    value.id.length > MAXIMUM_SYNC_DOCUMENT_ID_LENGTH ||
+    (value.documentId !== undefined && !isSyncCompatibleDocumentId(value.documentId)) ||
     !isTimestamp(value.deletedAt) ||
     typeof value.deviceId !== 'string' ||
     value.deviceId.length === 0 ||
@@ -739,7 +738,7 @@ function isSyncConflict(value: unknown): value is SyncConflict {
     (value.documentId === undefined ||
       (typeof value.documentId === 'string' &&
         value.documentId.length > 0 &&
-        value.documentId.length <= 256)) &&
+        isSyncCompatibleDocumentId(value.documentId))) &&
     isTimestamp(value.detectedAt) &&
     isSyncEntityVersion(value.winningVersion) &&
     isSyncEntityVersion(value.alternateVersion) &&

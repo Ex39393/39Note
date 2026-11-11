@@ -1,21 +1,11 @@
 import { NcbiRequestQueue, runBoundedRetry } from '../../../utils/ncbiRequestPolicy';
-import {
-  DictionaryProviderHttpError,
-  fetchJsonWithTimeout,
-} from './request';
+import { DictionaryProviderHttpError, fetchJsonWithTimeout } from './request';
 
 const ncbiQueue = new NcbiRequestQueue(350);
 
-export async function fetchNcbiJson(
-  url: URL,
-  signal: AbortSignal,
-): Promise<unknown> {
+export async function fetchNcbiJson(url: URL, signal: AbortSignal): Promise<unknown> {
   return runNcbiRequestWithRetry(
-    () =>
-      ncbiQueue.schedule(
-        () => fetchJsonWithTimeout(url, signal),
-        signal,
-      ),
+    () => ncbiQueue.schedule(() => fetchJsonWithTimeout(url, signal), signal),
     signal,
   );
 }
@@ -36,7 +26,16 @@ export function runNcbiRequestWithRetry<T>(
 
 export function isTransientProviderFailure(error: unknown): boolean {
   if (error instanceof DictionaryProviderHttpError) {
-    return error.status === 429 || error.status === 500 || error.status === 502 || error.status === 503 || error.status === 504;
+    return (
+      error.status === 429 ||
+      error.status === 500 ||
+      error.status === 502 ||
+      error.status === 503 ||
+      error.status === 504
+    );
   }
-  return error instanceof TypeError || (error instanceof DOMException && error.name === 'TimeoutError');
+  return (
+    error instanceof TypeError ||
+    (error instanceof DOMException && error.name === 'TimeoutError')
+  );
 }

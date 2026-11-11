@@ -1,0 +1,10 @@
+Tesseract.js 7.0.0 and tesseract.js-core 7.0.0
+Copyright their respective contributors.
+
+Licensed under the Apache License, Version 2.0. A complete copy of that general
+license text is distributed in this directory as PDFjs-Apache-2.0.txt; despite
+the filename, the same unmodified Apache License 2.0 text applies here.
+
+Project sources:
+https://github.com/naptha/tesseract.js
+https://github.com/naptha/tesseract.js-core

@@ -7,13 +7,21 @@ import type { ViteDevServer } from 'vite';
 import { getProviderKeyGuidance } from '../src/ai/providerGuidance.ts';
 import type { AiProviderId } from '../src/ai/types.ts';
 import { readingThemes, themes } from '../src/themes.ts';
+import {
+  resolveLibraryScrollContainer,
+  scrollLibraryContainerToTop,
+} from '../src/utils/libraryScroll.ts';
+import {
+  clearWorkspaceNavigationHandoff,
+  peekWorkspaceReloadDestination,
+  rememberDriveAfterWorkspaceReload,
+} from '../src/utils/workspaceNavigationHandoff.ts';
 
 const source = (path: string) => readFileSync(new URL(path, import.meta.url), 'utf8');
 const expectedSections = [
   ['home', 'Home'],
   ['library', 'Library'],
   ['collections', 'Collections'],
-  ['tags', 'Tags'],
   ['theme', 'Theme'],
   ['ai', 'AI'],
   ['drive', 'Google Drive'],
@@ -61,6 +69,52 @@ test('the floating Home entry point has an accessible name and compact icon', ()
   assert.match(markup, /<button[^>]*title="Home"[^>]*type="button"[^>]*>/u);
   assert.match(markup, /<svg aria-hidden="true"/u);
   assert.doesNotMatch(markup, />\s*Home\s*</u);
+});
+
+test('workspace reload preserves only a fresh one-shot Drive UI destination', () => {
+  const previousStorage = Object.getOwnPropertyDescriptor(globalThis, 'sessionStorage');
+  const values = new Map<string, string>();
+  const storage = {
+    get length() {
+      return values.size;
+    },
+    clear() {
+      values.clear();
+    },
+    getItem(key: string) {
+      return values.get(key) ?? null;
+    },
+    key(index: number) {
+      return [...values.keys()][index] ?? null;
+    },
+    removeItem(key: string) {
+      values.delete(key);
+    },
+    setItem(key: string, value: string) {
+      values.set(key, value);
+    },
+  } satisfies Storage;
+  Object.defineProperty(globalThis, 'sessionStorage', {
+    configurable: true,
+    value: storage,
+  });
+  try {
+    rememberDriveAfterWorkspaceReload(1_000);
+    assert.equal(peekWorkspaceReloadDestination(1_000), 'drive');
+    assert.equal(peekWorkspaceReloadDestination(61_000), 'drive');
+    assert.equal(peekWorkspaceReloadDestination(61_001), null);
+    clearWorkspaceNavigationHandoff();
+    assert.equal(peekWorkspaceReloadDestination(1_000), null);
+
+    storage.setItem('39note-workspace-navigation-handoff-v1', '{"version":2}');
+    assert.equal(peekWorkspaceReloadDestination(1_000), null);
+  } finally {
+    if (previousStorage) {
+      Object.defineProperty(globalThis, 'sessionStorage', previousStorage);
+    } else {
+      Reflect.deleteProperty(globalThis, 'sessionStorage');
+    }
+  }
 });
 
 test('Home uses an accessible icon-only Back action', () => {
@@ -153,6 +207,7 @@ test('the Home landing page stays compact and theme choices are real controls', 
   assert.match(landingMarkup, /Convert it to a normal 39Note PDF locally/u);
 
   const themeMarkup = renderToStaticMarkup(createElement(homeUi.ThemeHomePage));
+  assert.equal(readingThemes.length, 10);
   for (const themeId of readingThemes) {
     assert.match(themeMarkup, new RegExp(`>${themes[themeId].label}<`, 'u'));
   }
@@ -166,6 +221,9 @@ test('the Home landing page stays compact and theme choices are real controls', 
     readingThemes.length - 1,
   );
   assert.match(themeMarkup, /aria-pressed="true"[^>]*[\s\S]*?>Original</u);
+  assert.match(themeMarkup, /linear-gradient\(145deg, #061D2B/u);
+  assert.match(themeMarkup, /background:#BCEBFA/u);
+  assert.match(themeMarkup, /linear-gradient\(135deg, #99FFFF/u);
 });
 
 test('the Home section model, Reader toolbar, and mounted Reader shell stay separated', () => {
@@ -231,6 +289,15 @@ test('the Home section model, Reader toolbar, and mounted Reader shell stay sepa
     appSource,
     /onReturnToReader=\{\(\) => setApplicationView\('reader'\)\}/u,
   );
+  assert.match(
+    appSource,
+    /workspaceReloadDestination === 'drive' \? 'home' : 'reader'/u,
+  );
+  assert.match(
+    appSource,
+    /rememberDriveAfterWorkspaceReload[\s\S]*?39note:workspace-changing/u,
+  );
+  assert.match(appSource, /clearWorkspaceNavigationHandoff\(\)/u);
 
   const openHomeSection = appSource.match(
     /const openHomeSection = useCallback\(\(section: HomeSection\) => \{([\s\S]*?)\n\s*\}, \[\]\);/u,
@@ -407,7 +474,12 @@ test('semantic UI tokens and reduced-motion safeguards cover the application she
 });
 
 test('Collections is an independent Home page with an honest empty state', () => {
-  const markup = renderToStaticMarkup(createElement(homeUi.CollectionsHomePage));
+  const markup = renderToStaticMarkup(
+    createElement(homeUi.CollectionsHomePage, {
+      onOpenDocument: async () => false,
+      onOpenLibrary: () => undefined,
+    }),
+  );
   const homeSource = source('../src/components/HomeWorkspace.tsx');
   const appSource = source('../src/components/AppLayout.tsx');
 
@@ -418,7 +490,7 @@ test('Collections is an independent Home page with an honest empty state', () =>
   assert.match(homeSource, /onClick=\{onOpenCollections\}/u);
   assert.match(
     appSource,
-    /homeSection === 'collections'\s*\?\s*\(\s*<CollectionsHomePage\s*\/>/u,
+    /homeSection === 'collections'\s*\?\s*\(\s*<CollectionsHomePage/u,
   );
 });
 
@@ -439,12 +511,11 @@ test('Collections uses list, view, create, and staged edit modes', () => {
     /const openCollection[\s\S]*?openCollectionEditorView\(current, collection\.id\)/u,
   );
   assert.match(homeSource, /<CollectionView[\s\S]*?onEdit=\{beginEdit\}/u);
-  assert.match(
-    homeSource,
-    /<h3>\{mode === 'create' \? 'Create Collection' : 'Edit Collection'\}<\/h3>/u,
-  );
+  assert.match(homeSource, /className="collection-editor-heading-row"/u);
+  assert.match(homeSource, /className="collection-editor-header-actions"/u);
   assert.match(homeSource, />\s*Cancel\s*<\/button>/u);
   assert.match(homeSource, /\{isSaving \? 'Saving…' : 'Done'\}/u);
+  assert.doesNotMatch(homeSource, /className="collection-editor-actions"/u);
   assert.match(viewSource, /No papers in this Collection\./u);
 
   const atomicSave = persistenceSource.slice(
@@ -476,8 +547,8 @@ test('Collections uses list, view, create, and staged edit modes', () => {
     librarySource,
     /createCollection|renameCollection|deleteCollection|Add Collection|Collection:/u,
   );
-  assert.match(librarySource, /aria-label="Add Tag"/u);
-  assert.match(homeSource, /export function TagsHomePage/u);
+  assert.doesNotMatch(librarySource, /aria-label="Add Tag"|Browse Library by Tag/u);
+  assert.doesNotMatch(homeSource, /export function TagsHomePage|id: 'tags'/u);
 });
 
 test('Collection drafts stage membership without mutating persisted inputs', () => {
@@ -535,6 +606,23 @@ test('Collection drafts stage membership without mutating persisted inputs', () 
   assert.equal(cancelled.selectedCollectionId, existing.id);
 });
 
+test('Collection membership keeps an opaque new-paper instance ID exact', () => {
+  const documentId =
+    'pdfjs:synthetic-source-fingerprint:instance:11111111-1111-4111-8111-111111111111';
+  const draft = collectionEditor.createCollectionEditorDraft();
+  const included = collectionEditor.updateCollectionDraftMembership(
+    draft,
+    documentId,
+    true,
+  );
+  assert.deepEqual(included.selectedDocumentIds, [documentId]);
+  assert.deepEqual(
+    collectionEditor.updateCollectionDraftMembership(included, documentId, false)
+      .selectedDocumentIds,
+    [],
+  );
+});
+
 test('Collection create and edit complete into View without changing stable IDs', () => {
   const existing = {
     id: 'collection-a',
@@ -579,6 +667,10 @@ test('an empty Collection renders as a valid read-only View', () => {
       },
       documents: [],
       onEdit() {},
+      async onOpenDocument() {
+        return true;
+      },
+      onOpenLibrary() {},
     }),
   );
   assert.match(markup, /<h3[^>]*>Empty shelf<\/h3>/u);
@@ -586,6 +678,214 @@ test('an empty Collection renders as a valid read-only View', () => {
   assert.match(markup, />No papers in this Collection\.<\/p>/u);
   assert.match(markup, />\s*Edit\s*<\/button>/u);
   assert.doesNotMatch(markup, />\s*(?:Add|Remove|Delete Collection)\s*</u);
+});
+
+test('normal Collection paper rows are open-only Reader entry points', () => {
+  const markup = renderToStaticMarkup(
+    createElement(collectionViews.CollectionView, {
+      collection: {
+        id: 'collection-a',
+        name: 'Reading queue',
+        normalizedName: 'reading queue',
+        createdAt: 1,
+        updatedAt: 1,
+      },
+      documents: [
+        {
+          documentId: 'paper-a',
+          displayTitle: 'Open me',
+          documentType: 'pdf',
+          hasStoredSource: true,
+        },
+      ] as never,
+      onEdit() {},
+      async onOpenDocument() {
+        return true;
+      },
+      onOpenLibrary() {},
+    }),
+  );
+
+  assert.match(
+    markup,
+    /<button aria-label="Open Open me in Reader" class="collection-paper-open" type="button"><span>Open me<\/span>/u,
+  );
+  assert.doesNotMatch(
+    markup,
+    /Rename|Delete paper|Remove from Google Drive|Restore to Google Drive|Sync/u,
+  );
+});
+
+test('Collection rows disclose unavailable sources and route recovery through Library', () => {
+  assert.equal(
+    collectionEditor.getCollectionPaperAvailability({
+      documentType: 'pdf',
+      hasStoredSource: true,
+    }),
+    'available',
+  );
+  assert.equal(
+    collectionEditor.getCollectionPaperAvailability({
+      documentType: 'pdf',
+      hasStoredSource: false,
+    }),
+    'missing-source',
+  );
+  assert.equal(
+    collectionEditor.getCollectionPaperAvailability({
+      documentType: 'docx',
+      hasStoredSource: true,
+    }),
+    'unsupported-source',
+  );
+  assert.equal(
+    collectionEditor.getCollectionPaperAvailability({
+      documentType: 'pptx',
+      hasStoredSource: true,
+    }),
+    'unsupported-source',
+  );
+  assert.equal(
+    collectionEditor.getCollectionPaperAvailability(
+      { documentType: 'pdf', hasStoredSource: true },
+      true,
+    ),
+    'open-failed',
+  );
+
+  const markup = renderToStaticMarkup(
+    createElement(collectionViews.CollectionView, {
+      collection: {
+        id: 'collection-a',
+        name: 'Reading queue',
+        normalizedName: 'reading queue',
+        createdAt: 1,
+        updatedAt: 1,
+      },
+      documents: [
+        {
+          documentId: 'missing-paper',
+          displayTitle: 'Missing source',
+          documentType: 'pdf',
+          hasStoredSource: false,
+        },
+        {
+          documentId: 'legacy-office-paper',
+          displayTitle: 'Legacy Office source',
+          documentType: 'docx',
+          hasStoredSource: true,
+        },
+        {
+          documentId: 'legacy-presentation',
+          displayTitle: 'Legacy presentation source',
+          documentType: 'pptx',
+          hasStoredSource: true,
+        },
+      ] as never,
+      onEdit() {},
+      async onOpenDocument() {
+        return false;
+      },
+      onOpenLibrary() {},
+    }),
+  );
+
+  assert.match(markup, /<strong>Unavailable\.<\/strong> Source is not stored/u);
+  assert.match(markup, /must be converted to PDF before it can be opened/u);
+  assert.equal(markup.match(/>Open Library<\/button>/gu)?.length, 3);
+  assert.match(markup, /aria-label="Open Library for Missing source"/u);
+  assert.doesNotMatch(markup, /class="collection-paper-open"/u);
+  assert.doesNotMatch(
+    markup,
+    /Rename|Delete paper|Remove from Google Drive|Restore to Google Drive|Sync/u,
+  );
+
+  const viewSource = source('../src/components/CollectionWorkspaceViews.tsx');
+  assert.match(
+    viewSource,
+    /await onOpenDocument\(documentId\)[\s\S]*?setFailedOpenDocumentIds/u,
+  );
+  assert.match(
+    viewSource,
+    /role=\{availability === 'open-failed' \? 'alert' : 'status'\}/u,
+  );
+
+  const cssSource = source('../src/styles/index.css');
+  assert.match(
+    cssSource,
+    /@media \(max-width: 760px\)[\s\S]*?\.collection-paper-unavailable\s*\{[^}]*align-items:\s*stretch;[^}]*flex-direction:\s*column;/u,
+  );
+  assert.match(
+    cssSource,
+    /@media \(max-width: 760px\)[\s\S]*?\.collection-paper-unavailable > button\s*\{[^}]*align-self:\s*flex-start;/u,
+  );
+});
+
+test('Collection origin is retained for the Reader Home return path', () => {
+  const appSource = source('../src/components/AppLayout.tsx');
+  const homeSource = source('../src/components/HomeWorkspace.tsx');
+  assert.match(appSource, /const \[collectionReturnId, setCollectionReturnId\]/u);
+  assert.match(
+    appSource,
+    /onOpenDocument=\{\(documentId, collectionId\) =>[\s\S]*?openStoredDocument\(documentId, true\)\.then\(\(opened\) => \{[\s\S]*?if \(opened\) setCollectionReturnId\(collectionId\)[\s\S]*?return opened/u,
+  );
+  assert.match(
+    appSource,
+    /onOpenLibrary=\{\(\) => \{[\s\S]*?setCollectionReturnId\(null\);[\s\S]*?setHomeSection\('library'\)/u,
+  );
+  assert.doesNotMatch(homeSource, /onSelectedCollectionChange/u);
+  assert.match(
+    appSource,
+    /preserveCollectionOrigin = false[\s\S]*?if \(!preserveCollectionOrigin\) setCollectionReturnId\(null\)/u,
+  );
+  assert.match(
+    appSource,
+    /const openLibraryNote = useCallback\([\s\S]*?setCollectionReturnId\(null\)/u,
+  );
+  assert.match(
+    appSource,
+    /openHomeSection\(collectionReturnId \? 'collections' : 'home'\)/u,
+  );
+  assert.match(appSource, /initialCollectionId=\{collectionReturnId\}/u);
+});
+
+test('Collection editor completion controls stay in the top header and lists scroll', () => {
+  const homeSource = source('../src/components/HomeWorkspace.tsx');
+  const cssSource = source('../src/styles/index.css');
+  const header = homeSource.slice(
+    homeSource.indexOf('<header className="collection-editor-header">'),
+    homeSource.indexOf(
+      '</header>',
+      homeSource.indexOf('<header className="collection-editor-header">'),
+    ),
+  );
+  assert.match(header, />\s*Cancel\s*<\/button>/u);
+  assert.match(header, /type="submit"[\s\S]*?\{isSaving \? 'Saving…' : 'Done'\}/u);
+  assert.doesNotMatch(homeSource, /collection-editor-actions/u);
+  assert.match(
+    cssSource,
+    /\.collection-editor > section ul\s*\{[^}]*max-height:[^}]*overflow-y:\s*auto/su,
+  );
+  assert.match(
+    cssSource,
+    /\.collection-editor-heading-row\s*\{[^}]*flex-wrap:\s*wrap/su,
+  );
+});
+
+test('organizational Tags are absent while Reader contextual Tags remain', () => {
+  const homeSource = source('../src/components/HomeWorkspace.tsx');
+  const librarySource = source('../src/components/LibraryPanel.tsx');
+  const annotationTagSource = source('../src/utils/annotationTags.ts');
+  const annotationTagUi = source('../src/components/pdf/AnnotationTag.tsx');
+
+  assert.doesNotMatch(homeSource, /TagsHomePage|createTag|deleteTag|renameTag/u);
+  assert.doesNotMatch(
+    librarySource,
+    /listTags|TagRecord|Add Tag|Browse Library by Tag|tagIds/u,
+  );
+  assert.match(annotationTagSource, /export function deriveAnnotationTags/u);
+  assert.match(annotationTagUi, /Add Note/u);
+  assert.match(annotationTagUi, /Delete Note/u);
 });
 
 test('Collection paper search is case-insensitive and changes no membership', () => {
@@ -605,8 +905,9 @@ test('Collection paper search is case-insensitive and changes no membership', ()
   assert.equal(collectionEditor.filterCollectionAvailablePapers(papers, '').length, 3);
 });
 
-test('the Library PDF/Office import action has a centered non-wrapping text control', () => {
+test('Library import actions distinguish ordinary opens from explicit new-paper identity', () => {
   const librarySource = source('../src/components/LibraryPanel.tsx');
+  const appSource = source('../src/components/AppLayout.tsx');
   const cssSource = source('../src/styles/index.css');
   const importRule = cssSource.match(
     /\.library-panel-header button\.library-import-button\s*\{([^}]*)\}/u,
@@ -616,6 +917,29 @@ test('the Library PDF/Office import action has a centered non-wrapping text cont
     librarySource,
     /className="library-import-button"[\s\S]*?>\s*Import PDF or convert Office\s*<\/button>/u,
   );
+  assert.match(
+    librarySource,
+    /className="library-import-button library-import-new-paper-button"[\s\S]*?>\s*Import as new paper\s*<\/button>/u,
+  );
+  assert.match(
+    librarySource,
+    /Import a PDF as a separate paper[\s\S]*?ignored cloud records are not deleted/u,
+  );
+  assert.match(librarySource, /accept=\{PDF_DOCUMENT_ACCEPT\}/u);
+  assert.match(librarySource, /onImportAsNewPaper\(selectedFile\)/u);
+  assert.match(
+    appSource,
+    /newPaperImportRef\.current = options\.importAsNewPaper[\s\S]*?instanceId: crypto\.randomUUID\(\)/u,
+  );
+  assert.match(
+    appSource,
+    /pendingNewPaper\?\.generation === generation[\s\S]*?createDocumentInstanceIdentity\(identity, pendingNewPaper\.instanceId\)/u,
+  );
+  assert.match(
+    appSource,
+    /preserveRequestedDocumentInstanceIdentity\(\s*identity,\s*requestedDocumentId/u,
+  );
+  assert.match(appSource, /onImportAsNewPaper=\{importPdfAsNewPaper\}/u);
   assert.ok(
     importRule,
     'Import document should override the square icon-button sizing',
@@ -632,6 +956,200 @@ test('the Library PDF/Office import action has a centered non-wrapping text cont
     /\.library-panel-header-actions\s*\{[^}]*flex-wrap:\s*wrap/isu,
   );
   assert.match(librarySource, /className="library-header-icon-button"/u);
+});
+
+test('Library paper cards use compact semantic regions without dropping actions', () => {
+  const librarySource = source('../src/components/LibraryPanel.tsx');
+  const cssSource = source('../src/styles/index.css');
+
+  for (const region of [
+    'library-document-heading',
+    'library-document-summary',
+    'library-document-metadata',
+    'library-document-actions',
+  ]) {
+    assert.match(librarySource, new RegExp(`className="${region}`, 'u'));
+    assert.match(cssSource, new RegExp(`\\.${region}\\s*\\{`, 'u'));
+  }
+
+  for (const action of [
+    'Rename',
+    'Pin',
+    'Upload to Google Drive',
+    'Restore to Google Drive',
+    'Remove from Google Drive',
+    'Select PDF',
+    'Remove source copy',
+    'Read Now',
+    'Remove from this device',
+  ]) {
+    assert.match(librarySource, new RegExp(action, 'u'));
+  }
+
+  const cardRule = cssSource.match(/\.library-document\s*\{([^}]*)\}/u)?.[1];
+  assert.ok(cardRule);
+  assert.doesNotMatch(cardRule, /(?:^|\s)height\s*:/u);
+  assert.match(
+    cssSource,
+    /\.library-document-actions\s*\{[^}]*flex-wrap:\s*wrap[^}]*justify-content:\s*flex-start/su,
+  );
+  assert.match(
+    cssSource,
+    /\.library-document-summary\s*\{[^}]*grid-template-columns:\s*minmax\(0, 1fr\) auto/su,
+  );
+});
+
+test('Library management actions disclose cloud, source, and device scope without changing callbacks', () => {
+  const librarySource = source('../src/components/LibraryPanel.tsx');
+  const cssSource = source('../src/styles/index.css');
+
+  for (const className of [
+    'library-management-action',
+    'library-cloud-removal-action',
+    'library-source-removal-action',
+    'library-device-removal-action',
+  ]) {
+    assert.match(librarySource, new RegExp(className, 'u'));
+    assert.match(cssSource, new RegExp(`\\.${className}`, 'u'));
+  }
+
+  assert.equal(librarySource.match(/kind="cloud"/gu)?.length, 2);
+  assert.equal(librarySource.match(/kind="source"/gu)?.length, 1);
+  assert.equal(librarySource.match(/kind="device"/gu)?.length, 1);
+  assert.match(
+    librarySource,
+    /aria-hidden="true"[\s\S]*?className="library-management-icon"[\s\S]*?focusable="false"/u,
+  );
+  assert.match(
+    librarySource,
+    /library-cloud-removal-action[\s\S]*?onRemoveFromDrive\(\)/u,
+  );
+  assert.match(
+    librarySource,
+    /library-source-removal-action[\s\S]*?onRemoveSourceCopy\(\)/u,
+  );
+  assert.match(librarySource, /library-device-removal-action[\s\S]*?onForget\(\)/u);
+  assert.doesNotMatch(librarySource, /library-management-destructive/u);
+
+  assert.match(
+    cssSource,
+    /\.library-document-actions \.library-management-action\s*\{[^}]*display:\s*inline-flex[^}]*gap:\s*6px/su,
+  );
+  assert.match(
+    cssSource,
+    /\.library-document-actions \.library-cloud-removal-action\s*\{[^}]*var\(--theme-link\)[^}]*box-shadow:\s*inset 3px 0 0 var\(--theme-link\)/su,
+  );
+  assert.match(
+    cssSource,
+    /\.library-document-actions \.library-source-removal-action\s*\{[^}]*var\(--sync-warning\)[^}]*var\(--control-text\)/su,
+  );
+  assert.match(
+    cssSource,
+    /\.library-document-actions \.library-device-removal-action\s*\{[^}]*var\(--destructive-text\)[^}]*var\(--destructive-bg\)/su,
+  );
+});
+
+test('Library cards disclose full long titles and collapse safely at narrow widths', () => {
+  const librarySource = source('../src/components/LibraryPanel.tsx');
+  const cssSource = source('../src/styles/index.css');
+
+  assert.match(
+    librarySource,
+    /<h3 title=\{document\.displayTitle\}>\{document\.displayTitle\}<\/h3>/u,
+  );
+  assert.match(
+    librarySource,
+    /<h3 title=\{paper\.displayName\}>\{paper\.displayName\}<\/h3>/u,
+  );
+  assert.match(
+    librarySource,
+    /className="library-original-file-name" title=\{document\.originalFileName\}/u,
+  );
+  assert.match(librarySource, /tabIndex=\{selectionMode \? 0 : undefined\}/u);
+  assert.match(
+    cssSource,
+    /@media \(max-width: 620px\)\s*\{[\s\S]*?\.library-document-heading,[\s\S]*?grid-template-columns:\s*minmax\(0, 1fr\)[\s\S]*?\.library-document-actions > :is\(button, label, span\)[\s\S]*?flex:\s*1 1 170px/u,
+  );
+});
+
+test('Library Back to top resolves only the active Library scroll container', () => {
+  const embeddedScroller = { scrollTo: () => undefined } as unknown as HTMLElement;
+  const content = {
+    closest: (selector: string) =>
+      selector === '.home-content' ? embeddedScroller : null,
+    scrollTo: () => undefined,
+  } as unknown as HTMLElement;
+
+  assert.equal(resolveLibraryScrollContainer(content, 'embedded'), embeddedScroller);
+  assert.equal(resolveLibraryScrollContainer(content, 'overlay'), content);
+
+  const calls: ScrollToOptions[] = [];
+  const scrollTarget = {
+    scrollTo: (options: ScrollToOptions) => calls.push(options),
+  } as unknown as Pick<HTMLElement, 'scrollTo'>;
+  scrollLibraryContainerToTop(scrollTarget, false);
+  scrollLibraryContainerToTop(scrollTarget, true);
+  assert.deepEqual(calls, [
+    { top: 0, left: 0, behavior: 'smooth' },
+    { top: 0, left: 0, behavior: 'auto' },
+  ]);
+});
+
+test('Back to top is a measured Library footer and preserves Library view state', () => {
+  const librarySource = source('../src/components/LibraryPanel.tsx');
+  const homeSource = source('../src/components/HomeWorkspace.tsx');
+  const appSource = source('../src/components/AppLayout.tsx');
+
+  assert.match(
+    librarySource,
+    /isLibraryScrollable &&[\s\S]*?<footer className="library-list-footer">/u,
+  );
+  assert.match(librarySource, /aria-label="Back to top"/u);
+  assert.match(
+    librarySource,
+    /new ResizeObserver\(measureScrollability\)[\s\S]*?observer\?\.disconnect\(\)/u,
+  );
+  assert.match(
+    librarySource,
+    /scrollContainer\.scrollHeight > scrollContainer\.clientHeight \+ 1/u,
+  );
+  const footerIndex = librarySource.indexOf('<footer className="library-list-footer">');
+  assert.ok(footerIndex > librarySource.indexOf('aria-label="Note results"'));
+  const backToTopHandler = librarySource.slice(
+    librarySource.lastIndexOf('onClick={() => {', footerIndex + 900),
+    librarySource.indexOf('</button>', footerIndex),
+  );
+  assert.doesNotMatch(
+    backToTopHandler,
+    /setSearchQuery|setLibraryView|setSortMode|setSelectedDocumentIds|onClose/u,
+  );
+  assert.doesNotMatch(homeSource, /library-back-to-top|Back to top/u);
+  assert.doesNotMatch(appSource, /library-back-to-top/u);
+});
+
+test('Library and Reader hierarchy use distinct parent, card, control, and backdrop roles', () => {
+  const providerSource = source('../src/components/ThemeProvider.tsx');
+  const cssSource = source('../src/styles/index.css');
+
+  assert.match(providerSource, /'--surface-backdrop'/u);
+  assert.match(providerSource, /const shadowColor = usesDarkSurfaces \? '#000000'/u);
+  assert.match(providerSource, /'--control-bg': theme\.inputBackground/u);
+  assert.match(
+    cssSource,
+    /\.library-panel\.is-embedded\s*\{[^}]*background:\s*var\(--surface-base\)/su,
+  );
+  assert.match(
+    cssSource,
+    /\.library-document,[\s\S]*?background:\s*var\(--surface-raised\)/u,
+  );
+  assert.match(
+    cssSource,
+    /\.notes-panel-content :is\(\.note-card, \.glossary-card, \.document-link-card\)\s*\{[^}]*background:\s*var\(--surface-raised\)/su,
+  );
+  assert.match(
+    cssSource,
+    /\.library-confirm-overlay,[\s\S]*?background:\s*var\(--surface-backdrop\)/u,
+  );
 });
 
 test('Home AI guidance covers every provider without weakening local-only keys', () => {

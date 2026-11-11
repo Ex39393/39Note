@@ -12,8 +12,10 @@ import {
 } from './driveRepository.ts';
 import {
   GoogleAuthorizationCancelledError,
+  GoogleAuthorizationStartError,
   GoogleReauthorizationRequiredError,
   SyncBackendUnavailableError,
+  SyncOriginNotAllowedError,
   SyncServiceRateLimitedError,
 } from './googleIdentity.ts';
 import { LocalSyncPersistenceError } from './storage.ts';
@@ -24,6 +26,7 @@ export type SyncOperationalErrorCode =
   | 'google-authorization-required'
   | 'authorization-cancelled'
   | 'authorization-failed'
+  | 'sync-origin-not-allowed'
   | 'sync-service-unavailable'
   | 'sync-service-rate-limited'
   | 'drive-storage-full'
@@ -39,12 +42,20 @@ export type SyncOperationalErrorCode =
   | 'paper-removed-from-drive'
   | 'drive-response-invalid'
   | 'drive-upload-persistent'
+  | 'drive-operation-timeout'
+  | 'drive-mutation-uncertain'
   | 'reset-incomplete'
   | 'layout-upgrade-failed'
   | 'local-persistence-failed'
   | 'local-changes-waiting'
   | 'sync-not-configured'
   | 'sync-cancelled'
+  | 'device-mode-required'
+  | 'public-root-missing'
+  | 'temporary-cleanup-failed'
+  | 'account-association-required'
+  | 'account-mismatch'
+  | 'account-identity-unavailable'
   | 'unexpected-sync-failure';
 
 export type SyncIssueSeverity = 'info' | 'warning' | 'error' | 'critical';
@@ -60,6 +71,9 @@ export type SyncRecommendedAction =
   | 'create-root'
   | 'retry-reset'
   | 'retry-layout-upgrade'
+  | 'select-device-mode'
+  | 'associate-account'
+  | 'disconnect'
   | 'details';
 
 export interface SyncIssueDiagnostic {
@@ -67,7 +81,8 @@ export interface SyncIssueDiagnostic {
   httpStatus?: number;
   reason?: string;
   operation?: string;
-  phase?: LayoutMigrationFailure['phase'];
+  /** Redacted operation phase. This is diagnostic metadata, not protocol data. */
+  phase?: string;
   causeCode?: string;
   documentId?: string;
   paperName?: string;
@@ -138,7 +153,7 @@ export function createLayoutMigrationIssue(
 ): SyncOperationalIssue {
   return {
     code: 'layout-upgrade-failed',
-    message: failure.message,
+    message: layoutMigrationFailureMessage(failure),
     severity: 'error',
     state: 'attention',
     actions: [...new Set([failure.recommendedAction, 'details' as const])],
@@ -154,6 +169,45 @@ export function createLayoutMigrationIssue(
       ...(failure.paperName ? { paperName: failure.paperName } : {}),
     },
   };
+}
+
+function layoutMigrationFailureMessage(failure: LayoutMigrationFailure): string {
+  if (
+    failure.recommendedAction === 'reconnect' ||
+    ['google-authorization-required', 'authorization-failed'].includes(
+      failure.causeCode,
+    )
+  ) {
+    return 'Google Drive authorization expired. Reconnect to continue the upgrade.';
+  }
+  if (
+    [
+      'offline',
+      'drive-rate-limited',
+      'drive-backend-unavailable',
+      'sync-service-unavailable',
+      'sync-service-rate-limited',
+    ].includes(failure.causeCode)
+  ) {
+    return 'Google Drive is temporarily unavailable. The upgrade is safe to retry.';
+  }
+  if (failure.causeCode === 'local-persistence-failed') {
+    return 'The upgrade could not save its local checkpoint. Existing Drive data was left unchanged.';
+  }
+  if (
+    [
+      'ambiguous-paper-folder',
+      'drive-root-invalid',
+      'layout-migration-incomplete',
+      'layout-migration-proof-invalid',
+      'paper-integrity-failed',
+      'paper-logical-partition-invalid',
+      'paper-presence-invalid',
+    ].includes(failure.causeCode)
+  ) {
+    return 'Drive migration validation failed. Existing Drive data was left unchanged; review Details before retrying.';
+  }
+  return failure.message;
 }
 
 export function createLocalChangesWaitingIssue(): SyncOperationalIssue {
@@ -324,6 +378,42 @@ export function classifySyncError(
       blocksOrdinarySync: false,
       backupRecommended: false,
       diagnostic: { source: 'sync-service', operation: 'authorization' },
+    };
+  }
+
+  if (error instanceof SyncOriginNotAllowedError) {
+    return {
+      code: 'sync-origin-not-allowed',
+      message: error.message,
+      severity: 'warning',
+      state: 'disconnected',
+      actions: ['details'],
+      retrySafe: false,
+      blocksOrdinarySync: true,
+      backupRecommended: false,
+      diagnostic: {
+        source: 'sync-service',
+        operation: 'authorization-start',
+        causeCode: 'origin-not-allowed',
+      },
+    };
+  }
+
+  if (error instanceof GoogleAuthorizationStartError) {
+    return {
+      code: 'authorization-failed',
+      message: error.message,
+      severity: 'warning',
+      state: 'disconnected',
+      actions: ['reconnect', 'details'],
+      retrySafe: true,
+      blocksOrdinarySync: true,
+      backupRecommended: false,
+      diagnostic: {
+        source: 'sync-service',
+        operation: 'authorization-start',
+        causeCode: error.reason,
+      },
     };
   }
 

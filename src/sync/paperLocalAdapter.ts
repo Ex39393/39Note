@@ -3,25 +3,32 @@ import {
   deleteLibraryEntitiesStrict,
   getBackupDocumentDataStrict,
   getCollectionsByIds,
-  getTagsByIds,
+  inspectAnnotationStorageFootprintStrict,
   listLibraryDocuments,
   loadStoredDocumentSource,
   restoreBackupDocument,
   restoreDownloadedPaperBundle,
+  withWorkspaceMutation,
   type LibraryDocument,
 } from '../services/annotationPersistence.ts';
 import {
   captureRenderedPrintPdfStorageIdentity,
   deleteProductivityDocumentDataStrict,
   getProductivityBackupDataStrict,
+  inspectProductivityStorageFootprintStrict,
   loadRenderedPrintPdf,
   restoreRenderedPrintPdf,
   restoreRenderedPrintPdfIfUnchanged,
   restoreProductivityBackupData,
   type RenderedPrintPdfStorageIdentity,
 } from '../services/productivityPersistence.ts';
-import type { CollectionRecord, TagRecord } from '../types/library.ts';
+import type { WorkspaceRestoreLease } from '../services/workspaceRestoreLock.ts';
+import type { CollectionRecord } from '../types/library.ts';
 import type { DocumentType, StoredDocumentSource } from '../types/document.ts';
+import {
+  DOCUMENT_LINK_HIGH_WATER_ENTITY_ID,
+  createDocumentLinkNumberHighWater,
+} from '../utils/documentLinks.ts';
 import { compareCanonicalStrings, sha256Hex, stableStringify } from './hash.ts';
 import {
   documentValue,
@@ -57,6 +64,21 @@ export interface LocalPaperMetadata {
   updatedAt: number;
 }
 
+/**
+ * Strict, read-only inventory used by the confirmation-gated targeted purge.
+ * Collections are deliberately not included: they are shared Library records
+ * and must survive removal of any one paper.
+ */
+export interface LocalPaperPurgeInspection {
+  documentRecord: boolean;
+  sourceRecord: boolean;
+  syncStateRecord: boolean;
+  cloudCatalogRecord: boolean;
+  printDraftRecord: boolean;
+  renderedPrintPdfRecord: boolean;
+  aiConversationCount: number;
+}
+
 export interface AppliedPaperDownload {
   changedDocumentIds: string[];
   deletedDocumentIds: string[];
@@ -69,6 +91,8 @@ export interface AppliedPaperDownload {
 export interface PaperDownloadApplyOptions {
   /** Local artifact identity captured before choosing the Download merge. */
   expectedRenderedPrintPdf: RenderedPrintPdfStorageIdentity;
+  /** Full-lifetime Drive operation capability; prevents nested Web Lock requests. */
+  workspaceLease: WorkspaceRestoreLease;
 }
 
 export async function finalizeAppliedPaperDownload(
@@ -95,13 +119,45 @@ export class BrowserPaperLocalAdapter {
     }));
   }
 
+  async inspectPaperPurgeRecords(
+    documentId: string,
+    options: {
+      syncStateRecord: boolean;
+      cloudCatalogRecord: boolean;
+    },
+  ): Promise<LocalPaperPurgeInspection> {
+    const [library, productivity, productivityRecord] = await Promise.all([
+      inspectAnnotationStorageFootprintStrict(),
+      inspectProductivityStorageFootprintStrict(),
+      getProductivityBackupDataStrict([documentId]).then((records) => records[0]),
+    ]);
+    if (!productivityRecord) {
+      throw new Error('Local productivity storage could not be inspected safely.');
+    }
+    return {
+      documentRecord: library.documentIds.includes(documentId),
+      sourceRecord: library.sourceDocumentIds.includes(documentId),
+      syncStateRecord: options.syncStateRecord,
+      cloudCatalogRecord: options.cloudCatalogRecord,
+      printDraftRecord: productivity.printDraftIds.includes(documentId),
+      renderedPrintPdfRecord: productivity.renderedPrintPdfIds.includes(documentId),
+      aiConversationCount: productivityRecord.aiConversations.length,
+    };
+  }
+
   /**
    * Idempotent cleanup used when a Download local commit is superseded by an
    * intentional Remove-from-this-device transition. It emits no sync dirt.
    */
-  async ensurePaperAbsent(documentId: string, signal?: AbortSignal): Promise<void> {
-    await deleteProductivityDocumentDataStrict(documentId, signal);
-    await deleteDocumentStateStrict(documentId, signal);
+  async ensurePaperAbsent(
+    documentId: string,
+    signal: AbortSignal | undefined,
+    workspaceLease: WorkspaceRestoreLease,
+  ): Promise<void> {
+    await withWorkspaceMutation(async (lease) => {
+      await deleteProductivityDocumentDataStrict(documentId, signal, lease);
+      await deleteDocumentStateStrict(documentId, signal, lease);
+    }, workspaceLease);
   }
 
   captureRenderedPrintPdfStorageIdentity(
@@ -174,10 +230,7 @@ export class BrowserPaperLocalAdapter {
     ]);
     if (!productivity)
       throw new Error('The selected paper productivity data is unavailable.');
-    const [relevantCollections, relevantTags] = await Promise.all([
-      getCollectionsByIds(document.state.collectionIds),
-      getTagsByIds(document.state.tagIds),
-    ]);
+    const relevantCollections = await getCollectionsByIds(document.state.collectionIds);
     const entities: SyncEntityRecord[] = [];
     await addEntity(
       entities,
@@ -191,6 +244,22 @@ export class BrowserPaperLocalAdapter {
         document.state.pinnedAt ?? 0,
       ),
     );
+    const linkNumberHighWater = createDocumentLinkNumberHighWater(
+      documentId,
+      document.state.nextLinkNumber,
+    );
+    if (!linkNumberHighWater) {
+      throw new Error('The selected paper has invalid Link numbering.');
+    }
+    await addEntity(
+      entities,
+      state,
+      'link-number-high-water',
+      DOCUMENT_LINK_HIGH_WATER_ENTITY_ID,
+      linkNumberHighWater,
+      document.state.updatedAt,
+      documentId,
+    );
     for (const annotation of document.state.annotations) {
       await addEntity(
         entities,
@@ -199,6 +268,17 @@ export class BrowserPaperLocalAdapter {
         annotation.id,
         annotation,
         annotation.updatedAt,
+        documentId,
+      );
+    }
+    for (const link of document.state.links) {
+      await addEntity(
+        entities,
+        state,
+        'annotation',
+        link.id,
+        link,
+        link.updatedAt,
         documentId,
       );
     }
@@ -281,9 +361,6 @@ export class BrowserPaperLocalAdapter {
         collection.updatedAt,
         documentId,
       );
-    }
-    for (const tag of relevantTags) {
-      await addEntity(entities, state, 'tag', tag.id, tag, tag.updatedAt, documentId);
     }
     if (productivity.printDraft) {
       await addEntity(
@@ -394,6 +471,21 @@ export class BrowserPaperLocalAdapter {
     signal?: AbortSignal,
     options?: PaperDownloadApplyOptions,
   ): Promise<AppliedPaperDownload> {
+    if (!options?.workspaceLease) {
+      throw new Error('Paper Download requires workspace mutation ownership.');
+    }
+    return withWorkspaceMutation(
+      (lease) => this.applyDownloadedPaperWithLease(result, signal, options, lease),
+      options.workspaceLease,
+    );
+  }
+
+  private async applyDownloadedPaperWithLease(
+    result: PaperDownloadResult,
+    signal: AbortSignal | undefined,
+    options: PaperDownloadApplyOptions,
+    workspaceLease: WorkspaceRestoreLease,
+  ): Promise<AppliedPaperDownload> {
     signal?.throwIfAborted();
     const records = result.snapshot.entities.filter((entity) => {
       const id = entity.kind === 'document' ? entity.id : entity.documentId;
@@ -418,11 +510,15 @@ export class BrowserPaperLocalAdapter {
         previousProductivity,
         previousRenderedPrintPdf,
         createdCollectionIds: [],
-        createdTagIds: [],
+        workspaceLease,
       });
       try {
-        await deleteProductivityDocumentDataStrict(result.documentId, signal);
-        await deleteDocumentStateStrict(result.documentId, signal);
+        await deleteProductivityDocumentDataStrict(
+          result.documentId,
+          signal,
+          workspaceLease,
+        );
+        await deleteDocumentStateStrict(result.documentId, signal, workspaceLease);
       } catch (error) {
         await rollbackAfterFailure(rollback, error);
       }
@@ -460,15 +556,10 @@ export class BrowserPaperLocalAdapter {
     const collections = records
       .filter((entity) => entity.kind === 'collection')
       .map((entity) => entity.value as CollectionRecord);
-    const tags = records
-      .filter((entity) => entity.kind === 'tag')
-      .map((entity) => entity.value as TagRecord);
-    const [existingCollections, existingTags] = await Promise.all([
-      getCollectionsByIds(collections.map(({ id }) => id)),
-      getTagsByIds(tags.map(({ id }) => id)),
-    ]);
+    const existingCollections = await getCollectionsByIds(
+      collections.map(({ id }) => id),
+    );
     const existingCollectionIds = new Set(existingCollections.map(({ id }) => id));
-    const existingTagIds = new Set(existingTags.map(({ id }) => id));
     const renderedPrintPdfMutation: RenderedPrintPdfMutation = {
       applied: false,
       value: null,
@@ -482,10 +573,15 @@ export class BrowserPaperLocalAdapter {
       createdCollectionIds: collections
         .map(({ id }) => id)
         .filter((id) => !existingCollectionIds.has(id)),
-      createdTagIds: tags.map(({ id }) => id).filter((id) => !existingTagIds.has(id)),
+      workspaceLease,
     });
     try {
-      await restoreProductivityBackupData([productivity], false, signal);
+      await restoreProductivityBackupData(
+        [productivity],
+        false,
+        signal,
+        workspaceLease,
+      );
       renderedPrintPdfMutation.value = result.renderedPrintPdf ?? null;
       renderedPrintPdfMutation.applied = await restoreRenderedPrintPdfIfUnchanged(
         result.documentId,
@@ -493,9 +589,16 @@ export class BrowserPaperLocalAdapter {
         result.renderedPrintPdf ?? null,
         false,
         signal,
+        workspaceLease,
       );
       if (
-        !(await restoreDownloadedPaperBundle(state, source, collections, tags, signal))
+        !(await restoreDownloadedPaperBundle(
+          state,
+          source,
+          collections,
+          signal,
+          workspaceLease,
+        ))
       ) {
         throw new Error('The selected paper could not be stored locally.');
       }
@@ -550,22 +653,33 @@ function createPaperDownloadRollback(options: {
   previousRenderedPrintPdf: Awaited<ReturnType<typeof loadRenderedPrintPdf>>;
   renderedPrintPdfMutation?: RenderedPrintPdfMutation;
   createdCollectionIds: readonly string[];
-  createdTagIds: readonly string[];
+  workspaceLease: WorkspaceRestoreLease;
 }): () => Promise<void> {
   return async () => {
     const operations: Promise<unknown>[] = [
-      restoreProductivityBackupData([options.previousProductivity], false),
+      restoreProductivityBackupData(
+        [options.previousProductivity],
+        false,
+        undefined,
+        options.workspaceLease,
+      ),
       options.previousDocument
         ? restoreBackupDocument(
             options.previousDocument.state,
             options.previousDocument.source,
             true,
             false,
+            undefined,
+            options.workspaceLease,
           ).then((restored) => {
             if (!restored)
               throw new Error('The prior local paper could not be restored.');
           })
-        : deleteDocumentStateStrict(options.documentId),
+        : deleteDocumentStateStrict(
+            options.documentId,
+            undefined,
+            options.workspaceLease,
+          ),
     ];
     if (options.renderedPrintPdfMutation?.applied) {
       operations.push(
@@ -574,6 +688,8 @@ function createPaperDownloadRollback(options: {
           options.renderedPrintPdfMutation.value,
           options.previousRenderedPrintPdf,
           false,
+          undefined,
+          options.workspaceLease,
         ),
       );
     } else if (!options.renderedPrintPdfMutation) {
@@ -582,14 +698,16 @@ function createPaperDownloadRollback(options: {
           options.documentId,
           options.previousRenderedPrintPdf,
           false,
+          undefined,
+          options.workspaceLease,
         ),
       );
     }
-    if (options.createdCollectionIds.length || options.createdTagIds.length) {
+    if (options.createdCollectionIds.length) {
       operations.push(
         deleteLibraryEntitiesStrict(
           options.createdCollectionIds,
-          options.createdTagIds,
+          options.workspaceLease,
         ),
       );
     }

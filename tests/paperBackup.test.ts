@@ -107,6 +107,19 @@ test('every current manifest paper has an explicit productivity entry, including
   });
 });
 
+test('backup manifests preserve and safely encode opaque new-paper instance IDs', () => {
+  const documentId =
+    'pdfjs:synthetic-source-fingerprint:instance:11111111-1111-4111-8111-111111111111';
+  const archiveKey = encodeURIComponent(documentId);
+
+  assert.deepEqual(backup.createBackupManifestDocument(documentId, false), {
+    documentId,
+    hasStoredSource: false,
+    recordEntry: `documents/${archiveKey}.json`,
+    productivityEntry: `productivity/${archiveKey}.json`,
+  });
+});
+
 test('backup v5 validates truthful paper coverage and required productivity state', () => {
   const manifest = currentManifest();
   assert.deepEqual(backup.parseBackupManifest(manifest).paperCoverage, {
@@ -224,6 +237,30 @@ test('backup manifest parser retains versions 1 through 4 compatibility', () => 
   );
 });
 
+test('restore validates and discards retired organizational Tags from legacy archives', async () => {
+  const manifest = currentManifest();
+  manifest.paperCoverage.cloudOnlyCount = 0;
+  manifest.paperCoverage.cloudOnlyPapers = [];
+  const preview = await inspectArchive(manifest, emptyDocumentState(), {}, [
+    {
+      id: 'legacy-tag',
+      name: 'Legacy',
+      normalizedName: 'legacy',
+      createdAt: 1,
+      updatedAt: 2,
+    },
+  ]);
+
+  assert.equal('tags' in preview, false);
+  await assert.rejects(
+    () =>
+      inspectArchive(manifest, emptyDocumentState(), {}, [
+        { id: 'invalid-legacy-tag', name: '', createdAt: 1, updatedAt: 2 },
+      ]),
+    /Legacy organizational Tag data is invalid/u,
+  );
+});
+
 test('backup v5 round-trips a saved rendered Print PDF as an independent artifact', async () => {
   const printPdf = validPrintPdfBytes('saved print output');
   const printPdfSha256 = await sha256(printPdf);
@@ -326,7 +363,6 @@ test('a v5 archive restores explicit empty productivity instead of retaining sta
   const zip = new JSZip();
   zip.file('39note-backup/manifest.json', JSON.stringify(manifest));
   zip.file('39note-backup/collections.json', '[]');
-  zip.file('39note-backup/tags.json', '[]');
   zip.file(
     '39note-backup/documents/paper-local.json',
     JSON.stringify(emptyDocumentState()),
@@ -354,6 +390,45 @@ test('a v5 archive restores explicit empty productivity instead of retaining sta
   } finally {
     console.error = previousConsoleError;
   }
+});
+
+test('backup v5 preserves canonical custom Highlight and Underline colors exactly', async () => {
+  const manifest = currentManifest();
+  manifest.annotationCount = 2;
+  manifest.paperCoverage.cloudOnlyCount = 0;
+  manifest.paperCoverage.cloudOnlyPapers = [];
+  const state = emptyDocumentState();
+  state.annotations = [
+    {
+      id: 'custom-highlight',
+      type: 'highlight',
+      pageNumber: 1,
+      text: 'Custom highlight',
+      rects: [{ x: 0.1, y: 0.2, width: 0.3, height: 0.04 }],
+      color: '#12ABEF',
+      createdAt: 1,
+      updatedAt: 1,
+    },
+    {
+      id: 'custom-underline',
+      type: 'underline',
+      pageNumber: 1,
+      text: 'Custom underline',
+      rects: [{ x: 0.2, y: 0.3, width: 0.25, height: 0.04 }],
+      color: '#C03D91',
+      createdAt: 2,
+      updatedAt: 2,
+    },
+  ];
+
+  const preview = await inspectArchive(manifest, state, {});
+  assert.deepEqual(
+    preview.documents[0].state.annotations.map(({ id, color }) => [id, color]),
+    [
+      ['custom-highlight', '#12ABEF'],
+      ['custom-underline', '#C03D91'],
+    ],
+  );
 });
 
 test('backup v5 preserves a validated DOCX source, semantic marks, and reading state', async () => {
@@ -481,9 +556,12 @@ test('a legacy v4 PDF backup maps to the generic PDF source in memory', async ()
   const legacyState = {
     ...emptyDocumentState(),
     schemaVersion: 7,
+    tagIds: [],
   };
   delete (legacyState as { documentType?: string }).documentType;
   delete (legacyState as { officeAnnotations?: unknown[] }).officeAnnotations;
+  delete (legacyState as { links?: unknown[] }).links;
+  delete (legacyState as { nextLinkNumber?: number }).nextLinkNumber;
   const preview = await inspectArchive(manifest, legacyState, {
     '39note-backup/pdfs/paper-local.pdf': pdf,
   });
@@ -580,7 +658,7 @@ function validPrintPdfBytes(content: string): Uint8Array {
 
 function emptyDocumentState() {
   return {
-    schemaVersion: 8,
+    schemaVersion: 9,
     documentType: 'pdf',
     documentId: 'paper-local',
     documentName: 'Paper.pdf',
@@ -591,10 +669,11 @@ function emptyDocumentState() {
     noteAnchors: [],
     notes: [],
     glossaryEntries: [],
+    links: [],
     nextNoteNumber: 1,
+    nextLinkNumber: 1,
     updatedAt: 1,
     collectionIds: [],
-    tagIds: [],
     isPinned: false,
   };
 }
@@ -663,11 +742,14 @@ async function inspectArchive(
   manifest: unknown,
   state: unknown,
   sourceEntries: Record<string, Uint8Array>,
+  legacyTags?: unknown,
 ) {
   const zip = new JSZip();
   zip.file('39note-backup/manifest.json', JSON.stringify(manifest));
   zip.file('39note-backup/collections.json', '[]');
-  zip.file('39note-backup/tags.json', '[]');
+  if (legacyTags !== undefined) {
+    zip.file('39note-backup/tags.json', JSON.stringify(legacyTags));
+  }
   zip.file('39note-backup/documents/paper-local.json', JSON.stringify(state));
   zip.file(
     '39note-backup/productivity/paper-local.json',

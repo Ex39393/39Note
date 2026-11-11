@@ -17,6 +17,7 @@ dist
 backups/
 exports/
 screenshots/
+.codex-artifacts/
 temp/
 tmp/
 screenshot*.png

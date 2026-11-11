@@ -46,6 +46,7 @@ import {
   reducePrintComposerUiState,
   shouldShowSourceChangeNotice,
 } from '../src/print/printComposerUiState.ts';
+import { createIdempotentPrintAction } from '../src/print/printComposerOutput.ts';
 import {
   PRINT_DRAFT_SCHEMA_VERSION,
   type PrintDraftRecord,
@@ -254,6 +255,19 @@ test('editable Print Draft and formal templates remain paper-scoped and truthful
       assert.doesNotMatch(`${composer}\n${output}`, /new Blob\([^)]*application\/pdf/u);
     },
   );
+
+  await context.test('load and fallback timer can invoke printing only once', () => {
+    let printCalls = 0;
+    const printOnce = createIdempotentPrintAction(() => {
+      printCalls += 1;
+    });
+    assert.equal(printOnce(), true);
+    assert.equal(printOnce(), false);
+    assert.equal(printCalls, 1);
+    const output = source('../src/print/printComposerOutput.ts');
+    assert.match(output, /cleanupTimer = window\.setTimeout\(cleanup, 120_000\)/u);
+    assert.match(output, /window\.addEventListener\('pagehide', cleanup/u);
+  });
 
   await context.test(
     'rendered Print PDF model requires an independently hashed real PDF',
@@ -616,7 +630,19 @@ test('Print Composer exposes accessible compact drawers without dropping control
   assert.match(editor, /aria-controls="print-formatting-drawer"/u);
   assert.match(editor, /aria-label="Close Blocks drawer"/u);
   assert.match(editor, /aria-label="Close Formatting drawer"/u);
-  assert.match(editor, /event\.key !== 'Escape'/u);
+  assert.match(composer, /ref=\{dialogRef\}/u);
+  assert.match(composer, /tabIndex=\{-1\}/u);
+  assert.match(composer, /onKeyDown=\{handleDialogKeyDown\}/u);
+  assert.match(composer, /event\.key === 'Escape'/u);
+  assert.match(
+    composer,
+    /uiState\.blocksDrawerOpen \|\| uiState\.formattingDrawerOpen/u,
+  );
+  assert.match(composer, /dispatchUiState\(\{ type: 'close-drawers' \}\)/u);
+  assert.match(composer, /returnFocus\.focus\(\{ preventScroll: true \}\)/u);
+  assert.match(composer, /returnFocusTarget \?\?/u);
+  assert.match(composer, /event\.key !== 'Tab'/u);
+  assert.doesNotMatch(editor, /window\.addEventListener\('keydown', closeOnEscape\)/u);
   assert.match(editor, /updateBlocks\(editor\.getEditorState\(\)\)/u);
   assert.match(editor, /editor\.registerUpdateListener/u);
   for (const control of [
