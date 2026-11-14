@@ -143,6 +143,12 @@ export function paperSyncStatusLabel(state: PaperSyncViewState): string {
         return 'Revalidating Drive';
       }
       if (state.restorePublicationHold) return 'Restore sync paused';
+      if (
+        state.issue?.code === 'drive-operation-timeout' &&
+        state.issue.state === 'pending'
+      ) {
+        return withIgnoredIssue('Drive verification paused');
+      }
       if (state.progress.phase !== 'idle') return 'Syncing';
       const status = getPaperSyncUiStatus(state);
       if (status === 'attention') {
@@ -838,7 +844,11 @@ export function PaperLibraryCloudView({
             Download selected
           </button>
           <button
-            disabled={transferBusy || !uploadable.length}
+            disabled={
+              transferBusy ||
+              state.reviewedCloudIssueRevalidationPending ||
+              !uploadable.length
+            }
             type="button"
             onClick={() =>
               void coordinator.uploadSelected(uploadable).catch(() => undefined)
@@ -942,7 +952,9 @@ export function PaperLibraryCloudView({
                   {localPaper?.dirtyReasons.length &&
                   localPaper.cloudPresence !== 'removed' ? (
                     <button
-                      disabled={transferBusy}
+                      disabled={
+                        transferBusy || state.reviewedCloudIssueRevalidationPending
+                      }
                       type="button"
                       onClick={() =>
                         void coordinator
@@ -1047,6 +1059,14 @@ export function PaperSyncDrawer({
   const tone = syncToneForView(state, status);
   const busy = state.connection === 'connecting' || state.connection === 'syncing';
   const progress = getSyncProgressPresentation(state.progress);
+  const ignoredDocumentIds = new Set(
+    (state.ignoredCloudIssues ?? []).map((paper) => paper.documentId),
+  );
+  const remoteUpdateCount = state.paperStates.filter(
+    (paper) =>
+      !ignoredDocumentIds.has(paper.documentId) &&
+      (paper.status === 'remote-update-available' || paper.status === 'both-changed'),
+  ).length;
   const retryDiagnostic = import.meta.env.DEV
     ? coordinator.getLastPaperRetryDiagnostic?.()
     : undefined;
@@ -1354,6 +1374,19 @@ export function PaperSyncDrawer({
       {state.lastSuccessfulAt ? (
         <p className="sync-last-synced">
           Last synced: {formatTimestamp(state.lastSuccessfulAt)}
+        </p>
+      ) : null}
+      {state.lastVerifiedDriveAt ? (
+        <p className="sync-last-synced">
+          Last Drive check: {formatTimestamp(state.lastVerifiedDriveAt)}
+        </p>
+      ) : null}
+      {status === 'connected' && remoteUpdateCount > 0 ? (
+        <p className="sync-last-synced">
+          Drive updates are available for {remoteUpdateCount}{' '}
+          {remoteUpdateCount === 1 ? 'paper' : 'papers'}. Browse Drive papers to review
+          them. A read-only Drive check refreshes the catalog but does not download
+          updates.
         </p>
       ) : null}
 
@@ -1779,6 +1812,90 @@ export function PaperSyncDrawer({
                 <dd>{state.issue.diagnostic.causeCode}</dd>
               </div>
             ) : null}
+            {state.issue.diagnostic.operation === 'paper-presence-invalid' &&
+            state.issue.diagnostic.documentId ? (
+              <div>
+                <dt>Affected document ID</dt>
+                <dd>{state.issue.diagnostic.documentId}</dd>
+              </div>
+            ) : null}
+            {state.issue.diagnostic.operation === 'paper-presence-invalid' &&
+            state.issue.diagnostic.presenceFailureCode ? (
+              <div>
+                <dt>Presence failure code</dt>
+                <dd>{state.issue.diagnostic.presenceFailureCode}</dd>
+              </div>
+            ) : null}
+            {state.issue.diagnostic.operation === 'paper-presence-invalid' &&
+            state.issue.diagnostic.presenceTopology ? (
+              <>
+                <div>
+                  <dt>Presence validation stage</dt>
+                  <dd>{state.issue.diagnostic.presenceTopology.validationStage}</dd>
+                </div>
+                <div>
+                  <dt>Presence records</dt>
+                  <dd>
+                    {state.issue.diagnostic.presenceTopology.recordCount} reviewed /{' '}
+                    {state.issue.diagnostic.presenceTopology.uniqueGenerationCount}{' '}
+                    unique
+                  </dd>
+                </div>
+                <div>
+                  <dt>Presence roots</dt>
+                  <dd>{state.issue.diagnostic.presenceTopology.rootCount}</dd>
+                </div>
+                <div>
+                  <dt>Observed structural heads</dt>
+                  <dd>{state.issue.diagnostic.presenceTopology.structuralHeadCount}</dd>
+                </div>
+                <div>
+                  <dt>Resolved authoritative heads</dt>
+                  <dd>
+                    {state.issue.diagnostic.presenceTopology
+                      .resolvedAuthoritativeHeadCount ?? 'Unavailable'}
+                  </dd>
+                </div>
+                <div>
+                  <dt>Presence components</dt>
+                  <dd>{state.issue.diagnostic.presenceTopology.weakComponentCount}</dd>
+                </div>
+                <div>
+                  <dt>Missing parent references</dt>
+                  <dd>
+                    {
+                      state.issue.diagnostic.presenceTopology
+                        .missingParentReferenceCount
+                    }
+                  </dd>
+                </div>
+                {state.issue.diagnostic.presenceTopology.records.length ? (
+                  <div>
+                    <dt>Redacted presence records</dt>
+                    <dd>
+                      <ul>
+                        {state.issue.diagnostic.presenceTopology.records.map(
+                          (record) => (
+                            <li key={record.ordinal}>
+                              R{record.ordinal}: {record.state} · {record.intent} ·
+                              parents{' '}
+                              {record.parentOrdinals.length
+                                ? record.parentOrdinals
+                                    .map((ordinal) => `R${ordinal}`)
+                                    .join(', ')
+                                : 'none'}{' '}
+                              · missing {record.missingParentCount} · children{' '}
+                              {record.childCount} · root {record.root ? 'yes' : 'no'} ·
+                              structural head {record.structuralHead ? 'yes' : 'no'}
+                            </li>
+                          ),
+                        )}
+                      </ul>
+                    </dd>
+                  </div>
+                ) : null}
+              </>
+            ) : null}
             {state.issue.diagnostic.paperName ? (
               <div>
                 <dt>Affected paper</dt>
@@ -1786,10 +1903,12 @@ export function PaperSyncDrawer({
               </div>
             ) : null}
             {import.meta.env.DEV && state.issue.diagnostic.documentId ? (
-              <div>
-                <dt>Paper ID</dt>
-                <dd>{state.issue.diagnostic.documentId}</dd>
-              </div>
+              state.issue.diagnostic.operation !== 'paper-presence-invalid' ? (
+                <div>
+                  <dt>Paper ID</dt>
+                  <dd>{state.issue.diagnostic.documentId}</dd>
+                </div>
+              ) : null
             ) : null}
             {import.meta.env.DEV && state.issue.diagnostic.expectedSemanticPartition ? (
               <div>
@@ -3507,6 +3626,7 @@ function PaperPrimaryActions({
           busy ||
           Boolean(state.activeDriveOperation) ||
           state.issue?.code === 'drive-operation-timeout' ||
+          state.reviewedCloudIssueRevalidationPending ||
           Boolean(state.securityState) ||
           state.dirtyPaperIds.length === 0
         }
@@ -3516,15 +3636,33 @@ function PaperPrimaryActions({
         Upload changes
         {state.dirtyPaperIds.length ? ` (${state.dirtyPaperIds.length})` : ''}
       </button>
-      {state.connection === 'offline' || getPaperSyncUiStatus(state) === 'attention' ? (
+      {state.connection === 'offline' ||
+      getPaperSyncUiStatus(state) === 'attention' ||
+      state.issue?.code === 'drive-operation-timeout' ? (
         <button
           disabled={busy || Boolean(state.activeDriveOperation)}
           type="button"
           onClick={() => void coordinator.retryNow().catch(() => undefined)}
         >
-          {state.issue?.code === 'drive-operation-timeout'
+          {state.issue?.code === 'drive-operation-timeout' ||
+          state.reviewedCloudIssueRevalidationPending
             ? 'Check Drive again (read-only)'
             : 'Retry now'}
+        </button>
+      ) : state.connection === 'connected' &&
+        getPaperSyncUiStatus(state) === 'connected' &&
+        !state.securityState &&
+        !state.restorePublicationHold ? (
+        <button
+          disabled={busy || Boolean(state.activeDriveOperation)}
+          type="button"
+          onClick={() =>
+            void coordinator.checkDriveAgainReadOnly().catch(() => undefined)
+          }
+        >
+          {state.lastSuccessfulAt || state.lastVerifiedDriveAt
+            ? 'Check Drive again (read-only)'
+            : 'Check Drive (read-only)'}
         </button>
       ) : null}
       {state.deviceMode === 'temporary' ? (

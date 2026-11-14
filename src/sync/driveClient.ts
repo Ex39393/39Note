@@ -4,12 +4,14 @@ import type {
   DriveOperationTelemetrySnapshot,
   DriveSyncOperationType,
 } from './driveOperationTelemetry.ts';
+import { ConcurrencyGate, mapWithConcurrency } from './syncConcurrency.ts';
 
 const DRIVE_API = 'https://www.googleapis.com/drive/v3';
 const DRIVE_UPLOAD_API = 'https://www.googleapis.com/upload/drive/v3';
 const RESUMABLE_THRESHOLD = 5 * 1024 * 1024;
 const RESUMABLE_CHUNK_SIZE = 8 * 1024 * 1024;
 const MAX_ATTEMPTS = 4;
+const BULK_TEXT_READ_CONCURRENCY = 12;
 
 export interface DriveFileMetadata {
   id: string;
@@ -116,6 +118,11 @@ export interface DriveRequestContext {
   byteCount?: number;
   operationId?: string;
   operationType?: DriveSyncOperationType;
+}
+
+export interface DriveTextDownloadRequest {
+  fileId: string;
+  context?: DriveRequestContext;
 }
 
 /** Redacted per-attempt diagnostics. URLs, query text, tokens, and bodies are omitted. */
@@ -294,6 +301,8 @@ export class DriveClient {
     Response,
     DeferredDriveRequestTelemetry
   >();
+  /** Shared limit across concurrent immutable text walks on this Drive client. */
+  private readonly bulkTextReadGate = new ConcurrencyGate(BULK_TEXT_READ_CONCURRENCY);
 
   constructor(
     getAccessToken: (forceRefresh?: boolean) => string | null | Promise<string | null>,
@@ -727,6 +736,37 @@ export class DriveClient {
       this.completeDeferredTelemetry(response, 0, 'network-error');
       throw new DriveNetworkError('download');
     }
+  }
+
+  /**
+   * Reads immutable text with a shared concurrency bound. Drive does not support
+   * media downloads inside HTTP batches, so every file uses the ordinary GET
+   * path with its normal auth, retry, abort, and telemetry behavior.
+   */
+  async downloadTexts(
+    requests: readonly DriveTextDownloadRequest[],
+    signal: AbortSignal,
+  ): Promise<Map<string, string>> {
+    const unique = new Map<string, DriveTextDownloadRequest>();
+    for (const request of requests) {
+      if (!request.fileId || unique.has(request.fileId)) {
+        if (unique.has(request.fileId)) continue;
+        throw new TypeError('A Drive text download requires a file identity.');
+      }
+      unique.set(request.fileId, request);
+    }
+    const pairs = await mapWithConcurrency(
+      [...unique.values()],
+      BULK_TEXT_READ_CONCURRENCY,
+      async ({ fileId, context }): Promise<readonly [string, string]> => [
+        fileId,
+        await this.bulkTextReadGate.run(async () => {
+          signal.throwIfAborted();
+          return this.downloadText(fileId, signal, context);
+        }),
+      ],
+    );
+    return new Map(pairs);
   }
 
   private async multipartUpload(

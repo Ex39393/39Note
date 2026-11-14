@@ -47,6 +47,7 @@ import {
   mapWithConcurrency,
 } from '../src/sync/syncConcurrency.ts';
 import { derivePaperStatus } from '../src/sync/paperStateMachine.ts';
+import type { PaperVerificationCacheEntry } from '../src/sync/paperVerificationCache.ts';
 import {
   DOCUMENT_LINK_HIGH_WATER_ENTITY_ID,
   DOCUMENT_LINK_PERSISTENCE_SCHEMA_VERSION,
@@ -2316,6 +2317,272 @@ test('paper discovery is metadata-only, paginated, selective, and isolated', asy
   );
 
   await context.test(
+    'durable immutable cache survives repository recreation but never bypasses fresh Drive evidence',
+    async () => {
+      const fixture = await publishedFixture('doc-durable-cache', 'Cached paper');
+      const persisted: PaperVerificationCacheEntry[] = [];
+      const firstReload = new PaperDriveRepository(fixture.drive, 'root', {
+        async persistVerifiedCacheEntries(entries) {
+          persisted.push(...entries);
+        },
+      });
+      fixture.drive.resetRequestLog();
+      await firstReload.discover([fixture.state], signal);
+      assert.ok(persisted.some(({ kind }) => kind === 'manifest'));
+      assert.ok(persisted.some(({ kind }) => kind === 'presence'));
+
+      const resumed = new PaperDriveRepository(fixture.drive, 'root');
+      await resumed.hydrateVerifiedReadCache(persisted);
+      fixture.drive.resetRequestLog();
+      const [cached] = await resumed.discover([fixture.state], signal, {
+        reuseVerifiedManifests: true,
+      });
+      assert.equal(cached.documentId, 'doc-durable-cache');
+      assert.deepEqual(
+        fixture.drive.textReads.flatMap((fileId) => {
+          const role = fixture.drive.file(fileId).appProperties?.role;
+          return role === 'paper-manifest-generation' ||
+            role === 'paper-presence-generation'
+            ? [role]
+            : [];
+        }),
+        [],
+      );
+      assert.ok(
+        fixture.drive.queries.some((query) =>
+          query.includes("role' and value='paper-manifest-generation'"),
+        ),
+        'fresh Drive metadata listing remains mandatory',
+      );
+
+      const corrupt = persisted.map((entry) =>
+        entry.kind === 'manifest' ? { ...entry, text: `${entry.text} ` } : entry,
+      );
+      const failClosed = new PaperDriveRepository(fixture.drive, 'root');
+      await failClosed.hydrateVerifiedReadCache(corrupt);
+      fixture.drive.resetRequestLog();
+      await failClosed.discover([fixture.state], signal, {
+        reuseVerifiedManifests: true,
+      });
+      assert.equal(
+        fixture.drive.textReads.filter(
+          (fileId) =>
+            fixture.drive.file(fileId).appProperties?.role ===
+            'paper-manifest-generation',
+        ).length,
+        1,
+        'a malformed local body is ignored and downloaded again',
+      );
+
+      const mismatched = await Promise.all(
+        persisted.map(async (entry) => {
+          if (entry.kind !== 'manifest') return entry;
+          const original = parsePaperCloudManifestForSupportedLayout(entry.text);
+          const replacement = await siblingManifest(
+            original,
+            'Locally substituted manifest',
+            original.generation.createdAt + 1,
+            original.generation.parents,
+          );
+          return { ...entry, text: stableStringify(replacement) };
+        }),
+      );
+      const metadataMismatch = new PaperDriveRepository(fixture.drive, 'root');
+      await metadataMismatch.hydrateVerifiedReadCache(mismatched);
+      fixture.drive.resetRequestLog();
+      const [metadataBound] = await metadataMismatch.discover([fixture.state], signal, {
+        reuseVerifiedManifests: true,
+      });
+      assert.equal(metadataBound.displayName, 'Cached paper');
+      assert.equal(
+        fixture.drive.textReads.filter(
+          (fileId) =>
+            fixture.drive.file(fileId).appProperties?.role ===
+            'paper-manifest-generation',
+        ).length,
+        1,
+        'a valid local generation with mismatched Drive metadata is ignored',
+      );
+
+      const manifest = fixture.drive.byRole('paper-manifest-generation')[0];
+      fixture.drive.file(manifest.id).ownedByMe = false;
+      fixture.drive.resetRequestLog();
+      await resumed.discover([fixture.state], signal, {
+        reuseVerifiedManifests: true,
+      });
+      assert.deepEqual(
+        fixture.drive.textReads.filter(
+          (fileId) =>
+            fixture.drive.file(fileId).appProperties?.role ===
+            'paper-manifest-generation',
+        ),
+        [manifest.id],
+        'changed ownership evidence must invalidate a cache hit',
+      );
+      fixture.drive.file(manifest.id).ownedByMe = true;
+
+      const unchangedText = await fixture.drive.peekText(manifest.id);
+      fixture.drive.replaceBlob(
+        manifest.id,
+        new Blob([unchangedText], { type: 'application/json' }),
+      );
+      fixture.drive.resetRequestLog();
+      await resumed.discover([fixture.state], signal, {
+        reuseVerifiedManifests: true,
+      });
+      assert.deepEqual(
+        fixture.drive.textReads.filter(
+          (fileId) =>
+            fixture.drive.file(fileId).appProperties?.role ===
+            'paper-manifest-generation',
+        ),
+        [manifest.id],
+        'fresh metadata invalidates a previously durable cache hit',
+      );
+    },
+  );
+
+  await context.test(
+    'interrupted long manifest history retains completed verification batches across repository recreation',
+    async () => {
+      const fixture = await publishedFixture('doc-long-history', 'Long history');
+      let parent = fixture.first.manifest;
+      for (let index = 0; index < 100; index += 1) {
+        parent = await siblingManifest(
+          parent,
+          `Long history revision ${index + 1}`,
+          parent.generation.createdAt + 1,
+        );
+        fixture.drive.injectManifest(parent);
+      }
+      for (const file of fixture.drive.byRole('paper-manifest-generation')) {
+        fixture.drive.file(file.id).ownedByMe = true;
+      }
+
+      const persisted: PaperVerificationCacheEntry[] = [];
+      const firstAttempt = new PaperDriveRepository(fixture.drive, 'root', {
+        async persistVerifiedCacheEntries(entries) {
+          persisted.push(...entries);
+        },
+      });
+      const ordinaryBatchDownload = fixture.drive.downloadTexts.bind(fixture.drive);
+      let manifestBatches = 0;
+      Reflect.set(
+        fixture.drive,
+        'downloadTexts',
+        async (requests: readonly { fileId: string }[], batchSignal: AbortSignal) => {
+          if (
+            requests.some(
+              ({ fileId }) =>
+                fixture.drive.file(fileId).appProperties?.role ===
+                'paper-manifest-generation',
+            ) &&
+            ++manifestBatches === 2
+          ) {
+            throw new DOMException('Synthetic read deadline', 'AbortError');
+          }
+          return ordinaryBatchDownload(requests, batchSignal);
+        },
+      );
+      try {
+        await assert.rejects(() => firstAttempt.discover([fixture.state], signal), {
+          name: 'AbortError',
+        });
+      } finally {
+        Reflect.set(fixture.drive, 'downloadTexts', ordinaryBatchDownload);
+      }
+      assert.equal(manifestBatches, 2);
+      assert.equal(
+        persisted.filter(({ kind }) => kind === 'manifest').length,
+        100,
+        'the completed first batch is durable even though ancestry did not resolve',
+      );
+
+      const resumed = new PaperDriveRepository(fixture.drive, 'root');
+      await resumed.hydrateVerifiedReadCache(persisted);
+      fixture.drive.resetRequestLog();
+      const [summary] = await resumed.discover([fixture.state], signal, {
+        reuseVerifiedManifests: true,
+      });
+      assert.notEqual(summary.status, 'needs-attention');
+      assert.equal(
+        fixture.drive.textReads.filter(
+          (fileId) =>
+            fixture.drive.file(fileId).appProperties?.role ===
+            'paper-manifest-generation',
+        ).length,
+        1,
+        'the next attempt downloads only the unfinished immutable generation',
+      );
+    },
+  );
+
+  await context.test(
+    'interrupted presence discovery retains each verified record for a fresh repository',
+    async () => {
+      const fixture = await publishedFixture('doc-presence-first', 'First paper');
+      const secondState = paperState('doc-presence-second');
+      await fixture.repository.publishPaper(
+        await localPackage('doc-presence-second', 'Second paper'),
+        secondState,
+        signal,
+      );
+      const persisted: PaperVerificationCacheEntry[] = [];
+      let markFirstPresenceSaved!: () => void;
+      const firstPresenceSaved = new Promise<void>((resolve) => {
+        markFirstPresenceSaved = resolve;
+      });
+      const firstAttempt = new PaperDriveRepository(fixture.drive, 'root', {
+        async persistVerifiedCacheEntries(entries) {
+          persisted.push(...entries);
+          if (entries.some(({ kind }) => kind === 'presence')) {
+            markFirstPresenceSaved();
+          }
+        },
+      });
+      const ordinaryRead = fixture.drive.downloadText.bind(fixture.drive);
+      let presenceReads = 0;
+      Reflect.set(fixture.drive, 'downloadText', async (fileId: string) => {
+        if (fixture.drive.file(fileId).appProperties?.role === PAPER_PRESENCE_ROLE) {
+          presenceReads += 1;
+          if (presenceReads === 2) {
+            await firstPresenceSaved;
+            throw new DOMException('Synthetic read deadline', 'AbortError');
+          }
+        }
+        return ordinaryRead(fileId);
+      });
+      try {
+        await assert.rejects(
+          () => firstAttempt.discover([fixture.state, secondState], signal),
+          { name: 'AbortError' },
+        );
+      } finally {
+        Reflect.set(fixture.drive, 'downloadText', ordinaryRead);
+      }
+      assert.equal(presenceReads, 2);
+      assert.equal(persisted.filter(({ kind }) => kind === 'presence').length, 1);
+
+      const resumed = new PaperDriveRepository(fixture.drive, 'root');
+      await resumed.hydrateVerifiedReadCache(persisted);
+      fixture.drive.resetRequestLog();
+      const summaries = await resumed.discover([fixture.state, secondState], signal, {
+        reuseVerifiedManifests: true,
+      });
+      assert.equal(summaries.length, 2);
+      assert.ok(summaries.every(({ status }) => status !== 'needs-attention'));
+      assert.equal(
+        fixture.drive.textReads.filter(
+          (fileId) =>
+            fixture.drive.file(fileId).appProperties?.role === PAPER_PRESENCE_ROLE,
+        ).length,
+        1,
+        'only the unfinished presence body should be downloaded after reload',
+      );
+    },
+  );
+
+  await context.test(
     'one known update downloads only current-head payloads and skips a proven unchanged PDF',
     async () => {
       const fixture = await publishedFixture('doc-a', 'Paper');
@@ -2391,7 +2658,7 @@ test('paper discovery is metadata-only, paginated, selective, and isolated', asy
   );
 
   await context.test(
-    'cold multi-history download batches ancestry manifests and reads only current payload bytes',
+    'cold multi-history download reads ancestry manifests concurrently and only current payload bytes',
     async () => {
       const fixture = await publishedFixture('doc-history', 'History paper');
       incorporate(fixture.state, fixture.first);
@@ -2470,11 +2737,11 @@ test('paper discovery is metadata-only, paginated, selective, and isolated', asy
           (manifestReadsByWave.get(record.wave) ?? 0) + 1,
         );
       }
-      assert.ok(
-        [...manifestReadsByWave.values()].every(
-          (count) => count <= PAPER_MANIFEST_READ_CONCURRENCY,
-        ),
+      assert.equal(
+        [...manifestReadsByWave.values()].reduce((sum, count) => sum + count, 0),
+        9,
       );
+      assert.ok([...manifestReadsByWave.values()].every((count) => count <= 12));
       assertLatencyWaveCeiling(measured, 14);
     },
   );
@@ -2517,6 +2784,13 @@ test('paper discovery is metadata-only, paginated, selective, and isolated', asy
       );
 
       assert.equal(measured.result.length, paperCount);
+      assert.equal(
+        drive.textReads.filter(
+          (fileId) =>
+            drive.file(fileId).appProperties?.role === 'paper-manifest-generation',
+        ).length,
+        paperCount * manifestsPerPaper,
+      );
       const manifestRecords = scheduler.records.filter(
         ({ label }) => label === 'paper-manifest-generation',
       );
@@ -2528,13 +2802,18 @@ test('paper discovery is metadata-only, paginated, selective, and isolated', asy
       const maximumParallelReads = Math.max(...readsByWave.values());
       assert.ok(maximumParallelReads <= PAPER_MANIFEST_READ_CONCURRENCY);
       assert.ok(
-        maximumParallelReads > PAPER_MEDIA_CONCURRENCY,
-        'manifest verification must not be serialized behind the heavier media lane',
+        maximumParallelReads > 1,
+        'ordinary Drive GETs should retain bounded parallelism',
       );
       assert.ok(
         readsByWave.size <=
-          paperCount * Math.ceil(manifestsPerPaper / PAPER_MANIFEST_READ_CONCURRENCY),
+          Math.ceil(
+            (paperCount * manifestsPerPaper) / PAPER_MANIFEST_READ_CONCURRENCY,
+          ) +
+            paperCount,
+        'each immutable GET should remain inside a bounded read lane',
       );
+      assertLatencyWaveCeiling(measured, 125);
     },
   );
 
@@ -3794,6 +4073,73 @@ test('Paper-v3 removal and restore preserve presence authority', async (context)
       hasRepositoryCode('paper-presence-invalid'),
     );
   });
+
+  await context.test(
+    'global discovery preserves the exact broken document and redacted ancestry topology',
+    async () => {
+      const documentId = 'global-broken-ancestry';
+      const fixture = await publishedFixture(documentId, 'Broken ancestry');
+      const orphan = await seedValidOrphanPresence(fixture.drive, documentId);
+      fixture.drive.resetRequestLog();
+
+      await assert.rejects(
+        () => fixture.repository.discover([fixture.state], signal),
+        (error: unknown) => {
+          assert.equal(Reflect.get(error as object, 'code'), 'paper-presence-invalid');
+          assert.equal(Reflect.get(error as object, 'documentId'), documentId);
+          assert.equal(
+            Reflect.get(error as object, 'diagnosticPresenceResolutionScope'),
+            'all',
+          );
+          assert.equal(
+            Reflect.get(error as object, 'diagnosticPresenceFailureCode'),
+            'presence-missing-parent',
+          );
+          const diagnostic = Reflect.get(
+            error as object,
+            'diagnosticPresenceAncestry',
+          ) as {
+            validationStage?: string;
+            failureCode?: string;
+            topology?: {
+              status?: string;
+              recordCount?: number;
+              rootCount?: number;
+              structuralHeadCount?: number;
+              weakComponentCount?: number;
+              missingParentReferenceCount?: number;
+            };
+          };
+          assert.equal(diagnostic.validationStage, 'ancestry');
+          assert.equal(diagnostic.failureCode, 'presence-missing-parent');
+          assert.equal(diagnostic.topology?.status, 'invalid');
+          assert.equal(diagnostic.topology?.recordCount, 2);
+          assert.equal(diagnostic.topology?.rootCount, 1);
+          assert.equal(diagnostic.topology?.structuralHeadCount, 2);
+          assert.equal(diagnostic.topology?.weakComponentCount, 2);
+          assert.equal(diagnostic.topology?.missingParentReferenceCount, 1);
+          const redacted = stableStringify(diagnostic);
+          assert.equal(redacted.includes(documentId), false);
+          assert.equal(redacted.includes(orphan.record.generation.id), false);
+          assert.equal(redacted.includes('0'.repeat(64)), false);
+          return true;
+        },
+      );
+      await assert.rejects(
+        () => fixture.repository.discoverPapers([documentId], [fixture.state], signal),
+        (error: unknown) => {
+          assert.equal(Reflect.get(error as object, 'code'), 'paper-presence-invalid');
+          assert.equal(Reflect.get(error as object, 'documentId'), documentId);
+          assert.equal(
+            Reflect.get(error as object, 'diagnosticPresenceResolutionScope'),
+            'document',
+          );
+          return true;
+        },
+      );
+      assert.equal(fixture.drive.writes.length, 0);
+    },
+  );
 
   await context.test('failure before removed publication changes nothing', async () => {
     const fixture = await publishedFixture('doc-a', 'Paper A');
@@ -5988,6 +6334,13 @@ class MemoryDrive extends DriveClient {
       throw error;
     }
     return (await this.downloadBlobWithoutCount(fileId)).text();
+  }
+
+  override async downloadTexts(
+    requests: readonly { fileId: string }[],
+    signal: AbortSignal,
+  ): Promise<Map<string, string>> {
+    return super.downloadTexts(requests, signal);
   }
 
   private async downloadBlobWithoutCount(fileId: string): Promise<Blob> {

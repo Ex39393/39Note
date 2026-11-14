@@ -21,8 +21,8 @@ import {
   createPaperPresenceGeneration,
   inspectPaperPresenceAncestry,
   parsePaperPresenceGeneration,
-  resolvePaperPresence,
   verifyPaperPresenceGeneration,
+  PaperPresenceIntegrityError,
   type PaperPresenceAncestryDiagnostic,
   type PaperPresenceAncestryFailureCode,
   type PaperPresenceGeneration,
@@ -38,6 +38,7 @@ import {
   type SupportedPaperSyncProtocolVersion,
 } from './paperTypes.ts';
 import { PAPER_METADATA_CONCURRENCY, mapWithConcurrency } from './syncConcurrency.ts';
+import type { PaperVerificationCacheEntry } from './paperVerificationCache.ts';
 
 const FOLDER_MIME = 'application/vnd.google-apps.folder';
 
@@ -107,12 +108,21 @@ export interface PaperPresenceFile {
 }
 
 export class PaperV3ControlIntegrityError extends Error {
+  readonly failureCode?: TargetedPurgePresenceValidationFailureCode;
+  readonly ancestryDiagnostic?: TargetedPurgePresenceAncestryDiagnostic;
+
   constructor(
     message: string,
     readonly documentId?: string,
+    diagnostic?: {
+      failureCode?: TargetedPurgePresenceValidationFailureCode;
+      ancestryDiagnostic?: TargetedPurgePresenceAncestryDiagnostic;
+    },
   ) {
     super(message);
     this.name = 'PaperV3ControlIntegrityError';
+    this.failureCode = diagnostic?.failureCode;
+    this.ancestryDiagnostic = diagnostic?.ancestryDiagnostic;
   }
 }
 
@@ -133,7 +143,7 @@ class PaperPresenceProtocolBoundaryError extends PaperV3ControlIntegrityError {
     documentId: string | undefined,
     code: PaperPresenceProtocolBoundaryFailureCode,
   ) {
-    super(message, documentId);
+    super(message, documentId, { failureCode: code });
     this.name = 'PaperPresenceProtocolBoundaryError';
     this.code = code;
   }
@@ -249,8 +259,46 @@ export class PaperPresenceDriveRepository {
     private readonly drive: DriveClient,
     readonly rootFolderId: string,
     private readonly now: () => number = Date.now,
+    private readonly persistVerifiedCacheEntries?: (
+      entries: readonly PaperVerificationCacheEntry[],
+    ) => Promise<void>,
   ) {
     if (!isSafeDriveId(rootFolderId)) throw new Error('Invalid Drive root identity.');
+  }
+
+  /**
+   * Revalidates untrusted local cache bodies before admitting them to the
+   * in-memory acceleration map. Fresh Drive metadata is still mandatory at
+   * reuse time, so this cannot create or select remote ancestry.
+   */
+  async hydrateVerifiedCache(
+    entries: readonly PaperVerificationCacheEntry[],
+  ): Promise<void> {
+    for (const entry of entries) {
+      if (entry.kind !== 'presence') continue;
+      try {
+        const record = parsePaperPresenceGeneration(entry.text);
+        if (
+          entry.text !== stableStringify(record) ||
+          !(await verifyPaperPresenceGeneration(record)) ||
+          !sameImmutablePresenceEvidence(entry.file, entry.file) ||
+          !isPresenceMetadata(
+            entry.file,
+            record.controlFolderId,
+            this.rootFolderId,
+            record,
+          )
+        ) {
+          continue;
+        }
+        this.verifiedPresenceFiles.set(entry.file.id, {
+          file: entry.file,
+          record,
+        });
+      } catch {
+        // Cache corruption is a miss, never a remote integrity failure.
+      }
+    }
   }
 
   async createOrVerifyControlFolder(
@@ -423,20 +471,32 @@ export class PaperPresenceDriveRepository {
     for (const [documentId, generations] of [...grouped.entries()].sort(
       ([first], [second]) => compareCanonicalStrings(first, second),
     )) {
-      try {
-        resolved.set(documentId, {
-          ...(await resolvePaperPresence(generations)),
-          managedFileIds: records
-            .filter(({ record }) => record.documentId === documentId)
-            .map(({ file }) => file.id)
-            .sort(compareCanonicalStrings),
-        });
-      } catch (error) {
+      const ancestry = await inspectPaperPresenceAncestry(generations);
+      if (!ancestry.resolved) {
+        const failureCode =
+          ancestry.diagnostic.failureCode === 'none'
+            ? 'presence-unexpected-validation-error'
+            : ancestry.diagnostic.failureCode;
         throw new PaperV3ControlIntegrityError(
-          error instanceof Error ? error.message : 'Paper presence is invalid.',
+          'The verified presence records do not form one complete, valid ancestry graph.',
           documentId,
+          {
+            failureCode,
+            ancestryDiagnostic: targetedPurgePresenceAncestryDiagnostic(
+              'ancestry',
+              failureCode,
+              ancestry.diagnostic,
+            ),
+          },
         );
       }
+      resolved.set(documentId, {
+        ...ancestry.resolved,
+        managedFileIds: records
+          .filter(({ record }) => record.documentId === documentId)
+          .map(({ file }) => file.id)
+          .sort(compareCanonicalStrings),
+      });
     }
     return resolved;
   }
@@ -461,19 +521,31 @@ export class PaperPresenceDriveRepository {
     );
     if (ignoredDocumentIds.has(documentId)) return null;
     if (records.length === 0) return null;
-    try {
-      return {
-        ...(await resolvePaperPresence(records.map(({ record }) => record))),
-        managedFileIds: records
-          .map(({ file }) => file.id)
-          .sort(compareCanonicalStrings),
-      };
-    } catch (error) {
+    const ancestry = await inspectPaperPresenceAncestry(
+      records.map(({ record }) => record),
+    );
+    if (!ancestry.resolved) {
+      const failureCode =
+        ancestry.diagnostic.failureCode === 'none'
+          ? 'presence-unexpected-validation-error'
+          : ancestry.diagnostic.failureCode;
       throw new PaperV3ControlIntegrityError(
-        error instanceof Error ? error.message : 'Paper presence is invalid.',
+        'The verified presence records do not form one complete, valid ancestry graph.',
         documentId,
+        {
+          failureCode,
+          ancestryDiagnostic: targetedPurgePresenceAncestryDiagnostic(
+            'ancestry',
+            failureCode,
+            ancestry.diagnostic,
+          ),
+        },
       );
     }
+    return {
+      ...ancestry.resolved,
+      managedFileIds: records.map(({ file }) => file.id).sort(compareCanonicalStrings),
+    };
   }
 
   /**
@@ -1604,19 +1676,29 @@ export class PaperPresenceDriveRepository {
         resource: 'presence',
       }),
     );
-    const loaded = await mapWithConcurrency(
-      files,
-      PAPER_METADATA_CONCURRENCY,
-      async (file): Promise<PaperPresenceFile> => {
+    const prepared = await Promise.all(
+      files.map(async (file) => {
         signal.throwIfAborted();
         const pending = this.pendingPresenceFiles.get(file.id);
         const pendingFile = pending ? await pending : undefined;
-        const cached =
+        const candidate =
           pendingFile && sameImmutablePresenceEvidence(pendingFile.file, file)
             ? pendingFile
             : this.verifiedPresenceFiles.get(file.id);
+        const cached =
+          candidate && sameImmutablePresenceEvidence(candidate.file, file)
+            ? candidate
+            : undefined;
+        return { file, cached };
+      }),
+    );
+    const loaded = await mapWithConcurrency(
+      prepared,
+      PAPER_METADATA_CONCURRENCY,
+      async ({ file, cached }): Promise<PaperPresenceFile> => {
+        signal.throwIfAborted();
         let record = cached?.record;
-        if (!cached || !sameImmutablePresenceEvidence(cached.file, file)) {
+        if (!cached) {
           const text = await this.drive.downloadText(file.id, signal, {
             phase: 'presence-verification',
             resource: 'presence',
@@ -1627,6 +1709,17 @@ export class PaperPresenceDriveRepository {
             this.verifiedPresenceFiles.delete(file.id);
             throw new PaperV3ControlIntegrityError(
               error instanceof Error ? error.message : 'Paper presence is invalid.',
+              error instanceof PaperPresenceIntegrityError
+                ? error.documentId
+                : undefined,
+              error instanceof PaperPresenceIntegrityError
+                ? {
+                    failureCode:
+                      error.code === 'none'
+                        ? 'presence-unexpected-validation-error'
+                        : error.code,
+                  }
+                : { failureCode: 'presence-unexpected-validation-error' },
             );
           }
           if (!(await verifyPaperPresenceGeneration(record))) {
@@ -1634,6 +1727,7 @@ export class PaperPresenceDriveRepository {
             throw new PaperV3ControlIntegrityError(
               'A paper-presence record failed immutable verification.',
               record.documentId,
+              { failureCode: 'presence-record-integrity-failed' },
             );
           }
         }
@@ -1645,20 +1739,48 @@ export class PaperPresenceDriveRepository {
           throw new PaperV3ControlIntegrityError(
             'A paper-presence record has invalid Drive metadata or content.',
             record?.documentId,
+            { failureCode: 'presence-record-invalid' },
           );
         }
         this.verifiedPresenceFiles.set(file.id, { file, record });
+        if (!cached && this.persistVerifiedCacheEntries) {
+          // A failed or timed-out read must retain each completed immutable
+          // verification, even when later records in this control area have
+          // not been downloaded yet. This local hint remains non-authoritative.
+          await this.persistVerifiedCacheEntries([
+            { kind: 'presence', file, text: stableStringify(record) },
+          ]);
+        }
         return { file, record };
       },
     );
     const sorted = loaded.sort((first, second) =>
       compareCanonicalStrings(first.record.generation.id, second.record.generation.id),
     );
-    this.assertPresenceProtocolBoundary(
-      sorted,
-      documentId,
-      validatedIgnoredDocumentIds(options.ignoredDocumentIds),
-    );
+    try {
+      this.assertPresenceProtocolBoundary(
+        sorted,
+        documentId,
+        validatedIgnoredDocumentIds(options.ignoredDocumentIds),
+      );
+    } catch (error) {
+      if (error instanceof PaperPresenceProtocolBoundaryError && error.documentId) {
+        const ancestry = await inspectPaperPresenceAncestry(
+          sorted
+            .filter(({ record }) => record.documentId === error.documentId)
+            .map(({ record }) => record),
+        );
+        throw new PaperV3ControlIntegrityError(error.message, error.documentId, {
+          failureCode: error.code,
+          ancestryDiagnostic: targetedPurgePresenceAncestryDiagnostic(
+            'protocol-boundary',
+            error.code,
+            ancestry.diagnostic,
+          ),
+        });
+      }
+      throw error;
+    }
     return sorted;
   }
 

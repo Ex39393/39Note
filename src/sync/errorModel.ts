@@ -85,6 +85,28 @@ export interface SyncIssueDiagnostic {
   phase?: string;
   causeCode?: string;
   documentId?: string;
+  presenceFailureCode?: string;
+  presenceTopology?: {
+    validationStage: 'ancestry' | 'protocol-boundary' | 'targeted-purge-safety';
+    status: 'valid' | 'invalid';
+    recordCount: number;
+    uniqueGenerationCount: number;
+    rootCount: number;
+    structuralHeadCount: number;
+    resolvedAuthoritativeHeadCount: number | null;
+    weakComponentCount: number;
+    missingParentReferenceCount: number;
+    records: Array<{
+      ordinal: number;
+      state: 'present' | 'removed';
+      intent: 'migration' | 'upload' | 'remove' | 'restore';
+      parentOrdinals: number[];
+      missingParentCount: number;
+      childCount: number;
+      root: boolean;
+      structuralHead: boolean;
+    }>;
+  };
   paperName?: string;
   expectedSemanticPartition?: string;
   actualSemanticPartitions?: string[];

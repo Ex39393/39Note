@@ -1793,7 +1793,7 @@ async function verifyResponsiveReaderFixture(cdpClient, origin) {
         details: document.querySelector('#details')?.textContent ?? null,
         fixture: globalThis.__39noteResponsiveReaderFixture ?? null,
         viewportWidth: innerWidth,
-        documentWidth: document.documentElement.scrollWidth,
+        documentWidth: document.documentElement?.scrollWidth ?? null,
         sidebar: rect(sidebar),
         inner: rect(inner),
         toolbarDrawerDisplay:
