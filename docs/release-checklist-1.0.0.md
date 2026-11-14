@@ -23,12 +23,13 @@ Automated checks used synthetic data and did not access real Google Drive.
 The user completed two real read-only checks on the local build on 2026-11-14
 without another timeout. The UI reported a 16:40 Drive check, 26 ordinary cloud
 papers, one locally ignored cloud issue, zero changes waiting, and one paper
-with a Drive update available. Connected is expected until that update is
-reviewed. This observation does not establish cross-device convergence.
+with a Drive update available. The user then downloaded only that update and
+confirmed that the local status became Synced. This observation does not
+establish cross-device convergence.
 
-- [ ] Review the single available Drive update on the local build, then confirm
-      the resulting status and cloud-paper count. The two read-only checks above
-      verified this account's current scan path but did not transfer that update.
+- [x] Review the single available Drive update on the local build and confirm
+      Synced. The two read-only checks above verified this account's current scan
+      path, and the selected download completed the pending transfer.
 - [ ] Review the follow-up pull request and its CI checks, merge, and explicitly
       deploy the updated Pages build. This change set does not modify the Sync
       Worker.
