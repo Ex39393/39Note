@@ -99,6 +99,7 @@ let shouldShowRemoteUpdateRecommendation: (typeof import('../src/sync/PaperSyncC
 let targetedPaperPurgeCandidate: (typeof import('../src/sync/PaperSyncControl.tsx'))['targetedPaperPurgeCandidate'];
 let shouldOfferForgetIdentityVerification: (typeof import('../src/sync/PaperSyncControl.tsx'))['shouldOfferForgetIdentityVerification'];
 let getPaperSyncUiStatus: (typeof import('../src/sync/paperCoordinator.ts'))['getPaperSyncUiStatus'];
+let verifiedDriveCheckAt: (typeof import('../src/sync/paperCoordinator.ts'))['verifiedDriveCheckAt'];
 let getBlockingPaperIssueCount: (typeof import('../src/sync/paperCoordinator.ts'))['getBlockingPaperIssueCount'];
 let PaperGoogleDriveSyncCoordinator: (typeof import('../src/sync/paperCoordinator.ts'))['PaperGoogleDriveSyncCoordinator'];
 let DeviceModeSelectionRequiredError: (typeof import('../src/sync/paperCoordinator.ts'))['DeviceModeSelectionRequiredError'];
@@ -138,9 +139,11 @@ let deletePaperSyncRecords: (typeof import('../src/sync/storage.ts'))['deletePap
 let loadPaperSyncStates: (typeof import('../src/sync/storage.ts'))['loadPaperSyncStates'];
 let loadCloudPaperCatalog: (typeof import('../src/sync/storage.ts'))['loadCloudPaperCatalog'];
 let loadPaperSyncDeviceProfile: (typeof import('../src/sync/storage.ts'))['loadPaperSyncDeviceProfile'];
+let loadPaperDriveVerificationCache: (typeof import('../src/sync/storage.ts'))['loadPaperDriveVerificationCache'];
 let saveCloudPaperCatalog: (typeof import('../src/sync/storage.ts'))['saveCloudPaperCatalog'];
 let savePaperSyncState: (typeof import('../src/sync/storage.ts'))['savePaperSyncState'];
 let savePaperSyncDeviceProfile: (typeof import('../src/sync/storage.ts'))['savePaperSyncDeviceProfile'];
+let savePaperDriveVerificationCache: (typeof import('../src/sync/storage.ts'))['savePaperDriveVerificationCache'];
 let PUBLIC_DEVICE_LIMITATION: string;
 
 before(async () => {
@@ -314,6 +317,7 @@ before(async () => {
   targetedPaperPurgeCandidate = ui.targetedPaperPurgeCandidate;
   shouldOfferForgetIdentityVerification = ui.shouldOfferForgetIdentityVerification;
   getPaperSyncUiStatus = coordinator.getPaperSyncUiStatus;
+  verifiedDriveCheckAt = coordinator.verifiedDriveCheckAt;
   getBlockingPaperIssueCount = coordinator.getBlockingPaperIssueCount;
   PaperGoogleDriveSyncCoordinator = coordinator.PaperGoogleDriveSyncCoordinator;
   DeviceModeSelectionRequiredError = coordinator.DeviceModeSelectionRequiredError;
@@ -356,9 +360,11 @@ before(async () => {
   loadPaperSyncStates = syncStorage.loadPaperSyncStates;
   loadCloudPaperCatalog = syncStorage.loadCloudPaperCatalog;
   loadPaperSyncDeviceProfile = syncStorage.loadPaperSyncDeviceProfile;
+  loadPaperDriveVerificationCache = syncStorage.loadPaperDriveVerificationCache;
   saveCloudPaperCatalog = syncStorage.saveCloudPaperCatalog;
   savePaperSyncState = syncStorage.savePaperSyncState;
   savePaperSyncDeviceProfile = syncStorage.savePaperSyncDeviceProfile;
+  savePaperDriveVerificationCache = syncStorage.savePaperDriveVerificationCache;
   PUBLIC_DEVICE_LIMITATION = temporary.PUBLIC_DEVICE_LIMITATION;
 });
 
@@ -640,6 +646,69 @@ test('per-paper state transitions and selection semantics are deterministic', as
     assert.equal(getPaperSyncUiStatus(state), 'connected');
     assert.notEqual(getPaperSyncUiStatus(state), 'pending');
   });
+
+  await context.test(
+    'verified Drive text cache is durable and strictly account-root scoped',
+    async () => {
+      const entry = {
+        kind: 'manifest' as const,
+        file: {
+          id: 'durable-cache-file',
+          name: 'paper-manifest-generation.json',
+          mimeType: 'application/json',
+          parents: ['durable-cache-data-folder'],
+          appProperties: {
+            application: '39Note',
+            role: 'paper-manifest-generation',
+            documentId: 'durable-cache-document',
+            generationId: 'a'.repeat(64),
+          },
+          modifiedTime: '2026-11-13T00:00:00.000Z',
+          md5Checksum: 'b'.repeat(32),
+          version: '1',
+          size: '2',
+          trashed: false,
+          ownedByMe: true,
+        },
+        text: '{}',
+      };
+      await savePaperDriveVerificationCache('cache-account', 'cache-root', [entry]);
+      assert.deepEqual(
+        await loadPaperDriveVerificationCache('cache-account', 'cache-root'),
+        [entry],
+      );
+      assert.deepEqual(
+        await loadPaperDriveVerificationCache('another-account', 'cache-root'),
+        [],
+      );
+      assert.deepEqual(
+        await loadPaperDriveVerificationCache('cache-account', 'another-root'),
+        [],
+      );
+
+      const secondScopeEntry = {
+        ...entry,
+        text: '{"scope":2}',
+      };
+      await savePaperDriveVerificationCache(
+        'second-cache-account',
+        'second-cache-root',
+        [secondScopeEntry],
+      );
+      assert.deepEqual(
+        await loadPaperDriveVerificationCache('cache-account', 'cache-root'),
+        [entry],
+        'the same file identity in another scope must not evict this cache',
+      );
+      assert.deepEqual(
+        await loadPaperDriveVerificationCache(
+          'second-cache-account',
+          'second-cache-root',
+        ),
+        [secondScopeEntry],
+      );
+    },
+  );
 });
 
 test('remote update recommendation separates persisted dismissal from reconciliation', async (context) => {
@@ -1051,6 +1120,28 @@ test('paper-selective sync UI stays compact, honest, and accessible', async (con
   });
 
   await context.test(
+    'a progressing hard-cap audit is paused and resumable rather than labelled offline',
+    () => {
+      const issue = classifyPaperCoordinatorError(
+        new DriveOperationTimeoutError('scan', 5 * 60_000, false, true),
+      );
+      const state = viewState({
+        connection: 'connected',
+        lastSuccessfulAt: 10,
+        issue,
+        error: issue.message,
+      });
+      assert.equal(readerPaperSyncLabel(state), 'Drive verification paused');
+      assert.equal(getPaperSyncUiStatus(state), 'pending');
+      const html = renderDrawer(state);
+      assert.match(html, /Drive verification paused/u);
+      assert.match(html, /local audit starting point was retained/u);
+      assert.match(html, /Check Drive again \(read-only\)/u);
+      assert.doesNotMatch(html, />Offline</u);
+    },
+  );
+
+  await context.test(
     'Home section changes and unchanged reconnect scans cannot recreate an episode',
     () => {
       const sessionSeenStateIds = new Set<string>();
@@ -1115,6 +1206,49 @@ test('paper-selective sync UI stays compact, honest, and accessible', async (con
     const html = renderDrawer(viewState({ lastSuccessfulAt: 10 }));
     assert.match(html, /role="status">Synced</u);
   });
+
+  await context.test(
+    'a completed read-only Drive check makes an empty clean workspace visibly settled',
+    () => {
+      const state = viewState({ lastVerifiedDriveAt: 20 });
+      assert.equal(getPaperSyncUiStatus(state), 'synced');
+      assert.equal(readerPaperSyncLabel(state), 'Synced');
+      const html = renderDrawer(state);
+      assert.match(html, /role="status">Synced</u);
+      assert.match(html, /Last Drive check:/u);
+      assert.doesNotMatch(html, /Last synced:/u);
+      assert.match(html, /Upload changes[^<]*<\/button>/u);
+      assert.doesNotMatch(html, /Retry now/u);
+    },
+  );
+
+  await context.test(
+    'a clean Connected workspace with no verified check offers one read-only way forward',
+    () => {
+      const html = renderDrawer(viewState());
+      assert.match(html, /role="status">Connected</u);
+      assert.match(html, />Check Drive \(read-only\)<\/button>/u);
+      assert.doesNotMatch(html, /Last Drive check:/u);
+      assert.doesNotMatch(html, /Retry now/u);
+    },
+  );
+
+  await context.test(
+    'Connected with a past sync and pending cloud update still offers a read-only check',
+    () => {
+      const state = remoteUpdateView(['doc-a']);
+      state.reminder = undefined;
+      state.lastVerifiedDriveAt = 20;
+      assert.equal(getPaperSyncUiStatus(state), 'connected');
+      const html = renderDrawer(state);
+      assert.match(html, /role="status">Connected</u);
+      assert.match(html, /Last synced:/u);
+      assert.match(html, /Last Drive check:/u);
+      assert.match(html, /Drive updates are available for 1 paper/u);
+      assert.match(html, />Check Drive again \(read-only\)<\/button>/u);
+      assert.doesNotMatch(html, />Retry now<\/button>/u);
+    },
+  );
 
   await context.test(
     'development Retry diagnostics expose redacted repository and settlement state',
@@ -1406,6 +1540,194 @@ test('paper-selective sync UI stays compact, honest, and accessible', async (con
         renderDrawer(viewState({ connection: 'attention' }), true),
         /Preview targeted purge/u,
       );
+    },
+  );
+
+  await context.test(
+    'production Details exposes one exact presence target and redacted topology counts',
+    () => {
+      const documentId = 'pdfjs:production-presence-target';
+      const issue = classifyPaperCoordinatorError(
+        new PaperRepositoryError(
+          'paper-presence-invalid',
+          'Drive paper presence data needs verification.',
+          {
+            diagnosticPhase: 'paper-presence-resolution',
+            diagnosticCauseCode: 'presence-control-resolution-failed',
+            diagnosticDocumentId: documentId,
+            diagnosticPresenceFailureCode: 'presence-missing-parent',
+            diagnosticPresenceAncestry: {
+              schemaVersion: 1,
+              mode: 'read-only',
+              validationStage: 'ancestry',
+              failureCode: 'presence-missing-parent',
+              ordering: { timestamps: 'ignored', driveListing: 'ignored' },
+              topology: {
+                status: 'invalid',
+                failureCode: 'presence-missing-parent',
+                recordCount: 2,
+                uniqueGenerationCount: 2,
+                rootCount: 1,
+                structuralHeadCount: 2,
+                weakComponentCount: 2,
+                missingParentReferenceCount: 1,
+                records: [
+                  {
+                    ordinal: 1,
+                    state: 'present',
+                    intent: 'upload',
+                    parentOrdinals: [],
+                    missingParentCount: 0,
+                    childCount: 0,
+                    root: true,
+                    structuralHead: true,
+                  },
+                  {
+                    ordinal: 2,
+                    state: 'removed',
+                    intent: 'remove',
+                    parentOrdinals: [],
+                    missingParentCount: 1,
+                    childCount: 0,
+                    root: false,
+                    structuralHead: true,
+                  },
+                ],
+              },
+            },
+          },
+        ),
+      );
+      assert.equal(issue.diagnostic.documentId, documentId);
+      assert.equal(issue.diagnostic.presenceFailureCode, 'presence-missing-parent');
+      assert.deepEqual(issue.diagnostic.presenceTopology, {
+        validationStage: 'ancestry',
+        status: 'invalid',
+        recordCount: 2,
+        uniqueGenerationCount: 2,
+        rootCount: 1,
+        structuralHeadCount: 2,
+        resolvedAuthoritativeHeadCount: null,
+        weakComponentCount: 2,
+        missingParentReferenceCount: 1,
+        records: [
+          {
+            ordinal: 1,
+            state: 'present',
+            intent: 'upload',
+            parentOrdinals: [],
+            missingParentCount: 0,
+            childCount: 0,
+            root: true,
+            structuralHead: true,
+          },
+          {
+            ordinal: 2,
+            state: 'removed',
+            intent: 'remove',
+            parentOrdinals: [],
+            missingParentCount: 1,
+            childCount: 0,
+            root: false,
+            structuralHead: true,
+          },
+        ],
+      });
+
+      const drawer = renderDrawer(viewState({ connection: 'attention', issue }), true);
+      assert.match(
+        drawer,
+        /Affected document ID<\/dt><dd>pdfjs:production-presence-target/u,
+      );
+      assert.match(drawer, /Presence failure code<\/dt><dd>presence-missing-parent/u);
+      assert.match(drawer, /Presence validation stage<\/dt><dd>ancestry/u);
+      assert.match(drawer, /Presence records<\/dt><dd>2 reviewed \/ 2 unique/u);
+      assert.match(drawer, /Presence roots<\/dt><dd>1/u);
+      assert.match(drawer, /Observed structural heads<\/dt><dd>2/u);
+      assert.match(drawer, /Resolved authoritative heads<\/dt><dd>Unavailable/u);
+      assert.match(drawer, /Presence components<\/dt><dd>2/u);
+      assert.match(drawer, /Missing parent references<\/dt><dd>1/u);
+      assert.match(drawer, /Redacted presence records/u);
+      assert.match(
+        drawer,
+        /R1: present · upload · parents none · missing 0 · children 0 · root yes · structural head yes/u,
+      );
+      assert.match(
+        drawer,
+        /R2: removed · remove · parents none · missing 1 · children 0 · root no · structural head yes/u,
+      );
+      assert.doesNotMatch(drawer, /generationId|controlFolderId|paperFolderId/iu);
+    },
+  );
+
+  await context.test(
+    'protocol-boundary failures keep observed heads separate from unavailable resolved heads',
+    () => {
+      const generationHash = 'a'.repeat(64);
+      const issue = classifyPaperCoordinatorError(
+        new PaperRepositoryError(
+          'paper-presence-invalid',
+          'Drive paper presence data needs verification.',
+          {
+            diagnosticPhase: 'paper-presence-resolution',
+            diagnosticCauseCode: 'presence-control-resolution-failed',
+            diagnosticDocumentId: 'pdfjs:protocol-boundary-target',
+            diagnosticPresenceFailureCode: 'presence-crosses-cutover-boundary',
+            diagnosticPresenceResolutionScope: 'all',
+            diagnosticPresenceAncestry: {
+              schemaVersion: 1,
+              mode: 'read-only',
+              validationStage: 'protocol-boundary',
+              failureCode: 'presence-crosses-cutover-boundary',
+              ordering: { timestamps: 'ignored', driveListing: 'ignored' },
+              topology: {
+                status: 'valid',
+                recordCount: 2,
+                uniqueGenerationCount: 2,
+                rootCount: 1,
+                structuralHeadCount: 1,
+                weakComponentCount: 1,
+                missingParentReferenceCount: 0,
+                records: [
+                  {
+                    ordinal: 1,
+                    state: 'present',
+                    intent: 'upload',
+                    parentOrdinals: [],
+                    missingParentCount: 0,
+                    childCount: 1,
+                    root: true,
+                    structuralHead: false,
+                  },
+                  {
+                    ordinal: 2,
+                    state: 'present',
+                    intent: 'upload',
+                    parentOrdinals: [1],
+                    missingParentCount: 0,
+                    childCount: 0,
+                    root: false,
+                    structuralHead: true,
+                  },
+                ],
+              },
+            },
+          },
+        ),
+      );
+
+      assert.equal(
+        issue.diagnostic.presenceTopology?.resolvedAuthoritativeHeadCount,
+        null,
+      );
+      const drawer = renderDrawer(viewState({ connection: 'attention', issue }), true);
+      assert.match(drawer, /Observed structural heads<\/dt><dd>1/u);
+      assert.match(drawer, /Resolved authoritative heads<\/dt><dd>Unavailable/u);
+      assert.match(
+        drawer,
+        /R2: present · upload · parents R1 · missing 0 · children 0 · root no · structural head yes/u,
+      );
+      assert.doesNotMatch(drawer, new RegExp(generationHash, 'u'));
     },
   );
 
@@ -2816,7 +3138,11 @@ test('paper-selective sync UI stays compact, honest, and accessible', async (con
         );
         coordinator = await reopen();
         const reviewedProfile = await loadPaperSyncDeviceProfile();
-        assert.deepEqual(reviewedProfile.driveChangeCursor, retainedCursor);
+        assert.equal(reviewedProfile.driveChangeCursor, undefined);
+        assert.equal(
+          reviewedProfile.cloudIssueQuarantines?.[0]?.revalidationPending,
+          true,
+        );
         assert.equal(reviewedProfile.cloudIssueQuarantines?.length, 1);
         assert.equal(
           typeof reviewedProfile.cloudIssueQuarantines?.[0]?.reviewedAt,
@@ -2883,10 +3209,7 @@ test('paper-selective sync UI stays compact, honest, and accessible', async (con
           (await loadPaperSyncDeviceProfile()).cloudIssueQuarantines?.[0]?.reviewedAt,
           undefined,
         );
-        assert.deepEqual(
-          (await loadPaperSyncDeviceProfile()).driveChangeCursor,
-          retainedCursor,
-        );
+        assert.equal((await loadPaperSyncDeviceProfile()).driveChangeCursor, undefined);
         assert.deepEqual(await loadCloudPaperCatalog(), catalogBeforeRequarantine);
 
         const finalRefreshStateView = Reflect.get(coordinator, 'refreshStateView') as (
@@ -5764,6 +6087,269 @@ test('device choice and account ownership fail closed before Drive work', async 
   );
 });
 
+test('a read-only Drive check commits a clean status that survives reload', async () => {
+  await closeSyncPersistenceWorkspace();
+  const previousDatabase = securityDatabaseRecords.get('39note-sync');
+  securityDatabaseRecords.delete('39note-sync');
+  try {
+    const configuredProfile: PaperSyncDeviceProfile = {
+      id: 'paper-device',
+      deviceId: 'synthetic-check-device',
+      deviceLabel: 'Synthetic check device',
+      deviceMode: 'personal',
+      deviceModeChoiceConfirmed: true,
+      autoSync: false,
+      accountId: 'synthetic-check-account',
+      workspaceAccountId: 'synthetic-check-account',
+      rootFolderId: 'synthetic-check-root',
+    };
+    await savePaperSyncDeviceProfile(configuredProfile, {
+      authentication: 'replace',
+    });
+
+    const instance = new PaperGoogleDriveSyncCoordinator({ notify() {} });
+    Reflect.set(instance, 'profile', configuredProfile);
+    Reflect.set(instance, 'identity', {
+      hasDeviceSession: true,
+      accountId: configuredProfile.accountId,
+    });
+    Reflect.set(instance, 'view', viewState({ autoSync: false }));
+    const driveReads: string[] = [];
+    Reflect.set(instance, 'drive', {
+      async getStartPageToken() {
+        driveReads.push('start-token');
+        return 'synthetic-start-token';
+      },
+      async listChanges(pageToken: string) {
+        driveReads.push(`changes:${pageToken}`);
+        return {
+          changes: [],
+          newStartPageToken: 'synthetic-committed-token',
+          pages: 1,
+        };
+      },
+    });
+    const signal = new AbortController().signal;
+    Reflect.set(instance, 'beginOperation', async () => signal);
+    Reflect.set(instance, 'endOperation', () => undefined);
+    Reflect.set(instance, 'requireWorkspaceLease', () => undefined);
+    Reflect.set(instance, 'waitForLocalRemovalSettlement', async () => undefined);
+    Reflect.set(instance, 'reconcileLocalPaperStates', async () => undefined);
+    Reflect.set(instance, 'applyDiscovery', async () => undefined);
+    Reflect.set(instance, 'ensureVerifiedRepositoryReadOnly', async () => ({
+      rootFolderId: 'synthetic-check-root',
+      async assertActiveRoot() {
+        driveReads.push('validate-root');
+      },
+      async discover() {
+        driveReads.push('discover');
+        return [];
+      },
+    }));
+
+    assert.equal(getPaperSyncUiStatus(instance.getSnapshot()), 'connected');
+    assert.match(renderDrawer(instance.getSnapshot()), /Check Drive \(read-only\)/u);
+    await instance.checkDriveAgainReadOnly();
+    assert.deepEqual(driveReads, [
+      'start-token',
+      'validate-root',
+      'discover',
+      'changes:synthetic-start-token',
+    ]);
+    assert.equal(getPaperSyncUiStatus(instance.getSnapshot()), 'synced');
+    assert.equal(instance.getSnapshot().lastSuccessfulAt, undefined);
+
+    await closeSyncPersistenceWorkspace();
+    const reopenedProfile = await loadPaperSyncDeviceProfile();
+    assert.equal(
+      reopenedProfile.driveChangeCursor?.pageToken,
+      'synthetic-committed-token',
+    );
+    assert.equal(reopenedProfile.driveAuditCheckpoint, undefined);
+    const reopened = viewState({
+      autoSync: false,
+      lastVerifiedDriveAt: verifiedDriveCheckAt(reopenedProfile),
+    });
+    assert.equal(reopened.lastVerifiedDriveAt, reopenedProfile.lastDiscoveryAt);
+    assert.equal(getPaperSyncUiStatus(reopened), 'synced');
+    assert.match(renderDrawer(reopened), /Last Drive check:/u);
+    assert.doesNotMatch(renderDrawer(reopened), /Check Drive \(read-only\)/u);
+  } finally {
+    await closeSyncPersistenceWorkspace();
+    if (previousDatabase) {
+      securityDatabaseRecords.set('39note-sync', previousDatabase);
+    } else {
+      securityDatabaseRecords.delete('39note-sync');
+    }
+  }
+});
+
+test('reviewing an ignored issue after a successful baseline requires durable revalidation', async () => {
+  await closeSyncPersistenceWorkspace();
+  const previousDatabase = securityDatabaseRecords.get('39note-sync');
+  securityDatabaseRecords.delete('39note-sync');
+  try {
+    const documentId = 'synthetic-reviewed-broken-paper';
+    const accountId = 'synthetic-reviewed-account';
+    const rootFolderId = 'synthetic-reviewed-root';
+    const brokenPaper: PaperCloudSummary = {
+      ...cloudPaper(documentId, 'stale-head'),
+      status: 'needs-attention',
+    };
+    const healthyPaper = cloudPaper(documentId, 'verified-head');
+    const configuredProfile: PaperSyncDeviceProfile = {
+      id: 'paper-device',
+      deviceId: 'synthetic-reviewed-device',
+      deviceLabel: 'Synthetic reviewed device',
+      deviceMode: 'personal',
+      deviceModeChoiceConfirmed: true,
+      autoSync: false,
+      accountId,
+      workspaceAccountId: accountId,
+      rootFolderId,
+      cloudIssueQuarantines: [
+        {
+          version: 1,
+          documentId,
+          accountId,
+          rootFolderId,
+          reason: 'presence-control-resolution-failed',
+          confirmedAt: Date.now() - 1000,
+        },
+      ],
+    };
+    await savePaperSyncDeviceProfile(configuredProfile, {
+      authentication: 'replace',
+    });
+    await saveCloudPaperCatalog([brokenPaper]);
+
+    const instance = new PaperGoogleDriveSyncCoordinator({ notify() {} });
+    Reflect.set(instance, 'profile', configuredProfile);
+    Reflect.set(instance, 'identity', { hasDeviceSession: true, accountId });
+    Reflect.set(
+      instance,
+      'view',
+      viewState({
+        autoSync: false,
+        papers: [brokenPaper],
+        ignoredCloudIssues: [
+          {
+            documentId,
+            displayName: brokenPaper.displayName,
+            confirmedAt: configuredProfile.cloudIssueQuarantines![0]!.confirmedAt,
+          },
+        ],
+      }),
+    );
+    const signal = new AbortController().signal;
+    Reflect.set(instance, 'beginOperation', async () => signal);
+    Reflect.set(instance, 'endOperation', () => undefined);
+    Reflect.set(instance, 'requireWorkspaceLease', () => undefined);
+    Reflect.set(instance, 'waitForLocalRemovalSettlement', async () => undefined);
+    Reflect.set(instance, 'reconcileLocalPaperStates', async () => undefined);
+    Reflect.set(instance, 'initialize', async () => undefined);
+    let discoveryOutcome: 'ignored' | 'broken' | 'repaired' = 'ignored';
+    let startTokenCount = 0;
+    Reflect.set(instance, 'drive', {
+      async getStartPageToken() {
+        startTokenCount += 1;
+        return `synthetic-start-${startTokenCount}`;
+      },
+      async listChanges() {
+        return {
+          changes: [],
+          newStartPageToken: `synthetic-committed-${startTokenCount}`,
+          pages: 1,
+        };
+      },
+    });
+    Reflect.set(instance, 'ensureVerifiedRepositoryReadOnly', async () => ({
+      rootFolderId,
+      async assertActiveRoot() {},
+      async discover(
+        _states: unknown,
+        _signal: unknown,
+        options: { ignoredDocumentIds?: readonly string[] },
+      ) {
+        if (discoveryOutcome === 'ignored') {
+          assert.deepEqual(options.ignoredDocumentIds, [documentId]);
+          return [];
+        }
+        assert.deepEqual(options.ignoredDocumentIds, []);
+        if (discoveryOutcome === 'broken') {
+          throw new PaperRepositoryError(
+            'paper-presence-invalid',
+            'Synthetic broken presence ancestry.',
+            {
+              diagnosticPhase: 'paper-presence-resolution',
+              diagnosticCauseCode: 'presence-control-resolution-failed',
+              diagnosticDocumentId: documentId,
+              diagnosticPresenceResolutionScope: 'all',
+            },
+          );
+        }
+        return [healthyPaper];
+      },
+    }));
+    Reflect.set(instance, 'applyDiscovery', async (papers: PaperCloudSummary[]) => {
+      if (papers.length > 0) {
+        await saveCloudPaperCatalog(papers);
+        Reflect.set(instance, 'view', { ...instance.getSnapshot(), papers });
+      }
+    });
+
+    // A successful audit while the issue is ignored cannot certify that issue.
+    await instance.checkDriveAgainReadOnly();
+    assert.equal(getPaperSyncUiStatus(instance.getSnapshot()), 'synced');
+    assert.ok((await loadPaperSyncDeviceProfile()).driveChangeCursor);
+
+    await instance.reviewIgnoredCloudIssue(documentId);
+    await closeSyncPersistenceWorkspace();
+    const reviewed = await loadPaperSyncDeviceProfile();
+    assert.equal(reviewed.driveChangeCursor, undefined);
+    assert.equal(verifiedDriveCheckAt(reviewed), undefined);
+    assert.equal(
+      Reflect.get(reviewed.cloudIssueQuarantines?.[0] ?? {}, 'revalidationPending'),
+      true,
+    );
+    const reloadedView = viewState({
+      autoSync: false,
+      papers: await loadCloudPaperCatalog(),
+      lastVerifiedDriveAt: verifiedDriveCheckAt(reviewed),
+    });
+    assert.equal(getPaperSyncUiStatus(reloadedView), 'attention');
+
+    discoveryOutcome = 'broken';
+    await assert.rejects(() => instance.checkDriveAgainReadOnly());
+    const afterFailure = await loadPaperSyncDeviceProfile();
+    assert.equal(afterFailure.driveChangeCursor, undefined);
+    assert.equal(
+      Reflect.get(afterFailure.cloudIssueQuarantines?.[0] ?? {}, 'revalidationPending'),
+      true,
+    );
+
+    discoveryOutcome = 'repaired';
+    await instance.checkDriveAgainReadOnly();
+    const afterVerifiedRepair = await loadPaperSyncDeviceProfile();
+    assert.ok(afterVerifiedRepair.driveChangeCursor);
+    assert.notEqual(
+      Reflect.get(
+        afterVerifiedRepair.cloudIssueQuarantines?.[0] ?? {},
+        'revalidationPending',
+      ),
+      true,
+    );
+    assert.equal(getPaperSyncUiStatus(instance.getSnapshot()), 'synced');
+  } finally {
+    await closeSyncPersistenceWorkspace();
+    if (previousDatabase) {
+      securityDatabaseRecords.set('39note-sync', previousDatabase);
+    } else {
+      securityDatabaseRecords.delete('39note-sync');
+    }
+  }
+});
+
 test('incremental Drive discovery preserves a race-free durable cursor', async (context) => {
   const profile = (
     overrides: Partial<PaperSyncDeviceProfile> = {},
@@ -6034,6 +6620,227 @@ test('incremental Drive discovery preserves a race-free durable cursor', async (
         'durable-apply',
         'cursor-commit',
       ]);
+    },
+  );
+
+  await context.test(
+    'a root-wide presence failure survives scoped settlement until an authoritative baseline succeeds',
+    async () => {
+      const instance = coordinator(profile());
+      const presenceFailure = new PaperRepositoryError(
+        'paper-presence-invalid',
+        'Presence ancestry failed.',
+        {
+          diagnosticPhase: 'paper-presence-resolution',
+          diagnosticCauseCode: 'presence-control-resolution-failed',
+          diagnosticPresenceResolutionScope: 'all',
+        },
+      );
+
+      await invokePrivate<void>(instance, 'applyError', presenceFailure, false);
+      const retained = await invokePrivate<PaperSyncViewState['issue']>(
+        instance,
+        'firstBlockingPaperIssue',
+      );
+      assert.equal(retained?.diagnostic.operation, 'paper-presence-invalid');
+      assert.equal(retained?.diagnostic.phase, 'paper-presence-resolution');
+      assert.equal(
+        await invokePrivate<boolean>(instance, 'hasGlobalBlockingIssue'),
+        true,
+      );
+
+      // Paper-scoped Download/Merge settlement clears its transient UI issue,
+      // but it is not authoritative evidence for unrelated presence groups.
+      Reflect.set(
+        instance,
+        'view',
+        viewState({ connection: 'connected', issue: undefined, error: undefined }),
+      );
+      assert.strictEqual(
+        await invokePrivate(instance, 'firstBlockingPaperIssue'),
+        retained,
+      );
+      assert.equal(
+        await invokePrivate(instance, 'connectionAfterPaperSettlement', undefined),
+        'attention',
+      );
+
+      const events: string[] = [];
+      Reflect.set(instance, 'drive', {
+        async getStartPageToken() {
+          events.push('start-token');
+          return 'baseline-token';
+        },
+        async listChanges() {
+          events.push('replay');
+          return { changes: [], newStartPageToken: 'verified-cursor', pages: 1 };
+        },
+      });
+      Reflect.set(instance, 'assertActiveLayout', async () => {
+        events.push('layout');
+      });
+      Reflect.set(instance, 'applyDiscovery', async () => {
+        events.push('apply');
+      });
+      const commitDriveChangeCursor = Reflect.get(
+        instance,
+        'commitDriveChangeCursor',
+      ) as (...args: unknown[]) => Promise<void>;
+      Reflect.set(instance, 'commitDriveChangeCursor', async (...args: unknown[]) => {
+        events.push('commit');
+        await Reflect.apply(commitDriveChangeCursor, instance, args);
+      });
+
+      await assert.rejects(() =>
+        invokePrivate(
+          instance,
+          'runAuthoritativeBaseline',
+          {
+            rootFolderId: 'root-a',
+            async discover() {
+              events.push('discover-failed');
+              throw presenceFailure;
+            },
+          },
+          new AbortController().signal,
+          undefined,
+        ),
+      );
+      assert.equal(
+        (Reflect.get(instance, 'profile') as PaperSyncDeviceProfile).driveChangeCursor,
+        undefined,
+      );
+      assert.equal(
+        (Reflect.get(instance, 'profile') as PaperSyncDeviceProfile)
+          .driveAuditCheckpoint?.startPageToken,
+        'baseline-token',
+      );
+      assert.strictEqual(
+        await invokePrivate(instance, 'firstBlockingPaperIssue'),
+        retained,
+      );
+      events.length = 0;
+
+      await invokePrivate(
+        instance,
+        'runAuthoritativeBaseline',
+        {
+          rootFolderId: 'root-a',
+          async discover() {
+            events.push('discover');
+            return [];
+          },
+        },
+        new AbortController().signal,
+        undefined,
+      );
+
+      assert.deepEqual(events, ['layout', 'discover', 'replay', 'apply', 'commit']);
+      assert.equal(
+        (Reflect.get(instance, 'profile') as PaperSyncDeviceProfile).driveChangeCursor
+          ?.pageToken,
+        'verified-cursor',
+      );
+      assert.equal(await invokePrivate(instance, 'firstBlockingPaperIssue'), undefined);
+      assert.equal(
+        await invokePrivate<boolean>(instance, 'hasGlobalBlockingIssue'),
+        false,
+      );
+      assert.equal(
+        await invokePrivate(instance, 'connectionAfterPaperSettlement', undefined),
+        'connected',
+      );
+    },
+  );
+
+  await context.test(
+    'one scoped presence failure cannot become a retained root-wide blocker',
+    async () => {
+      const instance = coordinator(profile());
+      const scopedFailure = new PaperRepositoryError(
+        'paper-presence-invalid',
+        'Scoped presence ancestry failed.',
+        {
+          diagnosticPhase: 'paper-presence-resolution',
+          diagnosticCauseCode: 'presence-control-resolution-failed',
+          diagnosticDocumentId: 'doc-a',
+          diagnosticPresenceResolutionScope: 'document',
+        },
+      );
+
+      await invokePrivate<void>(instance, 'applyError', scopedFailure, false);
+      Reflect.set(
+        instance,
+        'view',
+        viewState({ connection: 'connected', issue: undefined, error: undefined }),
+      );
+      assert.equal(await invokePrivate(instance, 'firstBlockingPaperIssue'), undefined);
+      assert.equal(
+        await invokePrivate<boolean>(instance, 'hasGlobalBlockingIssue'),
+        false,
+      );
+    },
+  );
+
+  await context.test(
+    'an exact root-wide blocker becomes dormant only while that paper is quarantined',
+    async () => {
+      const documentId = 'doc-broken-root';
+      const configuredProfile = profile();
+      const instance = coordinator(configuredProfile);
+      const failure = new PaperRepositoryError(
+        'paper-presence-invalid',
+        'Presence ancestry failed.',
+        {
+          diagnosticPhase: 'paper-presence-resolution',
+          diagnosticCauseCode: 'presence-control-resolution-failed',
+          diagnosticDocumentId: documentId,
+          diagnosticPresenceResolutionScope: 'all',
+        },
+      );
+      await invokePrivate<void>(instance, 'applyError', failure, false);
+      assert.equal(
+        await invokePrivate<boolean>(instance, 'hasGlobalBlockingIssue'),
+        true,
+      );
+
+      configuredProfile.cloudIssueQuarantines = [
+        {
+          version: 1,
+          documentId,
+          accountId: 'account-a',
+          rootFolderId: 'root-a',
+          reason: 'presence-control-resolution-failed',
+          confirmedAt: 100,
+        },
+      ];
+      assert.equal(await invokePrivate(instance, 'firstBlockingPaperIssue'), undefined);
+      assert.equal(
+        await invokePrivate<boolean>(instance, 'hasGlobalBlockingIssue'),
+        false,
+      );
+      assert.equal(
+        await invokePrivate(instance, 'connectionAfterPaperSettlement', undefined),
+        'connected',
+      );
+
+      configuredProfile.cloudIssueQuarantines[0] = {
+        ...configuredProfile.cloudIssueQuarantines[0],
+        reviewedAt: 200,
+      };
+      assert.equal(
+        (
+          await invokePrivate<PaperSyncViewState['issue']>(
+            instance,
+            'firstBlockingPaperIssue',
+          )
+        )?.diagnostic.documentId,
+        documentId,
+      );
+      assert.equal(
+        await invokePrivate<boolean>(instance, 'hasGlobalBlockingIssue'),
+        true,
+      );
     },
   );
 
@@ -6576,7 +7383,7 @@ test('incremental Drive discovery preserves a race-free durable cursor', async (
       const coordinatorSource = source('../src/sync/paperCoordinator.ts');
       assert.match(
         coordinatorSource,
-        /if \(profile\.rootFolderId !== root\.id\) delete profile\.driveChangeCursor/u,
+        /if \(profile\.rootFolderId !== root\.id\) \{[\s\S]*?delete profile\.driveChangeCursor;[\s\S]*?delete profile\.driveAuditCheckpoint;/u,
       );
       assert.match(
         coordinatorSource,
@@ -7891,6 +8698,7 @@ function renderDrawer(
     connect: async () => undefined,
     reconnect: async () => undefined,
     scanCloudPapers: async () => undefined,
+    checkDriveAgainReadOnly: async () => undefined,
     createReplacementRoot: async () => undefined,
     upgradeDriveLayoutFromThisDevice: async () => undefined,
     setAutoSync: async () => undefined,

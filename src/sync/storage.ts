@@ -11,6 +11,12 @@ import type {
   PaperSyncState,
   TargetedPaperPurgeCheckpoint,
 } from './paperTypes.ts';
+import type { DriveFileMetadata } from './driveClient.ts';
+import {
+  paperVerificationCacheRecordId,
+  type PaperVerificationCacheEntry,
+  type StoredPaperVerificationCacheEntry,
+} from './paperVerificationCache.ts';
 import type { LayoutMigrationFailure } from './layoutMigration.ts';
 import { isValidDocumentId } from '../utils/documentId.ts';
 import {
@@ -40,6 +46,20 @@ export interface PaperDriveChangeCursor {
 }
 
 /**
+ * A local-only resumable boundary for an exhaustive read-only Drive audit.
+ * It is never a successful sync cursor. Success still requires a complete
+ * discovery followed by replaying every Drive change since startPageToken.
+ */
+export interface PaperDriveAuditCheckpoint {
+  version: 1;
+  accountId: string;
+  rootFolderId: string;
+  deviceMode: SyncDeviceMode;
+  startPageToken: string;
+  startedAt: number;
+}
+
+/**
  * A local-only, user-confirmed exception for one otherwise blocking cloud paper.
  * The account and root are carried on every record so a checkpoint can never
  * suppress a paper after an identity or Drive-root change.
@@ -56,6 +76,8 @@ export interface PaperCloudIssueQuarantineEntry {
    * that the user previously confirmed. Reviewed entries never suppress sync.
    */
   reviewedAt?: number;
+  /** A reviewed exception must pass a new full Drive check before sync resumes. */
+  revalidationPending?: true;
   /** Local-only managed-folder correlation captured at confirmation time. */
   paperFolderId?: string;
 }
@@ -76,6 +98,7 @@ export interface PaperSyncDeviceProfile {
   workspaceAccountId?: string;
   rootFolderId?: string;
   driveChangeCursor?: PaperDriveChangeCursor;
+  driveAuditCheckpoint?: PaperDriveAuditCheckpoint;
   /** Local-only; never serialized into a Drive paper or protocol record. */
   cloudIssueQuarantines?: PaperCloudIssueQuarantineEntry[];
   lastDiscoveryAt?: number;
@@ -157,8 +180,11 @@ interface SyncDatabase extends DBSchema {
     value: TemporarySessionProvenance;
   };
   [LAYOUT_MIGRATION_STORE]: {
-    key: 'layout' | 'paper-v3';
-    value: LayoutMigrationRecord | PaperV3MigrationRecord;
+    key: string;
+    value:
+      | LayoutMigrationRecord
+      | PaperV3MigrationRecord
+      | StoredPaperVerificationCacheEntry;
   };
 }
 
@@ -779,6 +805,87 @@ export async function clearPaperV3MigrationRecord(
   }
 }
 
+/**
+ * Loads only non-authoritative acceleration entries for the exact Google
+ * account and managed root. Malformed cache rows are ignored; they can never
+ * block sync or become proof of remote state.
+ */
+export async function loadPaperDriveVerificationCache(
+  accountId: string,
+  rootFolderId: string,
+): Promise<PaperVerificationCacheEntry[]> {
+  const normalizedAccountId = safeAccountId(accountId);
+  const normalizedRootFolderId = safeOpaqueToken(rootFolderId, 256);
+  if (!normalizedAccountId || !normalizedRootFolderId) return [];
+  try {
+    const records = await (await getDatabase()).getAll(LAYOUT_MIGRATION_STORE);
+    return records.flatMap((record) => {
+      const normalized = normalizeStoredPaperVerificationCacheEntry(record);
+      return normalized &&
+        normalized.accountId === normalizedAccountId &&
+        normalized.rootFolderId === normalizedRootFolderId
+        ? [
+            {
+              kind: normalized.kind,
+              file: normalized.file,
+              text: normalized.text,
+            },
+          ]
+        : [];
+    });
+  } catch (error) {
+    throw new LocalSyncPersistenceError('read', error);
+  }
+}
+
+/**
+ * Persists verified immutable text bodies independently so concurrent paper
+ * scans cannot overwrite each other's progress. These rows remain hints only;
+ * repository reuse still requires fresh, byte-identical Drive metadata.
+ */
+export async function savePaperDriveVerificationCache(
+  accountId: string,
+  rootFolderId: string,
+  entries: readonly PaperVerificationCacheEntry[],
+  workspaceLease?: WorkspaceRestoreLease,
+): Promise<void> {
+  if (entries.length === 0) return;
+  const normalizedAccountId = safeAccountId(accountId);
+  const normalizedRootFolderId = safeOpaqueToken(rootFolderId, 256);
+  if (!normalizedAccountId || !normalizedRootFolderId) {
+    throw new LocalSyncPersistenceError('write');
+  }
+  try {
+    await withSyncWorkspaceMutation(async () => {
+      const database = await getDatabase();
+      const transaction = database.transaction(LAYOUT_MIGRATION_STORE, 'readwrite');
+      const verifiedAt = Date.now();
+      for (const entry of entries) {
+        const record = normalizeStoredPaperVerificationCacheEntry({
+          id: paperVerificationCacheRecordId(
+            normalizedAccountId,
+            normalizedRootFolderId,
+            entry.kind,
+            entry.file.id,
+          ),
+          formatVersion: 1,
+          accountId: normalizedAccountId,
+          rootFolderId: normalizedRootFolderId,
+          kind: entry.kind,
+          file: entry.file,
+          text: entry.text,
+          verifiedAt,
+        });
+        if (!record) continue;
+        await transaction.store.put(record);
+      }
+      await transaction.done;
+    }, workspaceLease);
+  } catch (error) {
+    throw new LocalSyncPersistenceError('write', error);
+  }
+}
+
 export async function deletePaperSyncRecords(
   documentIds: readonly string[],
   workspaceLease?: WorkspaceRestoreLease,
@@ -864,6 +971,7 @@ function normalizePaperDeviceProfile(
     throw new Error('Invalid Google Drive workspace identity metadata.');
   }
   const cursor = normalizeDriveChangeCursor(value.driveChangeCursor);
+  const auditCheckpoint = normalizeDriveAuditCheckpoint(value.driveAuditCheckpoint);
   const cloudIssueQuarantines = temporaryWorkspace
     ? []
     : normalizePaperCloudIssueQuarantines(value.cloudIssueQuarantines);
@@ -882,12 +990,17 @@ function normalizePaperDeviceProfile(
     ...(accountId ? { accountId } : {}),
     ...(!temporaryWorkspace && workspaceAccountId ? { workspaceAccountId } : {}),
     ...(rootFolderId ? { rootFolderId } : {}),
-    ...(cursor &&
-    cursor.deviceMode === deviceMode &&
-    cursor.accountId === accountId &&
-    cursor.rootFolderId === rootFolderId
-      ? { driveChangeCursor: cursor }
-      : {}),
+    ...(auditCheckpoint &&
+    auditCheckpoint.deviceMode === deviceMode &&
+    auditCheckpoint.accountId === accountId &&
+    auditCheckpoint.rootFolderId === rootFolderId
+      ? { driveAuditCheckpoint: auditCheckpoint }
+      : cursor &&
+          cursor.deviceMode === deviceMode &&
+          cursor.accountId === accountId &&
+          cursor.rootFolderId === rootFolderId
+        ? { driveChangeCursor: cursor }
+        : {}),
     ...(cloudIssueQuarantines.length > 0 ? { cloudIssueQuarantines } : {}),
     ...(validTimestamp(value.lastDiscoveryAt)
       ? { lastDiscoveryAt: value.lastDiscoveryAt }
@@ -933,6 +1046,9 @@ function normalizePaperCloudIssueQuarantines(
       reason: 'presence-control-resolution-failed',
       confirmedAt: candidate.confirmedAt,
       ...(reviewedAt !== undefined ? { reviewedAt } : {}),
+      ...(reviewedAt !== undefined && candidate.revalidationPending === true
+        ? { revalidationPending: true as const }
+        : {}),
       ...(paperFolderId ? { paperFolderId } : {}),
     };
     const key = `${accountId}\u0000${rootFolderId}\u0000${candidate.documentId}`;
@@ -979,6 +1095,155 @@ function normalizeDriveChangeCursor(
     pageToken,
     lastFullAuditAt: value.lastFullAuditAt,
   };
+}
+
+function normalizeDriveAuditCheckpoint(
+  value: unknown,
+): PaperDriveAuditCheckpoint | undefined {
+  if (!isRecord(value)) return undefined;
+  const accountId = safeAccountId(value.accountId);
+  const rootFolderId = safeOpaqueToken(value.rootFolderId, 256);
+  const startPageToken = safeOpaqueToken(value.startPageToken, 4096);
+  if (
+    value.version !== 1 ||
+    !accountId ||
+    !rootFolderId ||
+    (value.deviceMode !== 'personal' && value.deviceMode !== 'temporary') ||
+    !startPageToken ||
+    !validTimestamp(value.startedAt)
+  ) {
+    return undefined;
+  }
+  return {
+    version: 1,
+    accountId,
+    rootFolderId,
+    deviceMode: value.deviceMode,
+    startPageToken,
+    startedAt: value.startedAt,
+  };
+}
+
+function normalizeStoredPaperVerificationCacheEntry(
+  value: unknown,
+): StoredPaperVerificationCacheEntry | undefined {
+  if (!isRecord(value)) return undefined;
+  const accountId = safeAccountId(value.accountId);
+  const rootFolderId = safeOpaqueToken(value.rootFolderId, 256);
+  const file = normalizeCachedDriveFileMetadata(value.file);
+  const kind =
+    value.kind === 'manifest' || value.kind === 'presence' ? value.kind : null;
+  if (
+    value.formatVersion !== 1 ||
+    !kind ||
+    !accountId ||
+    !rootFolderId ||
+    !file ||
+    typeof value.text !== 'string' ||
+    value.text.length === 0 ||
+    value.text.length > 1_000_000 ||
+    !validTimestamp(value.verifiedAt) ||
+    value.id !== paperVerificationCacheRecordId(accountId, rootFolderId, kind, file.id)
+  ) {
+    return undefined;
+  }
+  return {
+    id: value.id,
+    formatVersion: 1,
+    accountId,
+    rootFolderId,
+    kind,
+    file,
+    text: value.text,
+    verifiedAt: value.verifiedAt,
+  };
+}
+
+function normalizeCachedDriveFileMetadata(
+  value: unknown,
+): DriveFileMetadata | undefined {
+  if (!isRecord(value)) return undefined;
+  const id = safeOpaqueToken(value.id, 512);
+  const name = safeText(value.name, 1024);
+  const mimeType = safeText(value.mimeType, 256);
+  const modifiedTime = safeText(value.modifiedTime, 64);
+  const version = safeOpaqueToken(value.version, 128);
+  const size = safeOpaqueToken(value.size, 64);
+  const md5Checksum = safeOpaqueToken(value.md5Checksum, 64)?.toLowerCase();
+  const sha256Checksum = safeOpaqueToken(value.sha256Checksum, 128)?.toLowerCase();
+  const parents = normalizeCachedStringArray(value.parents, 8, 512);
+  const appProperties = normalizeCachedAppProperties(value.appProperties);
+  if (
+    !id ||
+    !name ||
+    !mimeType ||
+    !modifiedTime ||
+    !version ||
+    !size ||
+    !/^\d+$/u.test(size) ||
+    !md5Checksum ||
+    !/^[a-f\d]{32}$/u.test(md5Checksum) ||
+    (sha256Checksum !== undefined && !/^[a-f\d]{64}$/u.test(sha256Checksum)) ||
+    !parents ||
+    parents.length !== 1 ||
+    !appProperties ||
+    value.trashed === true ||
+    value.ownedByMe !== true
+  ) {
+    return undefined;
+  }
+  return {
+    id,
+    name,
+    mimeType,
+    parents,
+    appProperties,
+    modifiedTime,
+    md5Checksum,
+    ...(sha256Checksum ? { sha256Checksum } : {}),
+    version,
+    size,
+    trashed: false,
+    ...(value.explicitlyTrashed === false ? { explicitlyTrashed: false } : {}),
+    ownedByMe: true,
+  };
+}
+
+function normalizeCachedStringArray(
+  value: unknown,
+  maximumItems: number,
+  maximumLength: number,
+): string[] | undefined {
+  if (!Array.isArray(value) || value.length > maximumItems) return undefined;
+  const normalized = value.map((candidate) =>
+    safeOpaqueToken(candidate, maximumLength),
+  );
+  return normalized.every((candidate): candidate is string => Boolean(candidate))
+    ? normalized
+    : undefined;
+}
+
+function normalizeCachedAppProperties(
+  value: unknown,
+): Record<string, string> | undefined {
+  if (!isRecord(value) || Array.isArray(value)) return undefined;
+  const entries = Object.entries(value);
+  if (entries.length === 0 || entries.length > 64) return undefined;
+  const normalized: Record<string, string> = {};
+  for (const [key, raw] of entries) {
+    if (
+      !key ||
+      key.length > 128 ||
+      hasControlCharacters(key) ||
+      typeof raw !== 'string' ||
+      raw.length > 4096 ||
+      hasControlCharacters(raw)
+    ) {
+      return undefined;
+    }
+    normalized[key] = raw;
+  }
+  return normalized;
 }
 
 const DIRTY_REASONS = new Set<PaperDirtyReason>([

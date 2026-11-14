@@ -67,6 +67,7 @@ import {
   type PaperTransferProgress,
 } from './paperTypes.ts';
 import { planPaperChangeDiscovery } from './paperIncrementalDiscovery.ts';
+import type { PaperVerificationCacheEntry } from './paperVerificationCache.ts';
 import {
   clearLayoutMigrationRecord,
   clearPaperV3MigrationRecord,
@@ -77,6 +78,7 @@ import {
   loadPaperV3MigrationRecord,
   loadCloudPaperCatalog,
   loadPaperSyncDeviceProfile,
+  loadPaperDriveVerificationCache,
   loadPaperSyncStates,
   loadTemporarySessionProvenance,
   hasExplicitOrEstablishedDeviceMode,
@@ -84,11 +86,13 @@ import {
   saveLayoutMigrationRecord,
   savePaperV3MigrationRecord,
   savePaperSyncDeviceProfile,
+  savePaperDriveVerificationCache,
   savePaperSyncState,
   savePaperSyncStates,
   type LayoutMigrationRecord,
   type PaperV3MigrationRecord,
   type PaperCloudIssueQuarantineEntry,
+  type PaperDriveAuditCheckpoint,
   type PaperSyncDeviceProfile,
   type SyncDeviceMode,
   type TemporarySessionProvenance,
@@ -278,10 +282,14 @@ export interface PaperSyncViewState {
   dirtyPaperIds: string[];
   /** Active local-only exceptions for the currently verified account and root. */
   ignoredCloudIssues?: IgnoredPaperCloudIssue[];
+  /** A reviewed exception is awaiting a complete read-only Drive check. */
+  reviewedCloudIssueRevalidationPending?: boolean;
   sessions: GoogleDeviceSessionSummary[];
   rootChoices: DriveFileMetadata[];
   rootUrl?: string;
   lastSuccessfulAt?: number;
+  /** A completed Drive check with an account/root/mode-bound committed cursor. */
+  lastVerifiedDriveAt?: number;
   progress: SyncProgress;
   /**
    * View-independent Drive tasks currently owned by this workspace coordinator.
@@ -387,6 +395,7 @@ export class DriveOperationTimeoutError extends Error {
     readonly operationType: DriveSyncOperationType,
     readonly timeoutMs: number,
     mayHaveMutated = driveOperationMayHaveMutated(operationType),
+    readonly resumableReadProgress = false,
   ) {
     super(
       mayHaveMutated
@@ -570,6 +579,38 @@ export function getBlockingPaperIssueCount(state: PaperSyncViewState): number {
   ]).size;
 }
 
+/**
+ * A read-only check is complete only when its cursor was durably committed for
+ * this exact workspace. An audit checkpoint is progress, never a success.
+ */
+export function verifiedDriveCheckAt(
+  profile: PaperSyncDeviceProfile,
+): number | undefined {
+  const cursor = profile.driveChangeCursor;
+  const checkedAt = profile.lastDiscoveryAt;
+  if (
+    !cursor ||
+    profile.driveAuditCheckpoint ||
+    cursor.version !== 1 ||
+    !cursor.pageToken ||
+    !profile.accountId ||
+    !profile.rootFolderId ||
+    cursor.accountId !== profile.accountId ||
+    cursor.rootFolderId !== profile.rootFolderId ||
+    cursor.deviceMode !== profile.deviceMode ||
+    typeof checkedAt !== 'number' ||
+    !Number.isFinite(checkedAt) ||
+    checkedAt < 0 ||
+    checkedAt > Date.now() ||
+    !Number.isFinite(cursor.lastFullAuditAt) ||
+    cursor.lastFullAuditAt < 0 ||
+    cursor.lastFullAuditAt > checkedAt
+  ) {
+    return undefined;
+  }
+  return checkedAt;
+}
+
 export function getPaperSyncUiStatus(state: PaperSyncViewState): PaperSyncUiStatus {
   const ignored = new Set(
     (state.ignoredCloudIssues ?? []).map(({ documentId }) => documentId),
@@ -591,6 +632,13 @@ export function getPaperSyncUiStatus(state: PaperSyncViewState): PaperSyncUiStat
   )
     return 'attention';
   if (state.restorePublicationHold) return 'pending';
+  if (state.reviewedCloudIssueRevalidationPending) return 'attention';
+  if (
+    state.issue?.code === 'drive-operation-timeout' &&
+    state.issue.state === 'pending'
+  ) {
+    return 'pending';
+  }
   if (state.dirtyPaperIds.length > 0) return 'pending';
   if (
     state.paperStates.some(
@@ -600,7 +648,7 @@ export function getPaperSyncUiStatus(state: PaperSyncViewState): PaperSyncUiStat
     )
   )
     return 'connected';
-  return state.lastSuccessfulAt ? 'synced' : 'connected';
+  return state.lastSuccessfulAt || state.lastVerifiedDriveAt ? 'synced' : 'connected';
 }
 
 type Listener = (state: PaperSyncViewState) => void;
@@ -698,6 +746,12 @@ export class SerializedDriveOperationOwner {
 
 interface BlockingPaperIssue {
   headSetId?: string;
+  issue: SyncOperationalIssue;
+}
+
+interface RootWideBlockingIssue {
+  accountId: string;
+  rootFolderId: string;
   issue: SyncOperationalIssue;
 }
 
@@ -1213,12 +1267,14 @@ export function classifyPaperCoordinatorError(
         },
       };
     }
+    const resumableAudit = error.resumableReadProgress && online;
     return {
       code: 'drive-operation-timeout',
-      message:
-        'Google Drive did not respond before the safety deadline. The operation stopped without reporting success; local work remains saved.',
+      message: resumableAudit
+        ? 'Drive verification reached this run’s safety limit. Its local audit starting point was retained; previously verified records may be reused. Continue the read-only check. No remote result was reported as successful.'
+        : 'Google Drive did not respond before the safety deadline. The operation stopped without reporting success; local work remains saved.',
       severity: 'warning',
-      state: 'offline',
+      state: resumableAudit ? 'pending' : 'offline',
       actions: ['automatic-retry', 'retry-now', 'details'],
       retrySafe: true,
       blocksOrdinarySync: false,
@@ -1227,7 +1283,9 @@ export function classifyPaperCoordinatorError(
         source: 'google-drive',
         operation: error.operationType,
         phase: 'operation-watchdog',
-        causeCode: 'deadline-exceeded',
+        causeCode: resumableAudit
+          ? 'read-verification-paused-progress-retained'
+          : 'deadline-exceeded',
       },
     };
   }
@@ -1375,6 +1433,44 @@ export function classifyPaperCoordinatorError(
       operation: error.code,
       ...(error.diagnosticPhase ? { phase: error.diagnosticPhase } : {}),
       ...(error.diagnosticCauseCode ? { causeCode: error.diagnosticCauseCode } : {}),
+      ...(error.diagnosticPresenceFailureCode
+        ? { presenceFailureCode: error.diagnosticPresenceFailureCode }
+        : {}),
+      ...(error.diagnosticPresenceAncestry
+        ? {
+            presenceTopology: {
+              validationStage: error.diagnosticPresenceAncestry.validationStage,
+              status: error.diagnosticPresenceAncestry.topology.status,
+              recordCount: error.diagnosticPresenceAncestry.topology.recordCount,
+              uniqueGenerationCount:
+                error.diagnosticPresenceAncestry.topology.uniqueGenerationCount,
+              rootCount: error.diagnosticPresenceAncestry.topology.rootCount,
+              structuralHeadCount:
+                error.diagnosticPresenceAncestry.topology.structuralHeadCount,
+              // Any failed global resolution may expose observable graph
+              // leaves, but it has no protocol-authoritative resolved head
+              // set, including when the structure is valid but a protocol
+              // cutover boundary rejects it.
+              resolvedAuthoritativeHeadCount: null,
+              weakComponentCount:
+                error.diagnosticPresenceAncestry.topology.weakComponentCount,
+              missingParentReferenceCount:
+                error.diagnosticPresenceAncestry.topology.missingParentReferenceCount,
+              records: error.diagnosticPresenceAncestry.topology.records.map(
+                (record) => ({
+                  ordinal: record.ordinal,
+                  state: record.state,
+                  intent: record.intent,
+                  parentOrdinals: [...record.parentOrdinals],
+                  missingParentCount: record.missingParentCount,
+                  childCount: record.childCount,
+                  root: record.root,
+                  structuralHead: record.structuralHead,
+                }),
+              ),
+            },
+          }
+        : {}),
       ...(Reflect.get(error, 'documentId')
         ? { documentId: String(Reflect.get(error, 'documentId')) }
         : {}),
@@ -1555,6 +1651,12 @@ export class PaperGoogleDriveSyncCoordinator {
   private localRemovalReconcilePromise: Promise<void> | null = null;
   private readonly seenRemoteReminderStateIds = new Set<string>();
   private readonly blockingPaperIssues = new Map<string, BlockingPaperIssue>();
+  /**
+   * A failed root-wide presence resolution is not paper-scoped settlement state.
+   * Keep it separate so a later successful download of one cached paper cannot
+   * clear the unresolved global integrity boundary or report a false Synced.
+   */
+  private rootWideBlockingIssue?: RootWideBlockingIssue;
   private readonly paperRetryIntents = new Map<string, PaperRetryOperation>();
   private readonly activePaperRetryTasks = new Map<string, Promise<void>>();
   private lastPaperRetryDiagnostic?: PaperRetryDiagnosticSnapshot;
@@ -2036,17 +2138,20 @@ export class PaperGoogleDriveSyncCoordinator {
           ? {
               ...entry,
               reviewedAt,
+              revalidationPending: true as const,
               ...(paperFolderId && paperFolderId !== 'unavailable'
                 ? { paperFolderId }
                 : {}),
             }
           : entry,
       );
-      // Reviewing the cached Needs-attention row changes only the local filter.
-      // The retained row and scoped identity proof keep the exact issue visible
-      // for review or re-quarantine; they do not invalidate the global
-      // account/root/device-bound Drive change cursor.
+      // The prior cursor was committed while this paper was ignored. Its change
+      // feed cannot prove that the excluded ancestry is now sound. A reviewed
+      // paper therefore requires a new exhaustive read before any publication.
+      delete profile.driveChangeCursor;
+      delete profile.driveAuditCheckpoint;
       await savePaperSyncDeviceProfile(profile, {}, this.requireWorkspaceLease(signal));
+      this.updateView({ lastVerifiedDriveAt: undefined }, { notify: false });
       this.refreshStateView();
       const blockingIssue = this.firstBlockingPaperIssue();
       this.updateView({
@@ -2797,6 +2902,7 @@ export class PaperGoogleDriveSyncCoordinator {
           this.drive = null;
           this.updateView({
             connection: 'disconnected',
+            lastVerifiedDriveAt: undefined,
             autoSync: profile.deviceMode === 'temporary' ? false : profile.autoSync,
             securityState: undefined,
             issue: undefined,
@@ -2885,6 +2991,7 @@ export class PaperGoogleDriveSyncCoordinator {
           this.drive = null;
           this.updateView({
             connection: 'disconnected',
+            lastVerifiedDriveAt: undefined,
             autoSync: profile.deviceMode === 'temporary' ? false : profile.autoSync,
             securityState: undefined,
             issue: undefined,
@@ -2917,6 +3024,7 @@ export class PaperGoogleDriveSyncCoordinator {
           delete profile.accountId;
           delete profile.rootFolderId;
           delete profile.driveChangeCursor;
+          delete profile.driveAuditCheckpoint;
           await savePaperSyncDeviceProfile(
             profile,
             { authentication: 'replace' },
@@ -2928,6 +3036,7 @@ export class PaperGoogleDriveSyncCoordinator {
           this.seenRemoteReminderStateIds.clear();
           this.updateView({
             connection: 'disconnected',
+            lastVerifiedDriveAt: undefined,
             autoSync: profile.deviceMode === 'temporary' ? false : profile.autoSync,
             securityState: undefined,
             issue: undefined,
@@ -2967,11 +3076,16 @@ export class PaperGoogleDriveSyncCoordinator {
       const profile = this.requireProfile();
       profile.rootFolderId = refreshedRoot.id;
       delete profile.driveChangeCursor;
+      delete profile.driveAuditCheckpoint;
       await savePaperSyncDeviceProfile(profile, {}, this.requireWorkspaceLease(signal));
-      this.repository = new PaperDriveRepository(this.requireDrive(), refreshedRoot.id);
+      this.repository = await this.createPaperDriveRepository(
+        this.requireDrive(),
+        refreshedRoot.id,
+      );
       this.updateView({
         rootChoices: [],
         rootUrl: rootUrl(refreshedRoot.id),
+        lastVerifiedDriveAt: undefined,
         legacyHousekeeping: { status: 'idle' },
         folderNameMaintenance: { status: 'idle' },
       });
@@ -3030,12 +3144,14 @@ export class PaperGoogleDriveSyncCoordinator {
       const profile = this.requireProfile();
       profile.rootFolderId = root.id;
       delete profile.driveChangeCursor;
+      delete profile.driveAuditCheckpoint;
       await savePaperSyncDeviceProfile(profile, {}, this.requireWorkspaceLease(signal));
-      this.repository = new PaperDriveRepository(drive, root.id);
+      this.repository = await this.createPaperDriveRepository(drive, root.id);
       await this.repository.initializeEmptyLayout(signal);
       this.updateView(
         {
           rootUrl: rootUrl(root.id),
+          lastVerifiedDriveAt: undefined,
           legacyHousekeeping: { status: 'idle' },
           folderNameMaintenance: { status: 'idle' },
         },
@@ -3231,7 +3347,7 @@ export class PaperGoogleDriveSyncCoordinator {
               'The selected Google Drive folder is not a verified 39Note sync root.',
             );
           }
-          const repository = new PaperDriveRepository(drive, root.id);
+          const repository = await this.createPaperDriveRepository(drive, root.id);
           await repository.assertActiveRoot(signal);
           this.repository = repository;
           await this.reconcileLocalPaperStates(workspaceLease);
@@ -3277,6 +3393,7 @@ export class PaperGoogleDriveSyncCoordinator {
       const securityKind = securityStateKindForError(settledError);
       if (securityKind) this.applySecurityError(settledError as Error, securityKind);
       const classified = classifyPaperCoordinatorError(settledError);
+      this.rememberRootWidePresenceIssue(settledError, classified);
       const holdError =
         settledError instanceof WorkspaceRestoreBarrierError
           ? 'Restore safety changed in another tab. Reload 39Note before trying to resume sync again.'
@@ -3313,12 +3430,13 @@ export class PaperGoogleDriveSyncCoordinator {
 
   private async checkLegacyDriveDataOwned(): Promise<void> {
     await this.requireInitializedHousekeepingContext();
-    const signal = await this.beginOperation('housekeeping', false);
+    const signal = await this.beginOperation('housekeeping', false, 'diagnostic-only');
     this.updateView({ legacyHousekeeping: { status: 'checking' } }, { notify: false });
     try {
       const repository = await this.requireSelectedHousekeepingRepository(signal);
       const options = await this.legacyDriveHousekeepingOptions();
       const inventory = await repository.inspectLegacyDriveData(options, signal);
+      signal.throwIfAborted();
       this.updateView(
         { legacyHousekeeping: { status: 'ready', inventory } },
         { notify: false },
@@ -3431,7 +3549,7 @@ export class PaperGoogleDriveSyncCoordinator {
 
   private async previewPaperFolderNameNormalizationOwned(): Promise<void> {
     await this.requireInitializedHousekeepingContext();
-    const signal = await this.beginOperation('housekeeping', false);
+    const signal = await this.beginOperation('housekeeping', false, 'diagnostic-only');
     this.updateView(
       { folderNameMaintenance: { status: 'checking' } },
       { notify: false },
@@ -3439,6 +3557,7 @@ export class PaperGoogleDriveSyncCoordinator {
     try {
       const repository = await this.requireSelectedHousekeepingRepository(signal);
       const preview = await repository.inspectPaperFolderNames(signal);
+      signal.throwIfAborted();
       this.updateView(
         { folderNameMaintenance: { status: 'ready', preview } },
         { notify: false },
@@ -3538,6 +3657,11 @@ export class PaperGoogleDriveSyncCoordinator {
       this.scanPromise = null;
     });
     return this.scanPromise;
+  }
+
+  /** Rechecks only an already selected and verified Drive root, without writes. */
+  checkDriveAgainReadOnly(): Promise<void> {
+    return this.scanCloudPapersUsingVerifiedRepository();
   }
 
   /**
@@ -3767,9 +3891,15 @@ export class PaperGoogleDriveSyncCoordinator {
     workspaceLease: WorkspaceRestoreLease,
     strictReadOnly = false,
   ): Promise<void> {
+    // The checkpoint is not a successful cursor. It only preserves the exact
+    // change-feed boundary across a timeout while the independently persisted
+    // immutable-record cache avoids downloading the same verified bodies again.
+    let checkpoint =
+      this.currentDriveAuditCheckpoint() ??
+      (await this.createDriveAuditCheckpoint(signal, workspaceLease));
     for (let attempt = 0; attempt < MAX_BASELINE_REPLAY_ATTEMPTS; attempt += 1) {
       signal.throwIfAborted();
-      const startPageToken = await this.requireDrive().getStartPageToken(signal);
+      const startPageToken = checkpoint.startPageToken;
       signal.throwIfAborted();
       if (strictReadOnly) {
         // A second exact active-root check closes the TOCTOU gap after recovery
@@ -3784,14 +3914,31 @@ export class PaperGoogleDriveSyncCoordinator {
         signal,
         {
           layoutValidated: true,
-          reuseVerifiedManifests: strictReadOnly,
+          // files.list supplies fresh immutable Drive evidence on every full
+          // audit. Reusing only byte-identical, already verified parses avoids
+          // replaying an entire immutable history without weakening ancestry.
+          reuseVerifiedManifests: true,
           ignoredDocumentIds: this.activeQuarantinedDocumentIds(),
         },
       );
       signal.throwIfAborted();
       let papers: readonly PaperCloudSummary[] =
         this.retainMissingKnownCloudPapers(discovered);
-      const replay = await this.requireDrive().listChanges(startPageToken, signal);
+      let replay;
+      try {
+        replay = await this.requireDrive().listChanges(startPageToken, signal);
+      } catch (error) {
+        signal.throwIfAborted();
+        if (
+          error instanceof DriveRequestError &&
+          error.code === 'change-token-invalid' &&
+          attempt + 1 < MAX_BASELINE_REPLAY_ATTEMPTS
+        ) {
+          checkpoint = await this.createDriveAuditCheckpoint(signal, workspaceLease);
+          continue;
+        }
+        throw error;
+      }
       signal.throwIfAborted();
       const plan = planPaperChangeDiscovery(replay.changes, repository.rootFolderId, [
         ...papers,
@@ -3804,7 +3951,11 @@ export class PaperGoogleDriveSyncCoordinator {
           outcome: 'deferred',
           classification: 'baseline-replay-restarted',
         });
-        continue;
+        if (attempt + 1 < MAX_BASELINE_REPLAY_ATTEMPTS) {
+          checkpoint = await this.createDriveAuditCheckpoint(signal, workspaceLease);
+          continue;
+        }
+        break;
       }
       for (const documentId of plan.affectedDocumentIds) {
         this.requireDrive().recordOperationStateTransition?.({
@@ -3839,12 +3990,56 @@ export class PaperGoogleDriveSyncCoordinator {
         signal,
         workspaceLease,
       );
+      this.clearRootWidePresenceIssueAfterAuthoritativeBaseline(
+        repository.rootFolderId,
+      );
       return;
     }
     throw new PaperRepositoryError(
       'paper-remote-changed',
       'Google Drive changed repeatedly during the discovery baseline.',
     );
+  }
+
+  private currentDriveAuditCheckpoint(): PaperDriveAuditCheckpoint | undefined {
+    const profile = this.requireProfile();
+    const checkpoint = profile.driveAuditCheckpoint;
+    return checkpoint &&
+      checkpoint.accountId === profile.accountId &&
+      checkpoint.rootFolderId === profile.rootFolderId &&
+      checkpoint.deviceMode === profile.deviceMode
+      ? checkpoint
+      : undefined;
+  }
+
+  private async createDriveAuditCheckpoint(
+    signal: AbortSignal,
+    workspaceLease: WorkspaceRestoreLease,
+  ): Promise<PaperDriveAuditCheckpoint> {
+    const startPageToken = await this.requireDrive().getStartPageToken(signal);
+    signal.throwIfAborted();
+    const profile = this.requireProfile();
+    if (!profile.accountId || !profile.rootFolderId) {
+      throw new Error('Google Drive discovery identity is incomplete.');
+    }
+    const checkpoint: PaperDriveAuditCheckpoint = {
+      version: 1,
+      accountId: profile.accountId,
+      rootFolderId: profile.rootFolderId,
+      deviceMode: profile.deviceMode,
+      startPageToken,
+      startedAt: Date.now(),
+    };
+    const next: PaperSyncDeviceProfile = {
+      ...profile,
+      driveAuditCheckpoint: checkpoint,
+    };
+    delete next.driveChangeCursor;
+    await savePaperSyncDeviceProfile(next, {}, workspaceLease);
+    signal.throwIfAborted();
+    this.profile = next;
+    this.updateView({ lastVerifiedDriveAt: undefined }, { notify: false });
+    return checkpoint;
   }
 
   private async applyScopedDiscovery(
@@ -3940,6 +4135,19 @@ export class PaperGoogleDriveSyncCoordinator {
     const next: PaperSyncDeviceProfile = {
       ...profile,
       lastDiscoveryAt: Date.now(),
+      cloudIssueQuarantines: profile.cloudIssueQuarantines?.map((entry) => {
+        if (
+          entry.accountId !== profile.accountId ||
+          entry.rootFolderId !== profile.rootFolderId ||
+          entry.reviewedAt === undefined ||
+          !entry.revalidationPending
+        ) {
+          return entry;
+        }
+        const { revalidationPending: _completed, ...verified } = entry;
+        void _completed;
+        return verified;
+      }),
       driveChangeCursor: {
         version: 1,
         accountId: profile.accountId,
@@ -3949,10 +4157,20 @@ export class PaperGoogleDriveSyncCoordinator {
         lastFullAuditAt,
       },
     };
+    delete next.driveAuditCheckpoint;
     signal.throwIfAborted();
     await savePaperSyncDeviceProfile(next, {}, workspaceLease);
     signal.throwIfAborted();
     this.profile = next;
+    this.updateView(
+      {
+        lastVerifiedDriveAt: verifiedDriveCheckAt(next),
+        reviewedCloudIssueRevalidationPending: Boolean(
+          this.activeReviewedCloudIssueRevalidation(),
+        ),
+      },
+      { notify: false },
+    );
   }
 
   private assertDiscoverySucceeded(
@@ -4587,6 +4805,10 @@ export class PaperGoogleDriveSyncCoordinator {
   async retryNow(): Promise<void> {
     await this.waitForLocalRemovalSettlement();
     this.transientRetryAttempt = 0;
+    if (this.activeReviewedCloudIssueRevalidation()) {
+      await this.scanCloudPapersUsingVerifiedRepository();
+      return;
+    }
     if (this.view.issue?.code === 'drive-operation-timeout') {
       // Recover the connection boundary first. This remains read-only even when
       // unrelated papers are dirty or need attention; those commands require a
@@ -6685,6 +6907,7 @@ export class PaperGoogleDriveSyncCoordinator {
           this.drive = null;
           this.updateView({
             connection: 'disconnected',
+            lastVerifiedDriveAt: undefined,
             deviceMode: 'personal',
             autoSync: true,
             papers: [],
@@ -6810,6 +7033,10 @@ export class PaperGoogleDriveSyncCoordinator {
                 first.documentId.localeCompare(second.documentId),
               )
           : [];
+      const reviewedCloudIssueRevalidationPending = Boolean(
+        this.activeReviewedCloudIssueRevalidation(),
+      );
+      const reviewedCloudIssueIssue = this.reviewedCloudIssueRevalidationIssue();
       this.view = {
         ...this.view,
         connection: getBuildTimeSyncAuthUrl() ? 'disconnected' : 'not-configured',
@@ -6823,7 +7050,15 @@ export class PaperGoogleDriveSyncCoordinator {
         paperStates: [...this.paperStates.values()],
         dirtyPaperIds: this.getPendingSyncPaperIds(),
         ignoredCloudIssues: initialIgnoredCloudIssues,
+        reviewedCloudIssueRevalidationPending,
         lastSuccessfulAt: profile.lastSuccessfulAt,
+        lastVerifiedDriveAt: verifiedDriveCheckAt(profile),
+        ...(reviewedCloudIssueIssue
+          ? {
+              issue: reviewedCloudIssueIssue,
+              error: reviewedCloudIssueIssue.message,
+            }
+          : {}),
         publicDeviceNotice:
           profile.deviceMode === 'temporary' ? PUBLIC_DEVICE_LIMITATION : undefined,
         ...(cleanupNotice ? { temporaryCleanupNotice: cleanupNotice } : {}),
@@ -6917,11 +7152,16 @@ export class PaperGoogleDriveSyncCoordinator {
           { authentication: 'replace' },
           workspaceLease,
         );
+        this.updateView(
+          { lastVerifiedDriveAt: verifiedDriveCheckAt(profile) },
+          { notify: false },
+        );
       });
       if (!this.identity.hasDeviceSession) {
         this.updateView(
           {
             connection: 'disconnected',
+            lastVerifiedDriveAt: undefined,
             autoSync: profile.deviceMode === 'temporary' ? false : profile.autoSync,
           },
           { notify: false },
@@ -7045,11 +7285,14 @@ export class PaperGoogleDriveSyncCoordinator {
       }
       root = confirmedRoots[0];
     }
-    if (profile.rootFolderId !== root.id) delete profile.driveChangeCursor;
+    if (profile.rootFolderId !== root.id) {
+      delete profile.driveChangeCursor;
+      delete profile.driveAuditCheckpoint;
+    }
     profile.rootFolderId = root.id;
     const workspaceLease = this.requireWorkspaceLease(signal);
     await savePaperSyncDeviceProfile(profile, {}, workspaceLease);
-    this.repository = new PaperDriveRepository(drive, root.id);
+    this.repository = await this.createPaperDriveRepository(drive, root.id);
     if (profile.deviceMode === 'temporary' && profile.accountId) {
       const provenance = await beginTemporaryProvenance(
         profile.accountId,
@@ -7058,7 +7301,14 @@ export class PaperGoogleDriveSyncCoordinator {
       );
       this.temporaryWorkspaceAccountId = provenance.accountId;
     }
-    this.updateView({ rootUrl: rootUrl(root.id), rootChoices: [] }, { notify: false });
+    this.updateView(
+      {
+        rootUrl: rootUrl(root.id),
+        rootChoices: [],
+        lastVerifiedDriveAt: verifiedDriveCheckAt(profile),
+      },
+      { notify: false },
+    );
     if (requireActiveLayout) await this.repository.assertActiveRoot(signal);
     return this.repository;
   }
@@ -7100,9 +7350,61 @@ export class PaperGoogleDriveSyncCoordinator {
         'The selected Google Drive folder is not a verified active 39Note sync root.',
       );
     }
-    const repository = new PaperDriveRepository(drive, rootFolderId);
+    // Keep the root-scoped verified immutable caches populated by the timed-out
+    // read. The fresh root GET above and assertActiveRoot below still close the
+    // recovery boundary; recreating the repository here only forced Retry to
+    // redownload every manifest and presence record it had just verified.
+    const repository =
+      this.repository?.rootFolderId === rootFolderId
+        ? this.repository
+        : await this.createPaperDriveRepository(drive, rootFolderId);
     await repository.assertActiveRoot(signal);
     this.repository = repository;
+    return repository;
+  }
+
+  /**
+   * Rehydrates only locally cached immutable bodies. The repository still
+   * obtains fresh Drive listings and compares exact metadata before reuse.
+   */
+  private async createPaperDriveRepository(
+    drive: DriveClient,
+    rootFolderId: string,
+  ): Promise<PaperDriveRepository> {
+    const accountId = this.assertAuthorizedWorkspaceAccount();
+    const repository = new PaperDriveRepository(drive, rootFolderId, {
+      persistVerifiedCacheEntries: async (entries) => {
+        if (entries.length === 0) return;
+        const fence = this.activeDriveOperationIdentityFence;
+        const profile = this.profile;
+        if (
+          !fence ||
+          fence.accountId !== accountId ||
+          profile?.accountId !== accountId ||
+          profile.rootFolderId !== rootFolderId
+        ) {
+          return;
+        }
+        try {
+          await savePaperDriveVerificationCache(
+            accountId,
+            rootFolderId,
+            entries,
+            fence.workspaceLease,
+          );
+        } catch {
+          // This cache is an optimization only; a local cache write failure
+          // must not change the result of the authoritative Drive operation.
+        }
+      },
+    });
+    let cached: PaperVerificationCacheEntry[] = [];
+    try {
+      cached = await loadPaperDriveVerificationCache(accountId, rootFolderId);
+    } catch {
+      // A missing or unavailable local cache falls back to a cold Drive audit.
+    }
+    await repository.hydrateVerifiedReadCache(cached);
     return repository;
   }
 
@@ -8175,6 +8477,7 @@ export class PaperGoogleDriveSyncCoordinator {
 
   private async uploadSelectedOwned(documentIds: readonly string[]): Promise<void> {
     await this.initialize();
+    this.assertNoReviewedCloudIssueRevalidation();
     const ids = [...new Set(documentIds)].filter((id) => {
       const state = this.paperStates.get(id);
       return Boolean(
@@ -8210,6 +8513,7 @@ export class PaperGoogleDriveSyncCoordinator {
       // Recovery can start while account/workspace admission awaits. Recheck at
       // the last boundary before repository access or any Drive mutation.
       if (this.isReadTimeoutRecoveryBoundaryActive()) return;
+      this.assertNoReviewedCloudIssueRevalidation();
       const repository = await this.ensureRepository(signal, false);
       this.updateView({
         connection: 'syncing',
@@ -8695,6 +8999,7 @@ export class PaperGoogleDriveSyncCoordinator {
       this.profile = updated;
       this.updateView({
         connection: 'connected',
+        lastVerifiedDriveAt: verifiedDriveCheckAt(updated),
         securityState: undefined,
         autoSync: false,
         issue: undefined,
@@ -8759,7 +9064,11 @@ export class PaperGoogleDriveSyncCoordinator {
           workspaceLease,
         );
         this.updateView(
-          { securityState: undefined, autoSync: false },
+          {
+            securityState: undefined,
+            autoSync: false,
+            lastVerifiedDriveAt: verifiedDriveCheckAt(profile),
+          },
           { notify: false },
         );
         return true;
@@ -8791,6 +9100,7 @@ export class PaperGoogleDriveSyncCoordinator {
         {
           securityState: undefined,
           autoSync: profile.autoSync,
+          lastVerifiedDriveAt: verifiedDriveCheckAt(profile),
           issue: undefined,
           error: undefined,
         },
@@ -8821,6 +9131,7 @@ export class PaperGoogleDriveSyncCoordinator {
         {
           securityState: undefined,
           autoSync: profile.autoSync,
+          lastVerifiedDriveAt: verifiedDriveCheckAt(profile),
           issue: undefined,
           error: undefined,
         },
@@ -9018,6 +9329,7 @@ export class PaperGoogleDriveSyncCoordinator {
     return Boolean(
       profile?.deviceMode === 'personal' &&
       profile.autoSync &&
+      !this.activeReviewedCloudIssueRevalidation() &&
       !this.isReadTimeoutRecoveryBoundaryActive() &&
       !this.restorePublicationOperation &&
       this.view.deviceModeChoiceConfirmed &&
@@ -9051,6 +9363,56 @@ export class PaperGoogleDriveSyncCoordinator {
         entry.reviewedAt === undefined &&
         entry.accountId === accountId &&
         entry.rootFolderId === profile.rootFolderId,
+    );
+  }
+
+  private activeReviewedCloudIssueRevalidation():
+    PaperCloudIssueQuarantineEntry | undefined {
+    const profile = this.profile;
+    if (
+      profile?.deviceMode !== 'personal' ||
+      !profile.accountId ||
+      profile.workspaceAccountId !== profile.accountId ||
+      !profile.rootFolderId ||
+      (this.identity.accountId && this.identity.accountId !== profile.accountId)
+    ) {
+      return undefined;
+    }
+    return profile.cloudIssueQuarantines?.find(
+      (entry) =>
+        entry.accountId === profile.accountId &&
+        entry.rootFolderId === profile.rootFolderId &&
+        entry.reviewedAt !== undefined &&
+        entry.revalidationPending === true,
+    );
+  }
+
+  private reviewedCloudIssueRevalidationIssue(): SyncOperationalIssue | undefined {
+    if (!this.activeReviewedCloudIssueRevalidation()) return undefined;
+    return {
+      code: 'drive-integrity-mismatch',
+      message:
+        'A previously ignored paper needs a complete read-only Drive check before sync can resume.',
+      severity: 'warning',
+      state: 'attention',
+      actions: ['retry-now', 'details'],
+      retrySafe: true,
+      blocksOrdinarySync: true,
+      backupRecommended: false,
+      diagnostic: {
+        source: 'google-drive',
+        operation: 'paper-presence-review-revalidation',
+        phase: 'read-only-revalidation-required',
+      },
+    };
+  }
+
+  private assertNoReviewedCloudIssueRevalidation(): void {
+    if (!this.activeReviewedCloudIssueRevalidation()) return;
+    throw new PaperRepositoryError(
+      'paper-presence-invalid',
+      'A previously ignored paper needs a complete read-only Drive check before upload.',
+      { diagnosticPhase: 'read-only-revalidation-required' },
     );
   }
 
@@ -9117,10 +9479,72 @@ export class PaperGoogleDriveSyncCoordinator {
     );
   }
 
+  private rememberRootWidePresenceIssue(
+    error: unknown,
+    issue: SyncOperationalIssue,
+  ): void {
+    if (
+      !(error instanceof PaperRepositoryError) ||
+      error.code !== 'paper-presence-invalid' ||
+      error.diagnosticPhase !== 'paper-presence-resolution' ||
+      error.diagnosticPresenceResolutionScope !== 'all'
+    ) {
+      return;
+    }
+    const profile = this.profile;
+    if (!profile?.accountId || !profile.rootFolderId) return;
+    this.rootWideBlockingIssue = {
+      accountId: profile.accountId,
+      rootFolderId: profile.rootFolderId,
+      issue,
+    };
+  }
+
+  private activeRootWideBlockingIssue(): SyncOperationalIssue | undefined {
+    const retained = this.rootWideBlockingIssue;
+    const profile = this.profile;
+    if (
+      !retained ||
+      !profile?.accountId ||
+      !profile.rootFolderId ||
+      retained.accountId !== profile.accountId ||
+      retained.rootFolderId !== profile.rootFolderId
+    ) {
+      return undefined;
+    }
+    const exactDocumentId = retained.issue.diagnostic.documentId;
+    if (exactDocumentId && this.isPaperQuarantined(exactDocumentId)) {
+      // Keep the root-wide evidence dormant rather than discarding it. A local
+      // quarantine authorizes excluding only this exact paper; reviewing it
+      // again must restore the original fail-closed warning immediately.
+      return undefined;
+    }
+    return retained.issue;
+  }
+
+  private clearRootWidePresenceIssueAfterAuthoritativeBaseline(
+    rootFolderId: string,
+  ): void {
+    const retained = this.rootWideBlockingIssue;
+    const profile = this.profile;
+    if (
+      retained &&
+      profile?.accountId === retained.accountId &&
+      rootFolderId === retained.rootFolderId &&
+      profile.rootFolderId === retained.rootFolderId
+    ) {
+      this.rootWideBlockingIssue = undefined;
+    }
+  }
+
   private firstBlockingPaperIssue(): SyncOperationalIssue | undefined {
-    return [...this.blockingPaperIssues.entries()].find(
-      ([documentId]) => !this.isPaperQuarantined(documentId),
-    )?.[1].issue;
+    return (
+      this.activeRootWideBlockingIssue() ??
+      this.reviewedCloudIssueRevalidationIssue() ??
+      [...this.blockingPaperIssues.entries()].find(
+        ([documentId]) => !this.isPaperQuarantined(documentId),
+      )?.[1].issue
+    );
   }
 
   private connectionAfterPaperSettlement(
@@ -9128,6 +9552,8 @@ export class PaperGoogleDriveSyncCoordinator {
   ): PaperConnectionStatus {
     if (typeof navigator !== 'undefined' && navigator.onLine === false)
       return 'offline';
+    const rootWideIssue = this.activeRootWideBlockingIssue();
+    if (rootWideIssue) return connectionForIssue(rootWideIssue);
     if (!issue) return 'connected';
     return [...this.blockingPaperIssues.entries()].some(
       ([documentId, paperIssue]) =>
@@ -9138,8 +9564,20 @@ export class PaperGoogleDriveSyncCoordinator {
   }
 
   private hasGlobalBlockingIssue(): boolean {
+    if (this.activeReviewedCloudIssueRevalidation()) return true;
+    const activeRootWideIssue = this.activeRootWideBlockingIssue();
+    if (activeRootWideIssue?.blocksOrdinarySync) return true;
     const issue = this.view.issue;
     if (!issue?.blocksOrdinarySync) return false;
+    if (
+      this.rootWideBlockingIssue?.issue === issue &&
+      activeRootWideIssue === undefined
+    ) {
+      // The retained root evidence is either outside the current account/root
+      // or dormant behind the exact user-confirmed local quarantine. Do not let
+      // its stale presentation block unrelated ordinary sync.
+      return false;
+    }
     return ![...this.blockingPaperIssues.values()].some(
       (paperIssue) => paperIssue.issue === issue,
     );
@@ -9155,6 +9593,9 @@ export class PaperGoogleDriveSyncCoordinator {
         paperStates: states,
         dirtyPaperIds: this.getPendingSyncPaperIds(),
         ignoredCloudIssues: this.ignoredCloudIssueView(),
+        reviewedCloudIssueRevalidationPending: Boolean(
+          this.activeReviewedCloudIssueRevalidation(),
+        ),
       },
       { notify: false },
     );
@@ -9314,6 +9755,7 @@ export class PaperGoogleDriveSyncCoordinator {
     }
     if (error instanceof PaperRepositoryError) {
       const issue = classifyPaperCoordinatorError(error);
+      this.rememberRootWidePresenceIssue(error, issue);
       const connection: PaperConnectionStatus =
         error.code === 'layout-upgrade-required'
           ? 'layout-upgrade-required'
@@ -9586,6 +10028,11 @@ export class PaperGoogleDriveSyncCoordinator {
       operationType,
       effectiveTimeoutMs,
       active.mayHaveMutated,
+      operationType === 'scan' &&
+        hardReadDeadlineExceeded &&
+        active.diagnostic.completedRequestCount > 0 &&
+        this.profile !== null &&
+        this.currentDriveAuditCheckpoint() !== undefined,
     );
     const timeoutDiagnostic: DriveOperationTimeoutDiagnostic = {
       operationType,
@@ -10075,6 +10522,13 @@ function legacyHousekeepingMessage(
   error: unknown,
   operation: 'check' | 'cleanup',
 ): string {
+  if (
+    operation === 'check' &&
+    error instanceof DriveOperationTimeoutError &&
+    !error.mayHaveMutated
+  ) {
+    return 'The read-only legacy check reached its safety deadline. No Google Drive data was changed.';
+  }
   if (error instanceof LegacyDriveCleanupRefusedError && error.message.trim()) {
     return error.message;
   }
@@ -10089,6 +10543,13 @@ function paperFolderNameMaintenanceMessage(
   error: unknown,
   operation: 'preview' | 'normalize',
 ): string {
+  if (
+    operation === 'preview' &&
+    error instanceof DriveOperationTimeoutError &&
+    !error.mayHaveMutated
+  ) {
+    return 'The read-only folder-name preview reached its safety deadline. No Google Drive data was changed.';
+  }
   if (
     (error instanceof PaperFolderNameNormalizationRefusedError ||
       error instanceof LegacyDriveCleanupRefusedError) &&

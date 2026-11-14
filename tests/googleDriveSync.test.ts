@@ -6280,6 +6280,120 @@ test('the Drive primitives used by Retry verification issue GET-only requests', 
   );
 });
 
+test('immutable text reads use bounded direct GETs across concurrent walks', async () => {
+  const calls: Array<{ url: string; init?: RequestInit }> = [];
+  const previousFetch = globalThis.fetch;
+  let active = 0;
+  let maximumActive = 0;
+  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    calls.push({ url: String(input), init });
+    active += 1;
+    maximumActive = Math.max(maximumActive, active);
+    await new Promise<void>((resolve) => setTimeout(resolve, 5));
+    active -= 1;
+    return new Response(`content:${new URL(String(input)).pathname.split('/').at(-1)}`);
+  }) as typeof fetch;
+  try {
+    const client = new DriveClient(() => 'fake-google-oauth-token');
+    const signal = new AbortController().signal;
+    const requests = Array.from({ length: 32 }, (_, index) => ({
+      fileId: `manifest-${index}`,
+      context: { resource: 'manifest' as const },
+    }));
+    const [first, second] = await Promise.all([
+      client.downloadTexts([...requests, requests[0]], signal),
+      client.downloadTexts(requests, signal),
+    ]);
+    assert.equal(first.size, 32);
+    assert.equal(second.size, 32);
+    assert.equal(first.get('manifest-31'), 'content:manifest-31');
+    assert.equal(second.get('manifest-0'), 'content:manifest-0');
+  } finally {
+    globalThis.fetch = previousFetch;
+  }
+
+  assert.equal(calls.length, 64);
+  assert.equal(maximumActive, 12);
+  assert.ok(
+    calls.every(
+      ({ url, init }) =>
+        url.startsWith('https://www.googleapis.com/drive/v3/files/') &&
+        url.endsWith('?alt=media') &&
+        (init?.method ?? 'GET').toUpperCase() === 'GET' &&
+        new Headers(init?.headers).get('Authorization') ===
+          'Bearer fake-google-oauth-token',
+    ),
+  );
+});
+
+test('a failed bulk text GET retains the normal classified failure', async () => {
+  const calls: Array<{ url: string; method: string }> = [];
+  const previousFetch = globalThis.fetch;
+  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    const url = String(input);
+    calls.push({ url, method: (init?.method ?? 'GET').toUpperCase() });
+    return url.endsWith('/manifest-b?alt=media')
+      ? new Response('{"error":{"message":"sensitive upstream text"}}', {
+          status: 404,
+        })
+      : new Response('{"manifest":"first"}');
+  }) as typeof fetch;
+  try {
+    const client = new DriveClient(() => 'fake-google-oauth-token');
+    await assert.rejects(
+      client.downloadTexts(
+        [{ fileId: 'manifest-a' }, { fileId: 'manifest-b' }],
+        new AbortController().signal,
+      ),
+      (error: unknown) =>
+        error instanceof DriveRequestError &&
+        error.code === 'not-found' &&
+        error.operation === 'download' &&
+        !error.message.includes('sensitive upstream text'),
+    );
+  } finally {
+    globalThis.fetch = previousFetch;
+  }
+  assert.equal(calls.length, 2);
+  assert.ok(calls.every(({ method }) => method === 'GET'));
+});
+
+test('aborting a bulk text read prevents queued GETs from starting', async () => {
+  const previousFetch = globalThis.fetch;
+  const controller = new AbortController();
+  let calls = 0;
+  let resolveStarted!: () => void;
+  const started = new Promise<void>((resolve) => {
+    resolveStarted = resolve;
+  });
+  globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+    calls += 1;
+    resolveStarted();
+    return new Promise<Response>((_resolve, reject) => {
+      if (init?.signal?.aborted) {
+        reject(init.signal.reason);
+        return;
+      }
+      init?.signal?.addEventListener('abort', () => reject(init.signal?.reason), {
+        once: true,
+      });
+    });
+  }) as typeof fetch;
+  try {
+    const client = new DriveClient(() => 'fake-google-oauth-token');
+    const operation = client.downloadTexts(
+      Array.from({ length: 30 }, (_, index) => ({ fileId: `manifest-${index}` })),
+      controller.signal,
+    );
+    await started;
+    controller.abort(new Error('synthetic abort'));
+    await assert.rejects(operation, /synthetic abort/u);
+    assert.ok(calls <= 12, 'queued reads did not start after cancellation');
+  } finally {
+    globalThis.fetch = previousFetch;
+  }
+});
+
 test('Drive change discovery exhausts every page and emits only redacted request telemetry', async () => {
   const calls: URL[] = [];
   const telemetry: DriveRequestTelemetryEvent[] = [];

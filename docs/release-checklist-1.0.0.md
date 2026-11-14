@@ -1,10 +1,40 @@
 # 39Note 1.0.0 release checklist
 
-Last updated: 2026-11-10
+Last updated: 2026-11-14
 
-Current state: **release candidate, not yet published**. Local automated gates and
-release-set review pass. Remote CI, D1 migration verification, deployment, public URL
-verification, and the final Google OAuth production transition remain incomplete.
+Current state: **1.0.0 published**. The `v1.0.0` tag and `master` point to
+`3ac2aef`. The release follow-up [PR #2](https://github.com/Ex39393/39Note/pull/2)
+was merged with successful application, browser-matrix, and sync-worker checks.
+The [Pages deployment](https://github.com/Ex39393/39Note/actions/runs/42959094158)
+and [Sync Worker deployment](https://github.com/Ex39393/39Note/actions/runs/42958759899)
+for that commit succeeded on 2026-11-11. The unchecked items below record the
+pre-release checklist as it stood on 2026-11-10; they are not an up-to-date list
+of publication blockers.
+
+## Post-release follow-up
+
+Local verification on 2026-11-14: 1231 tests passed, ESLint and the production
+build passed, and isolated Chromium production startup and targeted recovery
+checks passed. The changed source and test files pass Prettier with LF line
+endings. The full Windows working-tree formatting command reports pre-existing
+CRLF differences; pull request CI must verify formatting on its Linux checkout.
+Automated checks used synthetic data and did not access real Google Drive.
+
+The user completed two real read-only checks on the local build on 2026-11-14
+without another timeout. The UI reported a 16:40 Drive check, 26 ordinary cloud
+papers, one locally ignored cloud issue, zero changes waiting, and one paper
+with a Drive update available. Connected is expected until that update is
+reviewed. This observation does not establish cross-device convergence.
+
+- [ ] Review the single available Drive update on the local build, then confirm
+      the resulting status and cloud-paper count. The two read-only checks above
+      verified this account's current scan path but did not transfer that update.
+- [ ] Review the follow-up pull request and its CI checks, merge, and explicitly
+      deploy the updated Pages build. This change set does not modify the Sync
+      Worker.
+- [ ] Recheck the deployed UI and cross-device cloud catalog after the updated
+      Pages deployment. Keep the existing ignored paper quarantined unless it is
+      explicitly reviewed; quarantine did not delete or repair its Drive records.
 
 ## Completed local gates
 

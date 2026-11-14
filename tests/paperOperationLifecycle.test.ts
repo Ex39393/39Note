@@ -6,6 +6,7 @@ import type {
   PaperActiveOperationType,
   PaperSyncViewState,
 } from '../src/sync/paperCoordinator.ts';
+import type { PaperSyncDeviceProfile } from '../src/sync/storage.ts';
 import { withExclusiveWorkspaceRestoreLease } from '../src/services/workspaceRestoreLock.ts';
 
 let server: ViteDevServer;
@@ -15,6 +16,8 @@ let DriveOperationTimeoutError: (typeof import('../src/sync/paperCoordinator.ts'
 let PaperManifestIntegrityError: (typeof import('../src/sync/paperDriveRepository.ts'))['PaperManifestIntegrityError'];
 let classifyPaperCoordinatorError: (typeof import('../src/sync/paperCoordinator.ts'))['classifyPaperCoordinatorError'];
 let driveOperationTimeoutMs: (typeof import('../src/sync/paperCoordinator.ts'))['driveOperationTimeoutMs'];
+let verifiedDriveCheckAt: (typeof import('../src/sync/paperCoordinator.ts'))['verifiedDriveCheckAt'];
+let getPaperSyncUiStatus: (typeof import('../src/sync/paperCoordinator.ts'))['getPaperSyncUiStatus'];
 
 before(async () => {
   const { createServer } = await import('vite');
@@ -34,6 +37,8 @@ before(async () => {
   DriveOperationTimeoutError = coordinator.DriveOperationTimeoutError;
   classifyPaperCoordinatorError = coordinator.classifyPaperCoordinatorError;
   driveOperationTimeoutMs = coordinator.driveOperationTimeoutMs;
+  verifiedDriveCheckAt = coordinator.verifiedDriveCheckAt;
+  getPaperSyncUiStatus = coordinator.getPaperSyncUiStatus;
   PaperManifestIntegrityError = (
     (await server.ssrLoadModule(
       '/src/sync/paperDriveRepository.ts',
@@ -70,6 +75,114 @@ function deferred<T>() {
   });
   return { promise, reject, resolve };
 }
+
+test('a completed Drive check is scoped to one committed cursor and settles a clean view', () => {
+  const checkedAt = Date.now() - 1000;
+  const profile: PaperSyncDeviceProfile = {
+    id: 'paper-device',
+    deviceId: 'synthetic-device',
+    deviceLabel: 'Synthetic device',
+    deviceMode: 'personal',
+    autoSync: false,
+    accountId: 'account-a',
+    workspaceAccountId: 'account-a',
+    rootFolderId: 'root-a',
+    lastDiscoveryAt: checkedAt,
+    driveChangeCursor: {
+      version: 1,
+      accountId: 'account-a',
+      rootFolderId: 'root-a',
+      deviceMode: 'personal',
+      pageToken: 'committed-token',
+      lastFullAuditAt: checkedAt - 100,
+    },
+  };
+  assert.equal(verifiedDriveCheckAt(profile), checkedAt);
+  assert.equal(
+    verifiedDriveCheckAt({ ...profile, driveChangeCursor: undefined }),
+    undefined,
+  );
+  assert.equal(verifiedDriveCheckAt({ ...profile, accountId: 'account-b' }), undefined);
+  assert.equal(verifiedDriveCheckAt({ ...profile, rootFolderId: 'root-b' }), undefined);
+  assert.equal(
+    verifiedDriveCheckAt({ ...profile, deviceMode: 'temporary' }),
+    undefined,
+  );
+  assert.equal(
+    verifiedDriveCheckAt({
+      ...profile,
+      driveAuditCheckpoint: {
+        version: 1,
+        accountId: 'account-a',
+        rootFolderId: 'root-a',
+        deviceMode: 'personal',
+        startPageToken: 'incomplete-audit',
+        startedAt: checkedAt,
+      },
+    }),
+    undefined,
+  );
+
+  const coordinator = new PaperGoogleDriveSyncCoordinator({ notify() {} });
+  const state = coordinator.getSnapshot();
+  Object.assign(state, { connection: 'connected', lastVerifiedDriveAt: checkedAt });
+  assert.equal(getPaperSyncUiStatus(state), 'synced');
+  state.dirtyPaperIds = ['paper-a'];
+  assert.equal(getPaperSyncUiStatus(state), 'pending');
+  state.dirtyPaperIds = [];
+  state.connection = 'attention';
+  assert.equal(getPaperSyncUiStatus(state), 'attention');
+});
+
+test('public read-only Drive check requires a selected root and cannot take a write path', async () => {
+  const unbound = new PaperGoogleDriveSyncCoordinator({ notify() {} });
+  await assert.rejects(
+    () => unbound.checkDriveAgainReadOnly(),
+    /verified existing 39Note Drive folder/u,
+  );
+
+  const coordinator = new PaperGoogleDriveSyncCoordinator({ notify() {} });
+  Reflect.set(coordinator, 'profile', {
+    id: 'paper-device',
+    deviceId: 'synthetic-device',
+    deviceLabel: 'Synthetic device',
+    deviceMode: 'personal',
+    autoSync: false,
+    accountId: 'account-a',
+    rootFolderId: 'root-a',
+  });
+  Reflect.set(coordinator, 'waitForLocalRemovalSettlement', async () => undefined);
+  Reflect.set(coordinator, 'beginOperation', async () => new AbortController().signal);
+  Reflect.set(coordinator, 'endOperation', () => undefined);
+  Reflect.set(coordinator, 'requireWorkspaceLease', () => ({}));
+  Reflect.set(coordinator, 'reconcileLocalPaperStates', async () => undefined);
+  Reflect.set(coordinator, 'ensureRepository', () => {
+    throw new Error('ordinary root discovery or creation was reached');
+  });
+  Reflect.set(coordinator, 'uploadSelected', () => {
+    throw new Error('an upload was reached');
+  });
+  Reflect.set(coordinator, 'ensureVerifiedRepositoryReadOnly', async () => ({
+    rootFolderId: 'root-a',
+  }));
+  let strictScans = 0;
+  Reflect.set(
+    coordinator,
+    'discoverWithFastPath',
+    async (
+      _repository: unknown,
+      _signal: AbortSignal,
+      _lease: unknown,
+      strict: boolean,
+    ) => {
+      assert.equal(strict, true);
+      strictScans += 1;
+    },
+  );
+  await coordinator.checkDriveAgainReadOnly();
+  assert.equal(strictScans, 1);
+  assert.equal(coordinator.getSnapshot().connection, 'connected');
+});
 
 test('paper operation lifetime belongs to the coordinator, not a UI subscription', async () => {
   const coordinator = new PaperGoogleDriveSyncCoordinator({ notify() {} });
@@ -262,6 +375,140 @@ test('read-timeout recovery cannot initialize or create a missing Drive reposito
   assert.equal(repositoryAttempts, 0);
 });
 
+test('read-timeout recovery preserves verified immutable caches on the same root', async () => {
+  const coordinator = new PaperGoogleDriveSyncCoordinator({ notify() {} });
+  const profile = {
+    id: 'paper-device',
+    deviceId: 'read-timeout-cache-device',
+    deviceLabel: 'Read timeout cache device',
+    deviceMode: 'personal',
+    deviceModeChoiceConfirmed: true,
+    autoSync: true,
+    accountId: 'account-a',
+    workspaceAccountId: 'account-a',
+    rootFolderId: 'verified-root',
+  } as const;
+  Reflect.set(coordinator, 'profile', profile);
+  Reflect.set(coordinator, 'identity', {
+    hasDeviceSession: true,
+    accountId: 'account-a',
+  });
+  Object.assign(coordinator.getSnapshot(), {
+    deviceMode: 'personal',
+    deviceModeChoiceConfirmed: true,
+  });
+  let rootReads = 0;
+  Reflect.set(coordinator, 'drive', {
+    async getMetadata() {
+      rootReads += 1;
+      return {
+        id: 'verified-root',
+        name: '39Note',
+        mimeType: 'application/vnd.google-apps.folder',
+        ownedByMe: true,
+        trashed: false,
+        appProperties: {
+          application: '39Note',
+          role: 'root',
+          layoutVersion: '3',
+          paperProtocolVersion: '3',
+          presenceProtocolVersion: '1',
+          controlFolderId: 'control-folder',
+        },
+      };
+    },
+  });
+  let activeRootChecks = 0;
+  const cachedRepository = {
+    rootFolderId: 'verified-root',
+    async assertActiveRoot() {
+      activeRootChecks += 1;
+    },
+  };
+  Reflect.set(coordinator, 'repository', cachedRepository);
+  const ensureVerifiedRepositoryReadOnly = Reflect.get(
+    coordinator,
+    'ensureVerifiedRepositoryReadOnly',
+  ) as (signal: AbortSignal) => Promise<unknown>;
+
+  const resolved = await ensureVerifiedRepositoryReadOnly.call(
+    coordinator,
+    new AbortController().signal,
+  );
+
+  assert.strictEqual(resolved, cachedRepository);
+  assert.strictEqual(Reflect.get(coordinator, 'repository'), cachedRepository);
+  assert.equal(rootReads, 1, 'recovery still performs a fresh exact-root GET');
+  assert.equal(activeRootChecks, 1, 'recovery still verifies the active layout');
+});
+
+test('every authoritative baseline reuses only fresh evidence-matched manifests', async () => {
+  const coordinator = new PaperGoogleDriveSyncCoordinator({ notify() {} });
+  Reflect.set(coordinator, 'profile', {
+    id: 'paper-device',
+    deviceId: 'baseline-cache-device',
+    deviceLabel: 'Baseline cache device',
+    deviceMode: 'personal',
+    deviceModeChoiceConfirmed: true,
+    autoSync: true,
+    accountId: 'account-a',
+    workspaceAccountId: 'account-a',
+    rootFolderId: 'verified-root',
+  });
+  Reflect.set(coordinator, 'drive', {
+    async getStartPageToken() {
+      return 'baseline-token';
+    },
+    async listChanges() {
+      return { changes: [], newStartPageToken: 'next-token', pages: 1 };
+    },
+  });
+  Reflect.set(coordinator, 'createDriveAuditCheckpoint', async () => ({
+    version: 1,
+    accountId: 'account-a',
+    rootFolderId: 'verified-root',
+    deviceMode: 'personal',
+    startPageToken: 'baseline-token',
+    startedAt: 1,
+  }));
+  let discoveryOptions: { reuseVerifiedManifests?: boolean } | undefined;
+  const repository = {
+    rootFolderId: 'verified-root',
+    async detectLayout() {
+      return { state: 'paper-v3' as const };
+    },
+    async discover(
+      _states: unknown,
+      _signal: AbortSignal,
+      options: { reuseVerifiedManifests?: boolean },
+    ) {
+      discoveryOptions = options;
+      return [];
+    },
+  };
+  Reflect.set(coordinator, 'applyDiscovery', async () => undefined);
+  Reflect.set(coordinator, 'commitDriveChangeCursor', async () => undefined);
+  const runAuthoritativeBaseline = Reflect.get(
+    coordinator,
+    'runAuthoritativeBaseline',
+  ) as (
+    repository: typeof repository,
+    signal: AbortSignal,
+    workspaceLease: unknown,
+    strictReadOnly?: boolean,
+  ) => Promise<void>;
+
+  await runAuthoritativeBaseline.call(
+    coordinator,
+    repository,
+    new AbortController().signal,
+    undefined,
+    false,
+  );
+
+  assert.equal(discoveryOptions?.reuseVerifiedManifests, true);
+});
+
 test('read-timeout recovery fails closed if the verified layout changes before baseline discovery', async () => {
   const coordinator = new PaperGoogleDriveSyncCoordinator({ notify() {} });
   const changed = new Error('synthetic active root changed before baseline');
@@ -305,6 +552,17 @@ test('read-timeout recovery fails closed if the verified layout changes before b
       calls.metadataUpdate += 1;
     },
   });
+  Reflect.set(coordinator, 'createDriveAuditCheckpoint', async () => {
+    calls.startToken += 1;
+    return {
+      version: 1,
+      accountId: 'account-a',
+      rootFolderId: 'verified-root',
+      deviceMode: 'personal',
+      startPageToken: 'baseline-token',
+      startedAt: 1,
+    };
+  });
   const repository = {
     rootFolderId: 'verified-root',
     async assertActiveRoot() {
@@ -336,7 +594,7 @@ test('read-timeout recovery fails closed if the verified layout changes before b
       coordinator,
       repository,
       new AbortController().signal,
-      {},
+      undefined,
       true,
     ),
     changed,
@@ -788,13 +1046,26 @@ test('read watchdog has a five-minute hard cap even while requests keep completi
 
   try {
     const coordinator = new PaperGoogleDriveSyncCoordinator({ notify() {} });
+    Reflect.set(coordinator, 'profile', {
+      accountId: 'checkpoint-account',
+      rootFolderId: 'checkpoint-root',
+      deviceMode: 'personal',
+      driveAuditCheckpoint: {
+        version: 1,
+        accountId: 'checkpoint-account',
+        rootFolderId: 'checkpoint-root',
+        deviceMode: 'personal',
+        startPageToken: 'synthetic-start-token',
+        startedAt: 1_000,
+      },
+    });
     const owner = Reflect.get(coordinator, 'operationOwner') as InstanceType<
       typeof SerializedDriveOperationOwner
     >;
     const signal = await owner.begin();
     const startWatchdog = Reflect.get(coordinator, 'startDriveOperationWatchdog') as (
       signal: AbortSignal,
-      operationType: 'scan',
+      operationType: 'scan' | 'download',
     ) => void;
     const markRunning = Reflect.get(coordinator, 'markDriveOperationRunning') as (
       signal: AbortSignal,
@@ -844,8 +1115,72 @@ test('read watchdog has a five-minute hard cap even while requests keep completi
       coordinator.getSnapshot().lastDriveOperationTimeout?.completedRequestCount,
       4,
     );
+    assert.equal(coordinator.getSnapshot().connection, 'connected');
+    assert.equal(coordinator.getSnapshot().issue?.state, 'pending');
+    assert.equal(
+      coordinator.getSnapshot().issue?.diagnostic.causeCode,
+      'read-verification-paused-progress-retained',
+    );
+    assert.match(
+      coordinator.getSnapshot().issue?.message ?? '',
+      /local audit starting point was retained/u,
+    );
     endOperation.call(coordinator, signal);
     assert.equal(owner.active, false);
+
+    for (const operationType of ['scan', 'download'] as const) {
+      const withoutReusableAudit = new PaperGoogleDriveSyncCoordinator({
+        notify() {},
+      });
+      if (operationType === 'download') {
+        Reflect.set(withoutReusableAudit, 'profile', {
+          accountId: 'checkpoint-account',
+          rootFolderId: 'checkpoint-root',
+          deviceMode: 'personal',
+          driveAuditCheckpoint: {
+            version: 1,
+            accountId: 'checkpoint-account',
+            rootFolderId: 'checkpoint-root',
+            deviceMode: 'personal',
+            startPageToken: 'synthetic-start-token',
+            startedAt: 1_000,
+          },
+        });
+      }
+      const uncheckpointedOwner = Reflect.get(
+        withoutReusableAudit,
+        'operationOwner',
+      ) as InstanceType<typeof SerializedDriveOperationOwner>;
+      const uncheckpointedSignal = await uncheckpointedOwner.begin();
+      startWatchdog.call(withoutReusableAudit, uncheckpointedSignal, operationType);
+      markRunning.call(withoutReusableAudit, uncheckpointedSignal);
+      Reflect.set(withoutReusableAudit, 'activeDriveOperationIdentityFence', {
+        signal: uncheckpointedSignal,
+        workspaceLeaseHandle: { release() {} },
+      });
+      now += 240_000;
+      updateRequestActivity.call(withoutReusableAudit, {
+        pendingRequestCount: 1,
+        completedRequestCount: 1,
+      });
+      callbacks.get(Math.max(...callbacks.keys()))?.();
+      assert.equal(uncheckpointedSignal.aborted, true);
+      assert.equal(withoutReusableAudit.getSnapshot().connection, 'offline');
+      assert.equal(withoutReusableAudit.getSnapshot().issue?.state, 'offline');
+      assert.equal(
+        withoutReusableAudit.getSnapshot().issue?.diagnostic.causeCode,
+        'deadline-exceeded',
+      );
+      endOperation.call(withoutReusableAudit, uncheckpointedSignal);
+      assert.equal(uncheckpointedOwner.active, false);
+    }
+
+    const disconnectedIssue = classifyPaperCoordinatorError(
+      new DriveOperationTimeoutError('scan', 5 * 60_000, false, true),
+      false,
+    );
+    assert.equal(disconnectedIssue.state, 'offline');
+    assert.equal(disconnectedIssue.diagnostic.causeCode, 'deadline-exceeded');
   } finally {
     Date.now = originalDateNow;
     globalThis.setTimeout = originalSetTimeout;

@@ -89,6 +89,7 @@ after(async () => server.close());
 test('legacy inventory classifies current, recognized legacy, and unknown data fail closed', async () => {
   const fixture = await housekeepingFixture();
   const mutationCount = fixture.drive.mutations.length;
+  const inventoryMetadataReads = fixture.drive.legacyInventoryMetadataReads;
   const inventory = await fixture.repository.inspectLegacyDriveData(
     housekeepingOptions(),
     signal,
@@ -98,6 +99,11 @@ test('legacy inventory classifies current, recognized legacy, and unknown data f
   assert.ok(inventory.recognizedLegacyCount >= 6);
   assert.equal(inventory.unknownCount, 4);
   assert.equal(fixture.drive.mutations.length, mutationCount, 'inventory is read-only');
+  assert.equal(
+    fixture.drive.legacyInventoryMetadataReads - inventoryMetadataReads,
+    1,
+    'the inventory reuses files.list metadata instead of rereading every child',
+  );
   assert.ok(
     inventory.items
       .filter(
@@ -174,6 +180,93 @@ test('legacy inventory classifies current, recognized legacy, and unknown data f
     inventory.cleanupTargetIds.every((id) => !referencedCurrentIds.has(id)),
     'current manifest and payload references are never cleanup targets',
   );
+});
+
+test('legacy inventory fails closed at its explicit folder budget', async () => {
+  const drive = createMemoryHousekeepingDrive();
+  let parentId = 'root';
+  for (let index = 0; index < 520; index += 1) {
+    const folderId = `bounded-folder-${index}`;
+    drive.seed({
+      id: folderId,
+      name: folderId,
+      mimeType: 'application/vnd.google-apps.folder',
+      parents: [parentId],
+      ownedByMe: true,
+    });
+    parentId = folderId;
+  }
+  const repository = new PaperDriveRepository(drive, 'root');
+
+  await assert.rejects(
+    () => repository.inspectLegacyDriveData(housekeepingOptions(), signal),
+    (error: unknown) =>
+      error instanceof LegacyDriveCleanupRefusedError &&
+      /bounded read-only inventory budget/u.test(error.message),
+  );
+  assert.deepEqual(drive.mutations, []);
+  assert.deepEqual(drive.trashCalls, []);
+});
+
+test('legacy inventory skips immutable paper history when no legacy candidate exists', async () => {
+  const drive = createMemoryHousekeepingDrive();
+  const repository = new PaperDriveRepository(drive, 'root');
+  await repository.initializeEmptyLayout(signal);
+  const blobReads = drive.blobReads;
+  const mutationCount = drive.mutations.length;
+
+  const inventory = await repository.inspectLegacyDriveData(
+    housekeepingOptions(),
+    signal,
+  );
+
+  assert.equal(inventory.recognizedLegacyCount, 0);
+  assert.equal(drive.blobReads, blobReads);
+  assert.equal(drive.mutations.length, mutationCount);
+  assert.equal(inventory.cleanupEligibleCount, 0);
+});
+
+test('read-only housekeeping timeouts are diagnostic-only and cannot publish late results', () => {
+  const coordinator = source('../src/sync/paperCoordinator.ts');
+  const check = coordinator.slice(
+    coordinator.indexOf('private async checkLegacyDriveDataOwned'),
+    coordinator.indexOf(
+      'removeRecognizedLegacyData(',
+      coordinator.indexOf('private async checkLegacyDriveDataOwned'),
+    ),
+  );
+  const preview = coordinator.slice(
+    coordinator.indexOf('private async previewPaperFolderNameNormalizationOwned'),
+    coordinator.indexOf(
+      'normalizePaperFolderNames(',
+      coordinator.indexOf('private async previewPaperFolderNameNormalizationOwned'),
+    ),
+  );
+  const cleanup = coordinator.slice(
+    coordinator.indexOf('private async removeRecognizedLegacyDataOwned'),
+    coordinator.indexOf(
+      'previewPaperFolderNameNormalization(',
+      coordinator.indexOf('private async removeRecognizedLegacyDataOwned'),
+    ),
+  );
+
+  assert.match(
+    check,
+    /beginOperation\(\s*'housekeeping',\s*false,\s*'diagnostic-only',?\s*\)/u,
+  );
+  assert.match(
+    check,
+    /inspectLegacyDriveData[\s\S]*?signal\.throwIfAborted\(\)[\s\S]*?status: 'ready'/u,
+  );
+  assert.match(
+    preview,
+    /beginOperation\(\s*'housekeeping',\s*false,\s*'diagnostic-only',?\s*\)/u,
+  );
+  assert.match(
+    preview,
+    /inspectPaperFolderNames[\s\S]*?signal\.throwIfAborted\(\)[\s\S]*?status: 'ready'/u,
+  );
+  assert.doesNotMatch(cleanup, /diagnostic-only/u);
 });
 
 test('housekeeping preserves current package layouts 2 and 3 with exact source and manifest roles', async () => {
@@ -920,6 +1013,8 @@ function createMemoryHousekeepingDrive() {
     readonly mutations: string[] = [];
     readonly trashCalls: string[] = [];
     readonly trashAttempts: string[] = [];
+    legacyInventoryMetadataReads = 0;
+    blobReads = 0;
     failTrashId?: string;
     afterFirstTrash?: () => void;
     onAncestryPreflight?: (fileId: string) => void;
@@ -981,6 +1076,9 @@ function createMemoryHousekeepingDrive() {
       _signal?: AbortSignal,
       context?: { phase?: string },
     ): Promise<DriveFileMetadata> {
+      if (context?.phase === 'legacy-inventory') {
+        this.legacyInventoryMetadataReads += 1;
+      }
       if (
         context?.phase === 'legacy-cleanup-ancestry-preflight' &&
         this.onAncestryPreflight
@@ -1045,6 +1143,7 @@ function createMemoryHousekeepingDrive() {
     }
 
     override async downloadBlob(fileId: string): Promise<Blob> {
+      this.blobReads += 1;
       const blob = this.blobs.get(fileId);
       if (!blob) throw new Error(`Missing Drive blob ${fileId}`);
       return blob;
@@ -1052,6 +1151,18 @@ function createMemoryHousekeepingDrive() {
 
     override async downloadText(fileId: string): Promise<string> {
       return (await this.downloadBlob(fileId)).text();
+    }
+
+    override async downloadTexts(
+      requests: readonly { fileId: string }[],
+    ): Promise<Map<string, string>> {
+      return new Map(
+        await Promise.all(
+          requests.map(
+            async ({ fileId }) => [fileId, await this.downloadText(fileId)] as const,
+          ),
+        ),
+      );
     }
 
     override async trashManagedLegacyFile(fileId: string): Promise<DriveFileMetadata> {

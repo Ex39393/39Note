@@ -130,12 +130,18 @@ import type {
   SyncSnapshot,
 } from './types.ts';
 import { derivePaperStatus } from './paperStateMachine.ts';
+import type { PaperVerificationCacheEntry } from './paperVerificationCache.ts';
 
 const FOLDER_MIME = 'application/vnd.google-apps.folder';
 const PAPER_DATA_NAME = '39Note Data';
 const STATE_NAME = 'state.json';
 const PRODUCTIVITY_NAME = 'productivity.json';
 const CONFLICTS_NAME = 'conflicts.json';
+/** Fail-closed bounds for the optional read-only legacy inventory. */
+const LEGACY_INVENTORY_FOLDER_BUDGET = 512;
+const LEGACY_INVENTORY_ITEM_BUDGET = 10_000;
+/** Persist completed verification batches before a long paper history can time out. */
+const PAPER_MANIFEST_VERIFICATION_BATCH_SIZE = 100;
 const LEGACY_ROLES = new Set([
   'documents',
   'document',
@@ -243,11 +249,23 @@ interface PaperRepositoryErrorOptions extends ErrorOptions {
   diagnosticPhase?: string;
   /** Stable redacted classifier; never contains a Drive identity. */
   diagnosticCauseCode?: string;
+  /** Exact logical paper identity; never a Drive file or folder identity. */
+  diagnosticDocumentId?: string;
+  /** Stable ancestry or protocol-boundary classifier. */
+  diagnosticPresenceFailureCode?: string;
+  /** Strictly read-only topology with inspection-local record aliases only. */
+  diagnosticPresenceAncestry?: TargetedPurgePresenceAncestryDiagnostic;
+  /** Whether presence resolution inspected the whole control graph or one paper. */
+  diagnosticPresenceResolutionScope?: 'all' | 'document';
 }
 
 export class PaperRepositoryError extends Error {
   readonly diagnosticPhase?: string;
   readonly diagnosticCauseCode?: string;
+  readonly documentId?: string;
+  readonly diagnosticPresenceFailureCode?: string;
+  readonly diagnosticPresenceAncestry?: TargetedPurgePresenceAncestryDiagnostic;
+  readonly diagnosticPresenceResolutionScope?: 'all' | 'document';
 
   constructor(
     readonly code: PaperRepositoryErrorCode,
@@ -259,6 +277,19 @@ export class PaperRepositoryError extends Error {
     if (options?.diagnosticPhase) this.diagnosticPhase = options.diagnosticPhase;
     if (options?.diagnosticCauseCode) {
       this.diagnosticCauseCode = options.diagnosticCauseCode;
+    }
+    if (options?.diagnosticDocumentId) {
+      this.documentId = options.diagnosticDocumentId;
+    }
+    if (options?.diagnosticPresenceFailureCode) {
+      this.diagnosticPresenceFailureCode = options.diagnosticPresenceFailureCode;
+    }
+    if (options?.diagnosticPresenceAncestry) {
+      this.diagnosticPresenceAncestry = options.diagnosticPresenceAncestry;
+    }
+    if (options?.diagnosticPresenceResolutionScope) {
+      this.diagnosticPresenceResolutionScope =
+        options.diagnosticPresenceResolutionScope;
     }
   }
 }
@@ -620,6 +651,9 @@ export class PaperDriveRepository {
     string,
     VerifiedManifestCacheEntry
   >();
+  private readonly persistVerifiedCacheEntries?: (
+    entries: readonly PaperVerificationCacheEntry[],
+  ) => Promise<void>;
   private verifiedProtocolContext:
     | {
         protocolVersion: SupportedPaperSyncProtocolVersion;
@@ -633,13 +667,53 @@ export class PaperDriveRepository {
     options: {
       now?: () => number;
       supportedPaperSyncProtocolVersion?: SupportedPaperSyncProtocolVersion;
+      persistVerifiedCacheEntries?: (
+        entries: readonly PaperVerificationCacheEntry[],
+      ) => Promise<void>;
     } = {},
   ) {
     if (!isSafeDriveId(rootFolderId)) throw new Error('Invalid Drive root identity.');
     this.now = options.now ?? Date.now;
     this.supportedPaperSyncProtocolVersion =
       options.supportedPaperSyncProtocolVersion ?? PAPER_SYNC_PROTOCOL_VERSION;
-    this.presence = new PaperPresenceDriveRepository(drive, rootFolderId, this.now);
+    this.persistVerifiedCacheEntries = options.persistVerifiedCacheEntries;
+    this.presence = new PaperPresenceDriveRepository(
+      drive,
+      rootFolderId,
+      this.now,
+      this.persistVerifiedCacheEntries,
+    );
+  }
+
+  /**
+   * Hydrates only cryptographically self-consistent immutable records. These
+   * entries remain non-authoritative until a new files.list result matches all
+   * cached Drive evidence and the ordinary ancestry checks succeed.
+   */
+  async hydrateVerifiedReadCache(
+    entries: readonly PaperVerificationCacheEntry[],
+  ): Promise<void> {
+    for (const entry of entries) {
+      if (entry.kind !== 'manifest') continue;
+      try {
+        const manifest = parsePaperCloudManifest(entry.text);
+        if (
+          entry.text !== stableStringify(manifest) ||
+          !(await verifyPaperManifestGeneration(manifest)) ||
+          !sameImmutableDriveEvidence(entry.file, entry.file) ||
+          !isManifestMetadataBoundToRecord(entry.file, manifest)
+        ) {
+          continue;
+        }
+        this.verifiedManifestCache.set(entry.file.id, {
+          file: entry.file,
+          manifest,
+        });
+      } catch {
+        // A malformed local cache row is an ordinary miss.
+      }
+    }
+    await this.presence.hydrateVerifiedCache(entries);
   }
 
   private retainVerifiedProtocolContext(
@@ -1022,6 +1096,28 @@ export class PaperDriveRepository {
     }
     const activePaperLayout = isPaperV3RootMetadata(root);
     const entries = await this.listLegacyInventoryTree(signal);
+    const unverifiedInventory = await buildLegacyDriveInventory(
+      this.rootFolderId,
+      entries,
+      {
+        activePaperLayout,
+        currentDataVerified: false,
+        migrationActivationVerified: false,
+        supersededLegacyFileIds: [],
+        currentReferenceIds: [],
+        protectedLegacyFileIds: options.protectedLegacyFileIds,
+        migrationInProgress: options.migrationInProgress,
+        now: this.now(),
+      },
+    );
+    if (unverifiedInventory.recognizedLegacyCount === 0) {
+      // The optional read-only check is often opened only to diagnose an
+      // unrelated sync warning. When the bounded metadata inventory contains
+      // no positively recognized legacy object, loading every immutable paper
+      // history cannot reveal a cleanup target and may cost hundreds of Drive
+      // reads. Return the honest, non-cleanable inventory immediately.
+      return unverifiedInventory;
+    }
     let currentDataVerified = activePaperLayout;
     let currentReferenceIds: string[] = [];
     let migrationActivationVerified = false;
@@ -1453,6 +1549,8 @@ export class PaperDriveRepository {
     } catch (error) {
       signal.throwIfAborted();
       if (isDriveOperationFailure(error)) throw error;
+      const presenceError =
+        error instanceof PaperV3ControlIntegrityError ? error : undefined;
       throw new PaperRepositoryError(
         'paper-presence-invalid',
         'The Drive paper-presence control data needs verification.',
@@ -1460,6 +1558,16 @@ export class PaperDriveRepository {
           cause: error,
           diagnosticPhase: 'paper-presence-resolution',
           diagnosticCauseCode: 'presence-control-resolution-failed',
+          ...(presenceError?.documentId
+            ? { diagnosticDocumentId: presenceError.documentId }
+            : {}),
+          ...(presenceError?.failureCode
+            ? { diagnosticPresenceFailureCode: presenceError.failureCode }
+            : {}),
+          ...(presenceError?.ancestryDiagnostic
+            ? { diagnosticPresenceAncestry: presenceError.ancestryDiagnostic }
+            : {}),
+          diagnosticPresenceResolutionScope: requestedDocumentIds ? 'document' : 'all',
         },
       );
     }
@@ -4762,20 +4870,92 @@ export class PaperDriveRepository {
         documentId,
       }),
     );
-    const generations = await mapWithConcurrency(
-      files,
-      PAPER_MANIFEST_READ_CONCURRENCY,
-      async (file) =>
-        this.loadManifestFile(
-          file,
+    const reused = new Map<string, LoadedPaperGeneration>();
+    const uncached: DriveFileMetadata[] = [];
+    for (const file of files) {
+      if (!isPaperManifestFile(file, dataFolder.id, documentId, allowInheritedTrash)) {
+        throw new PaperManifestIntegrityError(
+          'A managed paper manifest has invalid Drive metadata.',
           documentId,
-          folder,
-          dataFolder,
+        );
+      }
+      const cached = reuseVerifiedManifests
+        ? this.reuseVerifiedManifest(file, documentId, folder, dataFolder)
+        : undefined;
+      if (cached) reused.set(file.id, cached);
+      else uncached.push(file);
+    }
+    const verified = new Map(reused);
+    for (
+      let offset = 0;
+      offset < uncached.length;
+      offset += PAPER_MANIFEST_VERIFICATION_BATCH_SIZE
+    ) {
+      signal.throwIfAborted();
+      const batch = uncached.slice(
+        offset,
+        offset + PAPER_MANIFEST_VERIFICATION_BATCH_SIZE,
+      );
+      const prefetched = await this.manifestReadGate.run(() =>
+        this.drive.downloadTexts(
+          batch.map((file) => ({
+            fileId: file.id,
+            context: {
+              phase: 'manifest-head-resolution',
+              resource: 'manifest',
+              documentId,
+            },
+          })),
           signal,
-          reuseVerifiedManifests,
-          allowInheritedTrash,
         ),
-    );
+      );
+      const completed = await mapWithConcurrency(
+        batch,
+        PAPER_MANIFEST_READ_CONCURRENCY,
+        async (file) => {
+          const text = prefetched.get(file.id);
+          if (text === undefined) {
+            throw new PaperManifestIntegrityError(
+              'A managed paper manifest could not be downloaded.',
+              documentId,
+            );
+          }
+          return this.loadManifestFile(
+            file,
+            documentId,
+            folder,
+            dataFolder,
+            signal,
+            false,
+            allowInheritedTrash,
+            text,
+          );
+        },
+      );
+      // These bytes and metadata have each passed the ordinary immutable
+      // verification. They remain non-authoritative until every generation and
+      // the full graph have passed; retaining them only avoids future GETs.
+      if (this.persistVerifiedCacheEntries) {
+        await this.persistVerifiedCacheEntries(
+          completed.map(({ file, manifest }) => ({
+            kind: 'manifest' as const,
+            file,
+            text: stableStringify(manifest),
+          })),
+        );
+      }
+      for (const entry of completed) verified.set(entry.file.id, entry);
+    }
+    const generations = files.map((file) => {
+      const generation = verified.get(file.id);
+      if (!generation) {
+        throw new PaperManifestIntegrityError(
+          'A managed paper manifest could not be verified.',
+          documentId,
+        );
+      }
+      return generation;
+    });
     this.assertProtocolGenerationBoundary(documentId, folder.id, generations);
     if (!loadPayloads) return generations;
 
@@ -4973,6 +5153,7 @@ export class PaperDriveRepository {
     signal: AbortSignal,
     reuseVerifiedManifest: boolean,
     allowInheritedTrash = false,
+    prefetchedText?: string,
   ): Promise<LoadedPaperGeneration> {
     if (!isPaperManifestFile(file, dataFolder.id, documentId, allowInheritedTrash)) {
       throw new PaperManifestIntegrityError(
@@ -4980,24 +5161,19 @@ export class PaperDriveRepository {
         documentId,
       );
     }
-    const cached = this.verifiedManifestCache.get(file.id);
-    if (
-      reuseVerifiedManifest &&
-      cached &&
-      sameImmutableDriveEvidence(cached.file, file) &&
-      cached.manifest.documentId === documentId &&
-      cached.manifest.paperFolderId === folder.id &&
-      cached.manifest.dataFolderId === dataFolder.id
-    ) {
-      return { file, manifest: cached.manifest };
-    }
-    const text = await this.manifestReadGate.run(() =>
-      this.drive.downloadText(file.id, signal, {
-        phase: 'manifest-head-resolution',
-        resource: 'manifest',
-        documentId,
-      }),
-    );
+    const reused = reuseVerifiedManifest
+      ? this.reuseVerifiedManifest(file, documentId, folder, dataFolder)
+      : undefined;
+    if (reused) return reused;
+    const text =
+      prefetchedText ??
+      (await this.manifestReadGate.run(() =>
+        this.drive.downloadText(file.id, signal, {
+          phase: 'manifest-head-resolution',
+          resource: 'manifest',
+          documentId,
+        }),
+      ));
     let manifest: PaperCloudManifest;
     try {
       manifest = parsePaperCloudManifest(text);
@@ -5014,16 +5190,7 @@ export class PaperDriveRepository {
       manifest.documentId !== documentId ||
       manifest.paperFolderId !== folder.id ||
       manifest.dataFolderId !== dataFolder.id ||
-      paperPackageLayoutVersion(file) !== manifest.syncLayoutVersion ||
-      file.appProperties?.paperProtocolVersion !==
-        String(manifest.paperSyncProtocolVersion) ||
-      file.appProperties?.manifestStorage !== manifest.manifestStorage ||
-      file.name !==
-        manifestGenerationNameForProtocol(
-          manifest.generation.id,
-          manifest.paperSyncProtocolVersion,
-        ) ||
-      file.appProperties?.generationId !== manifest.generation.id
+      !isManifestMetadataBoundToRecord(file, manifest, allowInheritedTrash)
     ) {
       throw new PaperManifestIntegrityError(
         'A managed paper manifest failed immutable verification.',
@@ -5036,6 +5203,23 @@ export class PaperDriveRepository {
       this.verifiedManifestCache.delete(file.id);
     }
     return { file, manifest };
+  }
+
+  private reuseVerifiedManifest(
+    file: DriveFileMetadata,
+    documentId: string,
+    folder: DriveFileMetadata,
+    dataFolder: DriveFileMetadata,
+  ): LoadedPaperGeneration | undefined {
+    const cached = this.verifiedManifestCache.get(file.id);
+    return cached &&
+      sameImmutableDriveEvidence(cached.file, file) &&
+      cached.manifest.documentId === documentId &&
+      cached.manifest.paperFolderId === folder.id &&
+      cached.manifest.dataFolderId === dataFolder.id &&
+      isManifestMetadataBoundToRecord(file, cached.manifest)
+      ? { file, manifest: cached.manifest }
+      : undefined;
   }
 
   private async downloadPayload(
@@ -6440,18 +6624,43 @@ export class PaperDriveRepository {
     const visitedFolders = new Set<string>();
     while (queued.length > 0) {
       signal.throwIfAborted();
-      const next = queued.shift()!;
-      if (visitedFolders.has(next.folderId)) continue;
-      visitedFolders.add(next.folderId);
-      for (const file of await this.listChildrenForLegacyInventory(
-        next.folderId,
-        signal,
-      )) {
-        const depth = next.depth + 1;
-        const existing = entries.get(file.id);
-        if (!existing || depth < existing.depth) entries.set(file.id, { file, depth });
-        if (file.mimeType === FOLDER_MIME && !visitedFolders.has(file.id)) {
-          queued.push({ folderId: file.id, depth });
+      const batch: Array<{ folderId: string; depth: number }> = [];
+      while (queued.length > 0 && batch.length < PAPER_METADATA_CONCURRENCY) {
+        const next = queued.shift()!;
+        if (visitedFolders.has(next.folderId)) continue;
+        if (visitedFolders.size >= LEGACY_INVENTORY_FOLDER_BUDGET) {
+          throw new LegacyDriveCleanupRefusedError(
+            'The managed Drive tree exceeds the bounded read-only inventory budget. Nothing was changed.',
+          );
+        }
+        visitedFolders.add(next.folderId);
+        batch.push(next);
+      }
+      const listed = await mapWithConcurrency(
+        batch,
+        PAPER_METADATA_CONCURRENCY,
+        async (folder) => ({
+          folder,
+          children: await this.listChildrenForLegacyInventory(folder.folderId, signal),
+        }),
+      );
+      for (const { folder, children } of listed) {
+        for (const file of children) {
+          const depth = folder.depth + 1;
+          const existing = entries.get(file.id);
+          if (!existing) {
+            if (entries.size >= LEGACY_INVENTORY_ITEM_BUDGET) {
+              throw new LegacyDriveCleanupRefusedError(
+                'The managed Drive tree exceeds the bounded read-only inventory budget. Nothing was changed.',
+              );
+            }
+            entries.set(file.id, { file, depth });
+          } else if (depth < existing.depth) {
+            entries.set(file.id, { file, depth });
+          }
+          if (file.mimeType === FOLDER_MIME && !visitedFolders.has(file.id)) {
+            queued.push({ folderId: file.id, depth });
+          }
         }
       }
     }
@@ -6469,24 +6678,17 @@ export class PaperDriveRepository {
         { phase: 'legacy-inventory', resource: 'file-list' },
       ),
     );
-    const children: DriveFileMetadata[] = [];
-    for (const candidate of listed) {
-      let current: DriveFileMetadata;
-      try {
-        current = await this.drive.getMetadata(candidate.id, signal, {
-          phase: 'legacy-inventory',
-          resource: 'file-metadata',
-        });
-      } catch (error) {
-        if (error instanceof DriveRequestError && error.status === 404) continue;
-        throw error;
-      }
-      if (current.trashed || !current.parents?.includes(parentId)) continue;
-      children.push(current);
-    }
-    return children.sort((first, second) =>
-      compareCanonicalStrings(first.id, second.id),
-    );
+    signal.throwIfAborted();
+    // files.list already returns every field used by the inventory evidence.
+    // Cleanup rebuilds the inventory and performs exact metadata/ancestry
+    // verification immediately before each mutation, so repeating one
+    // getMetadata request per child here adds latency without weakening or
+    // strengthening the cleanup boundary.
+    return listed
+      .filter(
+        (candidate) => !candidate.trashed && candidate.parents?.includes(parentId),
+      )
+      .sort((first, second) => compareCanonicalStrings(first.id, second.id));
   }
 
   private async verifyCurrentPaperPayloads(signal: AbortSignal): Promise<void> {
@@ -6883,6 +7085,36 @@ function isPaperManifestFile(
     expectedManifestStorage !== undefined &&
     file.appProperties?.manifestStorage === expectedManifestStorage &&
     typeof file.appProperties.generationId === 'string'
+  );
+}
+
+/**
+ * Binds a self-consistent manifest body to the exact Drive object that claims
+ * to store it. This is required for downloaded bodies and for untrusted local
+ * cache hydration alike; a valid generation hash alone is not remote proof.
+ */
+function isManifestMetadataBoundToRecord(
+  file: DriveFileMetadata,
+  manifest: PaperCloudManifest,
+  allowInheritedTrash = false,
+): boolean {
+  return (
+    isPaperManifestFile(
+      file,
+      manifest.dataFolderId,
+      manifest.documentId,
+      allowInheritedTrash,
+    ) &&
+    paperPackageLayoutVersion(file) === manifest.syncLayoutVersion &&
+    file.appProperties?.paperProtocolVersion ===
+      String(manifest.paperSyncProtocolVersion) &&
+    file.appProperties?.manifestStorage === manifest.manifestStorage &&
+    file.name ===
+      manifestGenerationNameForProtocol(
+        manifest.generation.id,
+        manifest.paperSyncProtocolVersion,
+      ) &&
+    file.appProperties?.generationId === manifest.generation.id
   );
 }
 
@@ -7521,6 +7753,10 @@ function sameImmutableDriveEvidence(
     hasImmutableDriveEvidence(current) &&
     cached.id === current.id &&
     cached.version === current.version &&
+    cached.modifiedTime !== undefined &&
+    cached.modifiedTime === current.modifiedTime &&
+    cached.ownedByMe === true &&
+    current.ownedByMe === true &&
     cached.md5Checksum === current.md5Checksum &&
     cached.size === current.size &&
     cached.name === current.name &&
